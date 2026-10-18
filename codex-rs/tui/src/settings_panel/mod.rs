@@ -234,16 +234,20 @@ impl SettingsSwitch {
                     "agents.enabled",
                     serde_json::json!(enabled),
                 ));
-                if !enabled && config.features.enabled(Feature::MultiAgentV2) {
+                // A stale user value would return once an overriding layer goes away.
+                if !enabled {
                     edits.push(feature_edit(Feature::MultiAgentV2, /*enabled*/ false));
                 }
             }
-            // Clearing restores the default mode instead of guessing a previous one.
-            Self::WebSearch if enabled => edits.push(clear_config_value("web_search")),
-            Self::WebSearch => edits.push(replace_config_value(
-                "web_search",
-                serde_json::json!("disabled"),
-            )),
+            Self::WebSearch => {
+                // An explicit mode keeps a lower layer from leaving search disabled.
+                let mode = if enabled {
+                    enabled_web_search_mode(config).unwrap_or_default()
+                } else {
+                    WebSearchMode::Disabled
+                };
+                edits.push(replace_config_value("web_search", serde_json::json!(mode)));
+            }
             Self::PluginsAndApps
             | Self::Skills
             | Self::Hooks

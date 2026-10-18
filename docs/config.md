@@ -28,7 +28,7 @@ features they started with, so changes apply to new sessions (`/new`).
 | AGENTS.md        | `features.agents_md`                               |
 | Memories         | `features.memories`                                |
 | Subagents        | `features.multi_agent`, `agents.enabled`           |
-| Web search       | `web_search = "disabled"` (cleared when turned on) |
+| Web search       | `web_search` (`"disabled"`, or an allowed mode)    |
 | Image generation | `features.image_generation`                        |
 | Goals            | `features.goals`                                   |
 
@@ -38,8 +38,9 @@ and ignores `$skill` mentions. `features.agents_md = false` stops loading both
 `~/.codex/AGENTS.md` and project `AGENTS.md` files; instructions supplied by a
 host application are still used.
 
-Saving a switch also removes legacy aliases for the same feature (such as
-`features.connectors`) so they cannot override it. Values pinned in
-`requirements.toml` show as managed and cannot be changed from `/settings`. A
-profile or a trusted project's `.codex/config.toml` can still override the user
-value.
+Turning Subagents off also writes `features.multi_agent_v2 = false`, which
+otherwise overrides `agents.enabled`. Saving a switch also removes legacy
+aliases for the same feature (such as `features.connectors`) so they cannot
+override it. Values pinned in `requirements.toml` show as managed and cannot be
+changed from `/settings`. A profile or a trusted project's `.codex/config.toml`
+can still override the user value.

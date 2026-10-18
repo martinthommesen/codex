@@ -3894,7 +3894,7 @@ async fn save_settings_switch_writes_explicit_values_and_updates_live_state() ->
     let config: toml::Value = toml::from_str(&std::fs::read_to_string(
         codex_home.path().join("config.toml"),
     )?)?;
-    assert_eq!(config.get("web_search"), None);
+    assert_eq!(config["web_search"].as_str(), Some("cached"));
     assert_ne!(
         app.config.web_search_mode.value(),
         codex_protocol::config_types::WebSearchMode::Disabled

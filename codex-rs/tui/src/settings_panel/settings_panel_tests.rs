@@ -248,12 +248,21 @@ async fn edits_write_explicit_values_and_clear_legacy_aliases() {
         ]
     );
     assert_eq!(
+        edits(SettingsSwitch::Subagents, /*enabled*/ false),
+        vec![
+            ("features.multi_agent".to_string(), json!(false)),
+            ("features.collab".to_string(), json!(null)),
+            ("agents.enabled".to_string(), json!(false)),
+            ("features.multi_agent_v2".to_string(), json!(false)),
+        ]
+    );
+    assert_eq!(
         edits(SettingsSwitch::WebSearch, /*enabled*/ false),
         vec![("web_search".to_string(), json!("disabled"))]
     );
     assert_eq!(
         edits(SettingsSwitch::WebSearch, /*enabled*/ true),
-        vec![("web_search".to_string(), json!(null))]
+        vec![("web_search".to_string(), json!("cached"))]
     );
     assert_eq!(
         edits(SettingsSwitch::Skills, /*enabled*/ false),
