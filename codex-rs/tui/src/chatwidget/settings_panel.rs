@@ -26,9 +26,10 @@ impl ChatWidget {
 
     /// Adopt a saved switch and refresh the TUI surfaces it gates.
     pub(crate) fn apply_settings_switch(&mut self, switch: SettingsSwitch, config: &Config) {
-        switch.adopt(&mut self.config, config);
+        // Flip features first so their change-driven refreshes see the previous value.
         for feature in switch.features() {
             self.set_feature_enabled(*feature, config.features.enabled(*feature));
         }
+        switch.adopt(&mut self.config, config);
     }
 }

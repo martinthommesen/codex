@@ -32,7 +32,7 @@ const LOCKED_DESCRIPTION: &str = "Managed by your administrator";
 /// Fits the longest value label, `[-] Partial · managed`, plus a gap.
 const VALUE_COLUMN_WIDTH: usize = 22;
 
-fn value_label(status: &SwitchStatus) -> String {
+fn value_label(status: SwitchStatus) -> String {
     let label = match status.state {
         SwitchState::On => "[x] On",
         SwitchState::Off => "[ ] Off",
@@ -52,7 +52,7 @@ enum ItemContext {
 }
 
 fn item(
-    status: &SwitchStatus,
+    status: SwitchStatus,
     keymap: &ListKeymap,
     search_hint: Option<KeyBinding>,
     context: ItemContext,
@@ -136,7 +136,7 @@ pub(super) fn picker(
         search_placeholder: Some("Type to search features".to_string()),
         search_items: statuses
             .iter()
-            .map(|status| item(status, &keymap, search_hint, ItemContext::Search))
+            .map(|status| item(*status, &keymap, search_hint, ItemContext::Search))
             .collect(),
         // Row widths include the two-column selection marker; matching it keeps every tab's
         // value column aligned.
@@ -155,7 +155,7 @@ pub(super) fn picker(
                     items: statuses
                         .iter()
                         .filter(|status| status.switch.section() == *section)
-                        .map(|status| item(status, &keymap, search_hint, ItemContext::Group))
+                        .map(|status| item(*status, &keymap, search_hint, ItemContext::Group))
                         .collect(),
                 }
             })

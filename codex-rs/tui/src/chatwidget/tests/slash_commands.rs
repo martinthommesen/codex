@@ -3027,6 +3027,26 @@ async fn slash_settings_opens_kill_switch_panel() {
 }
 
 #[tokio::test]
+async fn saved_skills_switch_hides_command_and_refreshes_skill_list() {
+    let (mut chat, _rx, mut op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+    let mut saved = chat.config_ref().clone();
+    crate::settings_panel::SettingsSwitch::Skills
+        .apply(&mut saved, /*enabled*/ false)
+        .expect("skills is not pinned");
+
+    chat.apply_settings_switch(crate::settings_panel::SettingsSwitch::Skills, &saved);
+
+    assert!(!chat.config_ref().features.enabled(Feature::Skills));
+    assert!(!chat.builtin_command_flags().feature_commands.skills);
+    let expected_cwd = chat.config_ref().cwd.to_path_buf();
+    assert_matches!(
+        op_rx.try_recv(),
+        Ok(Op::ListSkills { cwds, force_reload: true }) if cwds == vec![expected_cwd]
+    );
+    assert!(op_rx.try_recv().is_err(), "expected a single skills refresh");
+}
+
+#[tokio::test]
 async fn commands_for_disabled_features_point_to_settings() {
     let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
 
