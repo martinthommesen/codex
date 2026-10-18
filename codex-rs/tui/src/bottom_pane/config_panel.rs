@@ -16,6 +16,18 @@ impl BottomPane {
         updated
     }
 
+    pub(crate) fn update_settings_panel(
+        &mut self,
+        update: &crate::settings_panel::SettingsPanelUpdate,
+    ) -> bool {
+        let mut updated = false;
+        for view in &mut self.view_stack {
+            updated |= view.update_settings_panel(update);
+        }
+        self.request_redraw();
+        updated
+    }
+
     pub(crate) fn config_editor_opened(&mut self) {
         for view in &mut self.view_stack {
             view.config_editor_opened();

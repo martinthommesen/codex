@@ -326,6 +326,14 @@ impl ChatWidget {
                     .send(AppEvent::OpenDesktopThread { thread_id });
             }
             SlashCommand::Init => {
+                if !self.config.features.enabled(Feature::AgentsMd) {
+                    self.add_info_message(
+                        "AGENTS.md is turned off, so Codex would not load the file /init creates."
+                            .to_string(),
+                        Some("Turn AGENTS.md back on in /settings.".to_string()),
+                    );
+                    return;
+                }
                 const INIT_PROMPT: &str = include_str!("../../assets/prompt_for_init_command.md");
                 self.submit_user_message(INIT_PROMPT.to_string().into());
             }
@@ -483,6 +491,9 @@ impl ChatWidget {
             SlashCommand::Experimental => {
                 self.open_experimental_popup();
             }
+            SlashCommand::Settings => {
+                self.open_settings_panel();
+            }
             SlashCommand::AutoReview => {
                 self.open_auto_review_denials_popup();
             }
@@ -536,6 +547,13 @@ impl ChatWidget {
                 self.insert_str("@");
             }
             SlashCommand::Skills => {
+                if !self.config.features.enabled(Feature::Skills) {
+                    self.add_info_message(
+                        "Skills are turned off.".to_string(),
+                        Some("Turn them back on in /settings.".to_string()),
+                    );
+                    return;
+                }
                 self.open_skills_menu();
             }
             SlashCommand::Import => {
@@ -543,6 +561,13 @@ impl ChatWidget {
                     .send(AppEvent::OpenExternalAgentConfigMigration);
             }
             SlashCommand::Hooks => {
+                if !self.config.features.enabled(Feature::CodexHooks) {
+                    self.add_info_message(
+                        "Hooks are turned off.".to_string(),
+                        Some("Turn them back on in /settings.".to_string()),
+                    );
+                    return;
+                }
                 self.add_hooks_output();
             }
             SlashCommand::Daemon => self.app_event_tx.send(AppEvent::OpenDaemonMenu),
@@ -1279,6 +1304,7 @@ impl ChatWidget {
             worktrees_enabled: self.local_worktree_operations,
             allow_elevate_sandbox,
             side_conversation_active: self.active_side_conversation,
+            feature_commands: self.feature_command_flags(),
         }
     }
 
@@ -1354,6 +1380,7 @@ impl ChatWidget {
             | SlashCommand::Permissions
             | SlashCommand::ElevateSandbox
             | SlashCommand::Experimental
+            | SlashCommand::Settings
             | SlashCommand::AutoReview
             | SlashCommand::Memories
             | SlashCommand::Quit

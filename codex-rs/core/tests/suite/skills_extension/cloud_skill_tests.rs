@@ -161,6 +161,7 @@ text({ names: result.skills.map(skill => skill.name), warnings: result.warnings,
             ]),
         })),
         |config: &Config| SkillsExtensionConfig {
+            enabled: true,
             include_instructions: config.include_skill_instructions,
             max_context_tokens: config.skill_max_context_tokens,
             bundled_skills_enabled: false,
@@ -503,6 +504,7 @@ async fn production_turn_aliases_discovered_singleton_cloud_root() -> Result<()>
             read_barrier: None,
         })),
         |config: &Config| SkillsExtensionConfig {
+            enabled: true,
             include_instructions: config.include_skill_instructions,
             max_context_tokens: config.skill_max_context_tokens,
             bundled_skills_enabled: false,
@@ -598,6 +600,7 @@ async fn cloud_skill_reads_run_in_parallel() -> Result<()> {
             read_barrier: Some(tokio::sync::Barrier::new(/*n*/ 2)),
         })),
         |config: &Config| SkillsExtensionConfig {
+            enabled: true,
             include_instructions: config.include_skill_instructions,
             max_context_tokens: config.skill_max_context_tokens,
             bundled_skills_enabled: false,
@@ -720,6 +723,7 @@ async fn cloud_skill_can_read_referenced_resource_without_an_executor() -> Resul
         &mut extensions,
         SkillProviders::new().with_cloud_provider(provider.clone()),
         |config: &Config| SkillsExtensionConfig {
+            enabled: true,
             include_instructions: config.include_skill_instructions,
             max_context_tokens: config.skill_max_context_tokens,
             bundled_skills_enabled: false,

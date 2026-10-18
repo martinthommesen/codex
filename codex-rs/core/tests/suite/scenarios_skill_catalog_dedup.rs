@@ -76,6 +76,7 @@ async fn cloud_preference_preserves_executor_aliases_and_description_budget() ->
             .with_executor_provider(provider(executor_entries))
             .with_cloud_provider(provider(cloud_entries)),
         |config: &Config| SkillsExtensionConfig {
+            enabled: true,
             include_instructions: config.include_skill_instructions,
             max_context_tokens: config.skill_max_context_tokens,
             bundled_skills_enabled: false,

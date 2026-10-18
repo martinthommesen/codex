@@ -53,6 +53,38 @@ impl SlashCommandItem {
     }
 }
 
+/// Commands whose feature `/settings` can turn off. Hidden commands still parse when typed so
+/// dispatch can explain how to turn the feature back on.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct FeatureCommandFlags {
+    pub(crate) skills: bool,
+    pub(crate) hooks: bool,
+    pub(crate) init: bool,
+}
+
+impl FeatureCommandFlags {
+    pub(crate) const ALL: Self = Self {
+        skills: true,
+        hooks: true,
+        init: true,
+    };
+
+    fn allows(self, cmd: SlashCommand) -> bool {
+        match cmd {
+            SlashCommand::Skills => self.skills,
+            SlashCommand::Hooks => self.hooks,
+            SlashCommand::Init => self.init,
+            _ => true,
+        }
+    }
+}
+
+impl Default for FeatureCommandFlags {
+    fn default() -> Self {
+        Self::ALL
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct BuiltinCommandFlags {
     pub(crate) collaboration_modes_enabled: bool,
@@ -66,6 +98,7 @@ pub(crate) struct BuiltinCommandFlags {
     pub(crate) worktrees_enabled: bool,
     pub(crate) allow_elevate_sandbox: bool,
     pub(crate) side_conversation_active: bool,
+    pub(crate) feature_commands: FeatureCommandFlags,
 }
 
 /// Return the built-ins that should be visible/usable for the current input.
@@ -80,6 +113,7 @@ pub(crate) fn builtins_for_input(flags: BuiltinCommandFlags) -> Vec<(&'static st
         .filter(|(_, cmd)| flags.goal_command_enabled || *cmd != SlashCommand::Goal)
         .filter(|(_, cmd)| flags.worktrees_enabled || *cmd != SlashCommand::Worktree)
         .filter(|(_, cmd)| flags.voice_command_enabled || *cmd != SlashCommand::Voice)
+        .filter(|(_, cmd)| flags.feature_commands.allows(*cmd))
         .filter(|(_, cmd)| {
             flags.daybreak_command_description.is_some() || *cmd != SlashCommand::Daybreak
         })
@@ -112,9 +146,9 @@ pub(crate) fn commands_for_input(
 
 /// Find a single built-in command by a recognized name or alias, after applying feature gating.
 ///
-/// Side-conversation and token-activity gating are intentionally enforced by dispatch rather than
-/// command lookup so a typed command can produce a specific unavailable message while the popup
-/// still hides it.
+/// Side-conversation, token-activity, and `/settings` feature gating are intentionally enforced by
+/// dispatch rather than command lookup so a typed command can produce a specific unavailable
+/// message while the popup still hides it.
 pub(crate) fn find_builtin_command(name: &str, flags: BuiltinCommandFlags) -> Option<SlashCommand> {
     let cmd = SlashCommand::from_str(name).ok().or_else(|| {
         let repeated_os = name.strip_prefix('g')?.strip_suffix("al")?;
@@ -125,6 +159,7 @@ pub(crate) fn find_builtin_command(name: &str, flags: BuiltinCommandFlags) -> Op
         token_activity_command_enabled: true,
         daybreak_command_description: Some(""),
         side_conversation_active: false,
+        feature_commands: FeatureCommandFlags::ALL,
         ..flags
     })
     .into_iter()
@@ -190,6 +225,7 @@ mod tests {
             worktrees_enabled: true,
             allow_elevate_sandbox: true,
             side_conversation_active: false,
+            feature_commands: FeatureCommandFlags::ALL,
         }
     }
 
@@ -287,6 +323,29 @@ mod tests {
             .collect::<Vec<_>>();
 
         assert_eq!(inserted, expected);
+    }
+
+    #[test]
+    fn settings_disabled_commands_are_hidden_but_still_parse() {
+        let mut flags = all_enabled_flags();
+        flags.feature_commands = FeatureCommandFlags {
+            skills: false,
+            hooks: false,
+            init: false,
+        };
+        let visible = builtins_for_input(flags)
+            .into_iter()
+            .map(|(_, cmd)| cmd)
+            .collect::<Vec<_>>();
+        for cmd in [
+            SlashCommand::Skills,
+            SlashCommand::Hooks,
+            SlashCommand::Init,
+        ] {
+            assert!(!visible.contains(&cmd), "{cmd:?} should be hidden");
+            assert_eq!(find_builtin_command(cmd.command(), flags), Some(cmd));
+        }
+        assert!(visible.contains(&SlashCommand::Settings));
     }
 
     #[test]

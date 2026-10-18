@@ -122,6 +122,9 @@ impl<'a> CatalogContext<'a> {
     ) -> Option<Self> {
         let thread_state = input.thread_store.get::<SkillsThreadState>()?;
         let config = thread_state.config();
+        if !config.enabled {
+            return None;
+        }
         let include_usage = input.model_info.include_skills_usage_instructions;
         let context_window = input.model_info.resolved_context_window();
         let metadata_budget = skill_metadata_budget(context_window, config.max_context_tokens);

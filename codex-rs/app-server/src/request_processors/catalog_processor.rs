@@ -569,6 +569,16 @@ impl CatalogRequestProcessor {
                             );
                         }
                     };
+                    if !config.features.enabled(Feature::Skills) {
+                        return (
+                            index,
+                            codex_app_server_protocol::SkillsListEntry {
+                                cwd,
+                                skills: Vec::new(),
+                                errors: Vec::new(),
+                            },
+                        );
+                    }
                     let plugins_input = config.plugins_config_input();
                     let plugins = plugins_manager.plugins_for_config(&plugins_input).await;
                     let plugin_skill_snapshots =

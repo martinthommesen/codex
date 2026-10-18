@@ -55,6 +55,7 @@ use codex_protocol::protocol::TruncationPolicy;
 use codex_protocol::protocol::TurnEnvironmentSelection;
 use codex_protocol::user_input::UserInput;
 use codex_skills::SkillMetadata;
+use codex_skills_extension::EnvironmentSkillRequirements;
 use codex_skills_extension::HostSkillProvider;
 use codex_skills_extension::HostSkillsLoadInput;
 use codex_skills_extension::HostSkillsService;
@@ -80,6 +81,7 @@ use codex_skills_extension::provider::SkillProvider;
 use codex_skills_extension::provider::SkillProviderFuture;
 use codex_skills_extension::provider::SkillReadRequest;
 use codex_skills_extension::provider::SkillSearchRequest;
+use codex_skills_extension::validate_required_skills;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use codex_utils_path_uri::PathUri;
 use opentelemetry_sdk::metrics::InMemoryMetricExporter;
@@ -2907,6 +2909,127 @@ async fn prompt_hidden_skill_can_still_be_invoked() -> TestResult {
     Ok(())
 }
 
+#[tokio::test]
+async fn disabled_extension_contributes_no_skill_context_or_requirements() -> TestResult {
+    for enabled in [true, false] {
+        let read_requests = Arc::new(Mutex::new(Vec::new()));
+        let providers = SkillProviders::new().with_host_provider(Arc::new(StaticSkillProvider {
+            catalog: SkillCatalog {
+                entries: vec![test_entry(
+                    SkillSourceKind::Host,
+                    "host",
+                    "host/lint-fix",
+                    "lint-fix/SKILL.md",
+                )],
+                warnings: Vec::new(),
+            },
+            read_requests: Arc::clone(&read_requests),
+            list_calls: None,
+            fail_first_list: false,
+        }));
+        let mut builder = ExtensionRegistryBuilder::new();
+        install_with_providers(&mut builder, providers, move |config: &TestConfig| {
+            SkillsExtensionConfig {
+                enabled,
+                ..skills_extension_config(config)
+            }
+        });
+        let registry = builder.build();
+        let session_store = ExtensionData::new("session");
+        let thread_store = ExtensionData::new("thread");
+        registry.thread_lifecycle_contributors()[0]
+            .on_thread_start(ThreadStartInput {
+                config: &default_config(),
+                session_source: &SessionSource::Cli,
+                persistent_thread_state_available: true,
+                environments: &[],
+                mcp_resource_client: None,
+                extension_metrics: None,
+                session_store: &session_store,
+                thread_store: &thread_store,
+            })
+            .await;
+
+        let turn_store = ExtensionData::new("turn-1");
+        let fragments = registry.turn_input_contributors()[0]
+            .contribute(
+                TurnInputContext {
+                    turn_id: "turn-1".to_string(),
+                    user_input: vec![UserInput::Text {
+                        text: "$lint-fix".to_string(),
+                        text_elements: Vec::new(),
+                    }],
+                    environments: Vec::new(),
+                },
+                /*extension_metrics*/ None,
+                &session_store,
+                &thread_store,
+                &turn_store,
+            )
+            .await;
+        let sections = registry.context_contributors()[0]
+            .contribute_world_state(WorldStateContributionInput {
+                previous_world_state: None,
+                executor_capability_discovery_v2: None,
+                model_info: &catalog_model_info(),
+                thread_id: codex_protocol::ThreadId::new(),
+                turn_id: "turn-1",
+                environments: &[],
+                ready_selected_capability_roots: &[],
+                executor_capability_discovery: None,
+                extension_metrics: None,
+                session_store: &session_store,
+                thread_store: &thread_store,
+                turn_store: &turn_store,
+                step_store: &turn_store,
+            })
+            .await;
+        let required_skill_names = vec!["lint-fix".to_string()];
+        let required_skills = validate_required_skills(
+            &thread_store,
+            &turn_store,
+            [EnvironmentSkillRequirements {
+                environment_id: "env-1",
+                skill_names: &required_skill_names,
+            }],
+        );
+
+        assert_eq!(
+            fragments
+                .iter()
+                .map(|fragment| fragment.role())
+                .collect::<Vec<_>>(),
+            if enabled {
+                vec!["developer", "user"]
+            } else {
+                Vec::new()
+            }
+        );
+        assert_eq!(
+            sections
+                .iter()
+                .map(WorldStateSectionContribution::id)
+                .collect::<Vec<_>>(),
+            if enabled { vec!["skills"] } else { Vec::new() }
+        );
+        assert_eq!(
+            read_request_keys(&read_requests).len(),
+            usize::from(enabled)
+        );
+        assert_eq!(
+            required_skills,
+            Err(if enabled {
+                "Required skill \"lint-fix\" from environment \"env-1\" is unavailable".to_string()
+            } else {
+                "Required skills are unavailable because skills are disabled (`features.skills = false`)"
+                    .to_string()
+            })
+        );
+    }
+
+    Ok(())
+}
+
 #[derive(Clone)]
 struct StaticSkillProvider {
     catalog: SkillCatalog,
@@ -3098,6 +3221,7 @@ fn default_config() -> TestConfig {
 
 fn skills_extension_config(config: &TestConfig) -> SkillsExtensionConfig {
     SkillsExtensionConfig {
+        enabled: true,
         include_instructions: config.include_instructions,
         max_context_tokens: None,
         bundled_skills_enabled: config.bundled_skills_enabled,

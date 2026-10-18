@@ -1,4 +1,6 @@
 use super::*;
+use crate::agents_md_manager::AgentsMdManager;
+use crate::agents_md_manager::SessionInstructions;
 use crate::config::ConfigBuilder;
 use crate::config::PermissionProfileSnapshot;
 use crate::context::ContextualUserFragment;
@@ -26,6 +28,9 @@ use codex_exec_server::WalkOptions;
 use codex_exec_server::WalkOutcome;
 use codex_exec_server::WriteFileOptions;
 use codex_extension_api::Instructions;
+use codex_extension_api::LoadInstructionsFuture;
+use codex_extension_api::LoadedUserInstructions;
+use codex_extension_api::UserInstructionsProvider;
 use codex_features::Feature;
 use codex_protocol::config_types::WindowsSandboxLevel;
 use codex_protocol::models::PermissionProfile;
@@ -46,6 +51,8 @@ use std::ops::DerefMut;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::Mutex;
+use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::Ordering;
 use tempfile::TempDir;
 use tokio::sync::Notify;
 use tokio::sync::Semaphore;
@@ -1791,6 +1798,99 @@ async fn apps_feature_does_not_append_to_agents_md_user_instructions() {
         .await
         .expect("instructions expected");
     assert_eq!(res, "base doc");
+}
+
+struct CountingUserInstructionsProvider {
+    instructions: Instructions,
+    load_count: AtomicUsize,
+}
+
+impl UserInstructionsProvider for CountingUserInstructionsProvider {
+    fn load_user_instructions(&self) -> LoadInstructionsFuture<'_> {
+        self.load_count.fetch_add(1, Ordering::SeqCst);
+        let instructions = self.instructions.clone();
+        Box::pin(async move {
+            LoadedUserInstructions {
+                instructions: Some(instructions),
+                warnings: Vec::new(),
+            }
+        })
+    }
+}
+
+#[tokio::test]
+async fn disabled_agents_md_feature_keeps_only_host_thread_instructions() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    fs::write(tmp.path().join("AGENTS.md"), "project doc").unwrap();
+
+    let mut cfg = make_config(&tmp, /*limit*/ 4096, /*instructions*/ None).await;
+    cfg.features
+        .disable(Feature::AgentsMd)
+        .expect("test config should allow disabling AGENTS.md");
+    let global_doc = Instructions {
+        text: "global doc".to_string(),
+        source: Some(cfg.codex_home.join(DEFAULT_AGENTS_MD_FILENAME)),
+    };
+    let thread_doc = Instructions {
+        text: "thread doc".to_string(),
+        source: None,
+    };
+    let provider = Arc::new(CountingUserInstructionsProvider {
+        instructions: global_doc.clone(),
+        load_count: AtomicUsize::new(0),
+    });
+    // Inherited global text and a global provider are both present so that disabling has to
+    // clear the former and skip the latter.
+    let manager = AgentsMdManager::new(SessionInstructions {
+        user: Some(Instructions {
+            text: "inherited global doc".to_string(),
+            source: None,
+        }),
+        thread: Some(thread_doc.clone()),
+        user_provider: Some(provider.clone()),
+        ..Default::default()
+    });
+    let environments = resolved_local_environments([("local", cfg.cwd.clone())]);
+
+    let (loaded, warnings) = manager.refresh(&cfg, &environments).await;
+
+    let thread_only = LoadedAgentsMd {
+        user_instructions: None,
+        thread_instructions: Some(thread_doc.clone()),
+        entries: Vec::new(),
+    };
+    assert_eq!(
+        loaded.expect("refresh should succeed").as_deref(),
+        Some(&thread_only)
+    );
+    assert_eq!(warnings, Vec::<String>::new());
+    assert_eq!(provider.load_count.load(Ordering::SeqCst), 0);
+    let inherited = manager.inherited_instructions().await;
+    assert_eq!(
+        (inherited.user, inherited.thread),
+        (None, Some(thread_doc.clone()))
+    );
+
+    // Re-enabling invalidates the cached snapshot and restores both AGENTS.md sources.
+    cfg.features
+        .enable(Feature::AgentsMd)
+        .expect("test config should allow enabling AGENTS.md");
+
+    let (loaded, _warnings) = manager.refresh(&cfg, &environments).await;
+
+    let expected = LoadedAgentsMd {
+        user_instructions: Some(global_doc),
+        thread_instructions: Some(thread_doc),
+        entries: vec![InstructionEntry {
+            contents: "project doc".to_string(),
+            provenance: project_provenance(cfg.cwd.join("AGENTS.md"), cfg.cwd.clone()),
+        }],
+    };
+    assert_eq!(
+        loaded.expect("refresh should succeed").as_deref(),
+        Some(&expected)
+    );
+    assert_eq!(provider.load_count.load(Ordering::SeqCst), 1);
 }
 
 fn create_skill(codex_home: PathBuf, name: &str, description: &str) {

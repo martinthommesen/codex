@@ -1,0 +1,16 @@
+---
+source: tui/src/settings_panel/settings_panel_tests.rs
+expression: "render(&panel, 130)"
+---
+
+  Settings
+  Turn whole features off · changes apply to new sessions
+
+   Extensions   Context   Tools
+
+› AGENTS.md         [x] On                 Load instructions from ~/.codex/AGENTS.md and project AGENTS.md files
+  Memories          [ ] Off                Remember useful context and reuse it in later sessions
+
+
+
+  left/right group · / search · enter toggle · esc clear search/close

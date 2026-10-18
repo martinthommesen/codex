@@ -1323,7 +1323,10 @@ async fn cli_main(
                         let mut feature_overrides = std::collections::BTreeMap::new();
                         // Match Features::apply_map's alias precedence.
                         for (&name, &value) in &features {
-                            if name == "imagegenext" && features.contains_key("image_generation") {
+                            if codex_features::canonical_feature_for_key(name).is_none()
+                                && codex_features::feature_for_key(name)
+                                    .is_some_and(|feature| features.contains_key(feature.key()))
+                            {
                                 continue;
                             }
                             let value = if let Some(table) = value.as_table() {
@@ -2114,6 +2117,7 @@ async fn run_debug_prompt_input_command(
     );
     codex_skills_extension::install(&mut extensions, |config: &Config| {
         codex_skills_extension::SkillsExtensionConfig {
+            enabled: config.features.enabled(codex_features::Feature::Skills),
             include_instructions: config.include_skill_instructions,
             max_context_tokens: config.skill_max_context_tokens,
             bundled_skills_enabled: config.bundled_skills_enabled(),

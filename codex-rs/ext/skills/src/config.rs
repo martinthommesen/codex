@@ -3,6 +3,8 @@ use std::num::NonZeroUsize;
 /// Host-supplied configuration used by the skills extension.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SkillsExtensionConfig {
+    /// Whether skills are discovered, exposed, and injected at all.
+    pub enabled: bool,
     /// Whether the available-skills catalog is included in model context.
     pub include_instructions: bool,
     /// Optional token budget override for the available-skills catalog.

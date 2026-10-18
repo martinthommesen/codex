@@ -24,6 +24,7 @@ use codex_app_server_protocol::SkillScope;
 use codex_app_server_protocol::SkillsChangedNotification;
 use codex_app_server_protocol::SkillsExtraRootsSetParams;
 use codex_app_server_protocol::SkillsExtraRootsSetResponse;
+use codex_app_server_protocol::SkillsListEntry;
 use codex_app_server_protocol::SkillsListParams;
 use codex_app_server_protocol::SkillsListResponse;
 use codex_app_server_protocol::ThreadStartParams;
@@ -769,6 +770,57 @@ async fn skills_list_skips_cwd_roots_when_environment_disabled() -> Result<()> {
             .skills
             .iter()
             .all(|skill| skill.name != "repo-skill")
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn skills_list_returns_no_skills_when_skills_feature_disabled() -> Result<()> {
+    let codex_home = TempDir::new()?;
+    let cwd = TempDir::new()?;
+    write_skill(&codex_home, "home-skill")?;
+    let config_path = codex_home.path().join("config.toml");
+    std::fs::write(&config_path, "[features]\nskills = false\n")?;
+
+    let mut mcp = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .without_auto_env()
+        .build_initialized_with_timeout(DEFAULT_TIMEOUT)
+        .await?;
+
+    let disabled_request_id = mcp
+        .send_skills_list_request(SkillsListParams {
+            cwds: vec![cwd.path().to_path_buf()],
+            force_reload: true,
+        })
+        .await?;
+    let SkillsListResponse { data } =
+        timeout(DEFAULT_TIMEOUT, mcp.read_response(disabled_request_id)).await??;
+    assert_eq!(
+        data,
+        vec![SkillsListEntry {
+            cwd: cwd.path().to_path_buf(),
+            skills: Vec::new(),
+            errors: Vec::new(),
+        }]
+    );
+
+    std::fs::remove_file(&config_path)?;
+    let enabled_request_id = mcp
+        .send_skills_list_request(SkillsListParams {
+            cwds: vec![cwd.path().to_path_buf()],
+            force_reload: true,
+        })
+        .await?;
+    let SkillsListResponse { data } =
+        timeout(DEFAULT_TIMEOUT, mcp.read_response(enabled_request_id)).await??;
+    assert_eq!(data.len(), 1);
+    assert_eq!(data[0].errors, Vec::new());
+    assert!(
+        data[0]
+            .skills
+            .iter()
+            .any(|skill| skill.name == "home-skill")
     );
     Ok(())
 }

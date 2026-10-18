@@ -1,0 +1,18 @@
+---
+source: tui/src/settings_panel/settings_panel_tests.rs
+expression: "render(&panel, 70)"
+---
+
+  Settings
+  Turn whole features off · changes apply to new sessions
+
+   Extensions   Context   Tools
+
+› Plugins & apps    [-] Partial
+  Skills            [x] On
+  Hooks             [ ] Off
+
+
+  Load plugins and connect apps, including their tools, skills, hooks,
+  and mentions
+  left/right group · / search · enter toggle · esc clear search/close

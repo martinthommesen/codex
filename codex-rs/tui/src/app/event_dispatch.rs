@@ -2813,6 +2813,9 @@ impl App {
             AppEvent::UpdateFeatureFlags { updates } => {
                 self.update_feature_flags(app_server, updates).await;
             }
+            AppEvent::SaveSettingsSwitch { switch, enabled } => {
+                self.save_settings_switch(app_server, switch, enabled).await;
+            }
             AppEvent::UpdateMemorySettings {
                 use_memories,
                 generate_memories,

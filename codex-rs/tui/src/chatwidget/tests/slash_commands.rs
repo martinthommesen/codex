@@ -3014,6 +3014,57 @@ async fn slash_memories_opens_memory_menu() {
 }
 
 #[tokio::test]
+async fn slash_settings_opens_kill_switch_panel() {
+    let (mut chat, mut rx, mut op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+
+    chat.dispatch_command(SlashCommand::Settings);
+
+    let popup = render_bottom_popup(&chat, /*width*/ 120);
+    assert!(popup.contains("Plugins & apps"), "got {popup:?}");
+    assert!(popup.contains("[x] On"), "got {popup:?}");
+    assert_matches!(rx.try_recv(), Err(TryRecvError::Empty));
+    assert!(op_rx.try_recv().is_err(), "expected no core op to be sent");
+}
+
+#[tokio::test]
+async fn commands_for_disabled_features_point_to_settings() {
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+
+    for (feature, command, expected) in [
+        (
+            Feature::Skills,
+            SlashCommand::Skills,
+            "Skills are turned off.",
+        ),
+        (
+            Feature::CodexHooks,
+            SlashCommand::Hooks,
+            "Hooks are turned off.",
+        ),
+        (
+            Feature::AgentsMd,
+            SlashCommand::Init,
+            "AGENTS.md is turned off",
+        ),
+    ] {
+        chat.set_feature_enabled(feature, /*enabled*/ false);
+        chat.dispatch_command(command);
+
+        let rendered = drain_insert_history(&mut rx)
+            .iter()
+            .map(|cell| lines_to_single_string(cell))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(rendered.contains(expected), "got {rendered:?}");
+        assert!(rendered.contains("/settings"), "got {rendered:?}");
+    }
+    assert!(
+        chat.bottom_pane.no_modal_or_popup_active(),
+        "disabled commands should not open their menus"
+    );
+}
+
+#[tokio::test]
 async fn slash_resume_opens_picker_while_mcp_startup_is_running() {
     let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
     chat.bottom_pane.set_task_running(/*running*/ true);

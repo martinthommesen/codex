@@ -357,6 +357,7 @@ use super::paste_burst::PasteBurst;
 use super::prompt_args::parse_slash_name;
 use super::skill_popup::MentionItem;
 use super::skill_popup::SkillPopup;
+use super::slash_commands::FeatureCommandFlags;
 use super::slash_commands::ServiceTierCommand;
 use super::slash_commands::SlashCommandItem;
 use super::voice_strip::VoiceStrip;
@@ -517,6 +518,7 @@ fn parent_owned_command_is_allowed(command: SlashCommand, args: &str) -> bool {
                 | SlashCommand::Config
                 | SlashCommand::ElevateSandbox
                 | SlashCommand::Experimental
+                | SlashCommand::Settings
                 | SlashCommand::Memories
                 | SlashCommand::Quit
                 | SlashCommand::Exit
@@ -653,6 +655,7 @@ pub(crate) struct ChatComposer {
     worktrees_enabled: bool,
     windows_degraded_sandbox_active: bool,
     side_conversation_active: bool,
+    feature_commands: FeatureCommandFlags,
     history_search: Option<HistorySearchSession>,
     vim_history: VimHistory,
     submit_keys: Vec<KeyBinding>,
@@ -826,6 +829,7 @@ impl ChatComposer {
             worktrees_enabled: false,
             windows_degraded_sandbox_active: false,
             side_conversation_active: false,
+            feature_commands: FeatureCommandFlags::ALL,
             history_search: None,
             vim_history: VimHistory::default(),
             submit_keys: vec![key_hint::plain(KeyCode::Enter)],
@@ -1032,6 +1036,10 @@ impl ChatComposer {
 
     pub fn set_goal_command_enabled(&mut self, enabled: bool) {
         self.update_slash_command_catalog(|composer| composer.goal_command_enabled = enabled);
+    }
+
+    pub(crate) fn set_feature_commands(&mut self, feature_commands: FeatureCommandFlags) {
+        self.update_slash_command_catalog(|composer| composer.feature_commands = feature_commands);
     }
 
     pub fn set_voice_command_enabled(&mut self, enabled: bool) {

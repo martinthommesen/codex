@@ -346,6 +346,7 @@ async fn guardian_reviews_with_offline_primary_executor() -> Result<()> {
     let mut extensions = ExtensionRegistryBuilder::<Config>::new();
     codex_skills_extension::install(&mut extensions, |config: &Config| {
         codex_skills_extension::SkillsExtensionConfig {
+            enabled: true,
             include_instructions: config.include_skill_instructions,
             max_context_tokens: config.skill_max_context_tokens,
             bundled_skills_enabled: false,

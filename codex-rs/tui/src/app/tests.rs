@@ -3835,6 +3835,75 @@ async fn update_feature_flags_enabling_guardian_selects_auto_review() -> Result<
 }
 
 #[tokio::test]
+async fn save_settings_switch_writes_explicit_values_and_updates_live_state() -> Result<()> {
+    let (mut app, _app_event_rx, _op_rx) = make_test_app_with_channels().await;
+    let codex_home = tempdir()?;
+    app.config.codex_home = codex_home.path().to_path_buf().abs();
+    // A stale legacy alias must not keep apps on after the switch turns them off.
+    std::fs::write(
+        codex_home.path().join("config.toml"),
+        "[features]\nconnectors = true\n",
+    )?;
+    let mut app_server = start_config_write_test_app_server(&app).await?;
+
+    app.save_settings_switch(
+        &mut app_server,
+        crate::settings_panel::SettingsSwitch::PluginsAndApps,
+        /*enabled*/ false,
+    )
+    .await;
+    app.save_settings_switch(
+        &mut app_server,
+        crate::settings_panel::SettingsSwitch::Skills,
+        /*enabled*/ false,
+    )
+    .await;
+    app.save_settings_switch(
+        &mut app_server,
+        crate::settings_panel::SettingsSwitch::WebSearch,
+        /*enabled*/ false,
+    )
+    .await;
+
+    for feature in [Feature::Plugins, Feature::Apps, Feature::Skills] {
+        assert!(!app.config.features.enabled(feature), "{feature:?}");
+        assert!(
+            !app.chat_widget.config_ref().features.enabled(feature),
+            "{feature:?}"
+        );
+    }
+    assert_eq!(
+        app.chat_widget.config_ref().web_search_mode.value(),
+        codex_protocol::config_types::WebSearchMode::Disabled
+    );
+    let config: toml::Value = toml::from_str(&std::fs::read_to_string(
+        codex_home.path().join("config.toml"),
+    )?)?;
+    assert_eq!(config["features"]["plugins"].as_bool(), Some(false));
+    assert_eq!(config["features"]["apps"].as_bool(), Some(false));
+    assert_eq!(config["features"]["skills"].as_bool(), Some(false));
+    assert_eq!(config["features"].get("connectors"), None);
+    assert_eq!(config["web_search"].as_str(), Some("disabled"));
+
+    app.save_settings_switch(
+        &mut app_server,
+        crate::settings_panel::SettingsSwitch::WebSearch,
+        /*enabled*/ true,
+    )
+    .await;
+    let config: toml::Value = toml::from_str(&std::fs::read_to_string(
+        codex_home.path().join("config.toml"),
+    )?)?;
+    assert_eq!(config.get("web_search"), None);
+    assert_ne!(
+        app.config.web_search_mode.value(),
+        codex_protocol::config_types::WebSearchMode::Disabled
+    );
+    app_server.shutdown().await?;
+    Ok(())
+}
+
+#[tokio::test]
 async fn update_feature_flags_disabling_guardian_clears_review_policy_and_restores_default()
 -> Result<()> {
     let (mut app, mut app_event_rx, mut op_rx) = make_test_app_with_channels().await;

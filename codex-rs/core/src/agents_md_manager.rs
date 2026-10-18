@@ -9,6 +9,7 @@ use crate::environment_selection::TurnEnvironmentSnapshot;
 use codex_extension_api::Instructions;
 use codex_extension_api::ThreadInstructionsProvider;
 use codex_extension_api::UserInstructionsProvider;
+use codex_features::Feature;
 use codex_protocol::config_types::TrustLevel;
 use codex_protocol::error::CodexErr;
 use codex_protocol::error::Result as CodexResult;
@@ -45,6 +46,7 @@ struct AgentsMdState {
 struct AgentsMdCache {
     selections: Option<Vec<TurnEnvironmentSelection>>,
     active_project_trust_level: Option<TrustLevel>,
+    agents_md_enabled: Option<bool>,
     loaded: Option<Arc<LoadedAgentsMd>>,
 }
 
@@ -84,10 +86,13 @@ impl AgentsMdManager {
             .map(|environment| environment.selection.clone())
             .collect::<Vec<_>>();
         let active_project_trust_level = config.active_project.trust_level;
+        // Disabling AGENTS.md drops global, inherited, and repository files alike.
+        let agents_md_enabled = config.features.enabled(Feature::AgentsMd);
         let (mut instructions, cached, refresh_repository) = {
             let mut state = self.state.lock().await;
             let refresh_repository = state.cache.selections.as_ref() != Some(&selections)
-                || state.cache.active_project_trust_level != active_project_trust_level;
+                || state.cache.active_project_trust_level != active_project_trust_level
+                || state.cache.agents_md_enabled != Some(agents_md_enabled);
             if refresh_repository {
                 // Tightened read permissions must not leave inaccessible instructions visible,
                 // even if discovery fails or the caller cancels the refresh.
@@ -100,7 +105,9 @@ impl AgentsMdManager {
             )
         };
         let mut warnings = Vec::new();
-        if let Some(provider) = &instructions.user_provider {
+        if !agents_md_enabled {
+            instructions.user = None;
+        } else if let Some(provider) = &instructions.user_provider {
             let loaded = provider.load_user_instructions().await;
             instructions.user = normalize_instructions(loaded.instructions);
             warnings.extend(loaded.warnings);
@@ -124,7 +131,9 @@ impl AgentsMdManager {
                 }
             }
 
-            let loaded = if let Some(project) = &instructions.project_snapshot {
+            let loaded = if !agents_md_enabled {
+                LoadedAgentsMd::default()
+            } else if let Some(project) = &instructions.project_snapshot {
                 project.as_ref().clone()
             } else if refresh_repository {
                 load_project_instructions(config, /*user_instructions*/ None, environments)
@@ -140,6 +149,7 @@ impl AgentsMdManager {
             state.cache = AgentsMdCache {
                 selections: Some(selections),
                 active_project_trust_level,
+                agents_md_enabled: Some(agents_md_enabled),
                 loaded: loaded.clone(),
             };
             Ok(loaded)
@@ -165,8 +175,9 @@ impl AgentsMdManager {
             .collect::<Vec<_>>();
         let state = self.state.lock().await;
         (state.cache.selections.as_ref() == Some(&selections)
-            && state.cache.active_project_trust_level == config.active_project.trust_level)
-            .then(|| state.cache.loaded.clone().unwrap_or_default())
+            && state.cache.active_project_trust_level == config.active_project.trust_level
+            && state.cache.agents_md_enabled == Some(config.features.enabled(Feature::AgentsMd)))
+        .then(|| state.cache.loaded.clone().unwrap_or_default())
     }
 
     pub(crate) async fn inherited_instructions(&self) -> SessionInstructions {

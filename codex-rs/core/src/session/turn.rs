@@ -1013,8 +1013,14 @@ async fn required_mcp_servers_for_input(
         .await
         .without_plugins(&turn_context.disabled_plugin_ids);
     let current_config = sess.services.mcp_runtime.current_config();
-    let mentioned_plugins =
+    let mut mentioned_plugins =
         collect_explicit_plugin_mentions(user_input, loaded_plugins.capability_summaries());
+    if !turn_context.config.features.enabled(Feature::Skills) {
+        // Plugin skills are not loaded, so do not advertise their prefix to the model.
+        for plugin in &mut mentioned_plugins {
+            plugin.has_skills = false;
+        }
+    }
     let mut required_servers = mentioned_plugins
         .iter()
         .flat_map(|plugin| plugin.mcp_server_names.iter().cloned())

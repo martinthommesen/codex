@@ -2,6 +2,7 @@
 
 use super::*;
 use crate::app_event::AppEvent;
+use crate::bottom_pane::slash_commands::FeatureCommandFlags;
 use crate::chatwidget::rate_limits::RATE_LIMIT_SWITCH_PROMPT_VIEW_ID;
 
 impl ChatWidget {
@@ -114,6 +115,7 @@ impl ChatWidget {
 
     #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
     pub(crate) fn set_feature_enabled(&mut self, feature: Feature, enabled: bool) -> bool {
+        let was_enabled = self.config.features.enabled(feature);
         if let Err(err) = self.config.features.set_enabled(feature, enabled) {
             tracing::warn!(
                 error = %err,
@@ -133,9 +135,31 @@ impl ChatWidget {
             self.refresh_effective_service_tier();
             self.sync_service_tier_commands();
         }
+        let changed = enabled != was_enabled;
         if feature == Feature::Plugins {
             self.sync_plugins_command_enabled();
             self.refresh_plugin_mentions();
+            if changed {
+                // Plugin-provided skills appear or disappear with their plugins.
+                self.refresh_skills_for_current_cwd(/*force_reload*/ true);
+            }
+        }
+        if feature == Feature::Apps {
+            self.bottom_pane
+                .set_connectors_enabled(self.connectors_enabled());
+            if changed {
+                self.refresh_connector_mentions(/*force_refresh*/ false);
+            }
+        }
+        if matches!(
+            feature,
+            Feature::Skills | Feature::CodexHooks | Feature::AgentsMd
+        ) {
+            self.sync_feature_commands();
+        }
+        if feature == Feature::Skills && changed {
+            // The server lists no skills while they are off, which also clears `$` mentions.
+            self.refresh_skills_for_current_cwd(/*force_reload*/ true);
         }
         if feature == Feature::Goals {
             self.sync_goal_command_enabled();
@@ -342,6 +366,19 @@ impl ChatWidget {
     pub(super) fn sync_plugins_command_enabled(&mut self) {
         self.bottom_pane
             .set_plugins_command_enabled(self.config.features.enabled(Feature::Plugins));
+    }
+
+    pub(super) fn feature_command_flags(&self) -> FeatureCommandFlags {
+        FeatureCommandFlags {
+            skills: self.config.features.enabled(Feature::Skills),
+            hooks: self.config.features.enabled(Feature::CodexHooks),
+            init: self.config.features.enabled(Feature::AgentsMd),
+        }
+    }
+
+    pub(super) fn sync_feature_commands(&mut self) {
+        self.bottom_pane
+            .set_feature_commands(self.feature_command_flags());
     }
 
     pub(super) fn sync_goal_command_enabled(&mut self) {

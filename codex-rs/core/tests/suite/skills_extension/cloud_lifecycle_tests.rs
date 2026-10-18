@@ -108,6 +108,7 @@ async fn cloud_skills_reuse_cache_and_invalidate_on_connection_or_auth_change() 
         &mut extensions,
         SkillProviders::new().with_cloud_provider(provider.clone()),
         |_config: &Config| SkillsExtensionConfig {
+            enabled: true,
             include_instructions: true,
             max_context_tokens: None,
             bundled_skills_enabled: false,

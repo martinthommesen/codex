@@ -264,6 +264,7 @@ mod safety_buffering;
 mod server_version_notice;
 mod session_lifecycle;
 mod session_picker;
+mod settings_panel;
 mod side;
 mod startup;
 pub(crate) mod startup_bootstrap;

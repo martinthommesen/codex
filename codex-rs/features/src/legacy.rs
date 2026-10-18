@@ -55,6 +55,22 @@ pub fn legacy_feature_keys() -> impl Iterator<Item = &'static str> {
     ALIASES.iter().map(|alias| alias.legacy_key)
 }
 
+/// Returns the legacy aliases that still configure `feature`.
+pub fn legacy_keys_for_feature(feature: Feature) -> impl Iterator<Item = &'static str> {
+    ALIASES
+        .iter()
+        .filter(move |alias| alias.feature == feature)
+        .map(|alias| alias.legacy_key)
+}
+
+/// Resolves a legacy alias without logging, so callers can check for a canonical override.
+pub(crate) fn feature_for_legacy_key(key: &str) -> Option<Feature> {
+    ALIASES
+        .iter()
+        .find(|alias| alias.legacy_key == key)
+        .map(|alias| alias.feature)
+}
+
 pub(crate) fn feature_for_key(key: &str) -> Option<Feature> {
     ALIASES
         .iter()

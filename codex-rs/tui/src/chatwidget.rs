@@ -381,6 +381,7 @@ use self::review::ReviewState;
 mod safety_buffering;
 mod service_tiers;
 mod settings;
+mod settings_panel;
 mod settings_popups;
 mod side;
 use self::safety_buffering::SafetyBufferingState;

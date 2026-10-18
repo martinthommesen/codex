@@ -1378,7 +1378,7 @@ pub(super) fn overridden_write_message(write_response: &ConfigWriteResponse) -> 
         .unwrap_or("the effective config is overridden by a higher-priority layer")
 }
 
-fn feature_enabled_from_effective_config(
+pub(super) fn feature_enabled_from_effective_config(
     effective_config: &ConfigReadResponse,
     feature: Feature,
 ) -> bool {

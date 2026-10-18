@@ -337,14 +337,22 @@ impl Renderable for ConfigPanelHeader {
 }
 
 fn header(notice: Option<String>) -> Box<dyn Renderable> {
-    let subtitle = notice.unwrap_or_else(|| "Changes save automatically".to_string());
+    panel_header(
+        "Configuration",
+        notice.unwrap_or_else(|| "Changes save automatically".to_string()),
+    )
+}
+
+/// Bold panel title above a dim subtitle, wrapped to the available width.
+pub(crate) fn panel_header(title: &'static str, subtitle: String) -> Box<dyn Renderable> {
     Box::new(ConfigPanelHeader(vec![
-        Line::from("Configuration".bold()),
+        Line::from(title.bold()),
         Line::from(subtitle.dim()),
     ]))
 }
 
-fn hint(
+/// Footer hint shared by tabbed, searchable settings panels.
+pub(crate) fn hint(
     keymap: &ListKeymap,
     search: Option<KeyBinding>,
     accept_label: Option<&str>,

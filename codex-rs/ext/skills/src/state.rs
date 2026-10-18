@@ -86,7 +86,8 @@ impl SkillsThreadState {
     }
 
     pub(crate) fn cloud_skill_enabled(&self) -> bool {
-        self.cloud_skills_available && self.config().cloud_skill_enabled
+        let config = self.config();
+        self.cloud_skills_available && config.enabled && config.cloud_skill_enabled
     }
 
     pub(crate) fn replace_shadow_selection_turn(

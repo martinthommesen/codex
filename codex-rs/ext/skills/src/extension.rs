@@ -195,7 +195,7 @@ where
                 return Vec::new();
             };
             let config = thread_state.config();
-            if !config.include_instructions {
+            if !config.enabled || !config.include_instructions {
                 return Vec::new();
             }
             let catalog = self
@@ -372,6 +372,9 @@ where
             };
 
             let config = thread_state.config();
+            if !config.enabled {
+                return Vec::new();
+            }
             let mcp_resources = session_store
                 .get::<SkillsSessionState>()
                 .and_then(|state| state.mcp_resources.clone());

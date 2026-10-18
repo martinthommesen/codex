@@ -25,6 +25,12 @@ pub fn validate_required_skills<'a>(
         "Required skills cannot be validated because the skills extension is unavailable"
             .to_string()
     })?;
+    if !thread_state.config().enabled {
+        return Err(
+            "Required skills are unavailable because skills are disabled (`features.skills = false`)"
+                .to_string(),
+        );
+    }
     let executor = turn_store.get::<ExecutorSkillsStepState>();
     thread_state.with_cloud_catalog(|cloud| {
         for EnvironmentSkillRequirements {
