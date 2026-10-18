@@ -98,6 +98,13 @@ pub const AMAZON_BEDROCK_DEFAULT_BASE_URL: &str =
 const AMAZON_BEDROCK_MANTLE_CLIENT_AGENT_HEADER: &str = "x-amzn-mantle-client-agent";
 const AMAZON_BEDROCK_MANTLE_CLIENT_AGENT_VALUE: &str = "codex";
 const CHAT_WIRE_API_REMOVED_ERROR: &str = "`wire_api = \"chat\"` is no longer supported.\nHow to fix: set `wire_api = \"responses\"` in your provider config.\nMore info: https://github.com/openai/codex/discussions/7782";
+const ANTHROPIC_PROVIDER_NAME: &str = "Anthropic";
+pub const ANTHROPIC_PROVIDER_ID: &str = "anthropic";
+pub const ANTHROPIC_DEFAULT_BASE_URL: &str = "https://api.anthropic.com/v1";
+/// Environment variable used as a fallback when no Anthropic API key is stored by Codex.
+pub const ANTHROPIC_API_KEY_ENV_VAR: &str = "ANTHROPIC_API_KEY";
+const CLAUDE_CODE_PROVIDER_NAME: &str = "Claude Code";
+pub const CLAUDE_CODE_PROVIDER_ID: &str = "claude-code";
 pub const LEGACY_OLLAMA_CHAT_PROVIDER_ID: &str = "ollama-chat";
 pub const OLLAMA_CHAT_PROVIDER_REMOVED_ERROR: &str = "`ollama-chat` is no longer supported.\nHow to fix: replace `ollama-chat` with `ollama` in `model_provider`, `oss_provider`, or `--local-provider`.\nMore info: https://github.com/openai/codex/discussions/7782";
 
@@ -108,12 +115,30 @@ pub enum WireApi {
     /// The Responses API exposed by OpenAI at `/v1/responses`.
     #[default]
     Responses,
+    /// The Anthropic Messages API at `/v1/messages`, authenticated with an Anthropic API key.
+    #[serde(rename = "anthropic_messages")]
+    AnthropicMessages,
+    /// The locally installed, unmodified Claude Code CLI (`claude`), which uses its own sign-in
+    /// (for example a Claude subscription). Codex never reads Claude Code credentials.
+    #[serde(rename = "claude_code")]
+    ClaudeCode,
+}
+
+const WIRE_API_VARIANTS: &[&str] = &["responses", "anthropic_messages", "claude_code"];
+
+impl WireApi {
+    /// Returns whether this protocol targets Claude models.
+    pub fn is_claude(self) -> bool {
+        matches!(self, Self::AnthropicMessages | Self::ClaudeCode)
+    }
 }
 
 impl fmt::Display for WireApi {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let value = match self {
             Self::Responses => "responses",
+            Self::AnthropicMessages => "anthropic_messages",
+            Self::ClaudeCode => "claude_code",
         };
         f.write_str(value)
     }
@@ -127,8 +152,10 @@ impl<'de> Deserialize<'de> for WireApi {
         let value = String::deserialize(deserializer)?;
         match value.as_str() {
             "responses" => Ok(Self::Responses),
+            "anthropic_messages" => Ok(Self::AnthropicMessages),
+            "claude_code" => Ok(Self::ClaudeCode),
             "chat" => Err(serde::de::Error::custom(CHAT_WIRE_API_REMOVED_ERROR)),
-            _ => Err(serde::de::Error::unknown_variant(&value, &["responses"])),
+            _ => Err(serde::de::Error::unknown_variant(&value, WIRE_API_VARIANTS)),
         }
     }
 }
@@ -296,9 +323,72 @@ other non-default provider fields are not supported"
         Ok(())
     }
 
+    /// Checks that a configured Anthropic or Claude Code entry only customizes supported fields.
+    /// Call this on the override before merging it with the built-in provider.
+    pub fn validate_claude_override(&self) -> Result<(), String> {
+        let unsupported_fields = Self {
+            // The built-in name and wire protocol always win; restating them is harmless.
+            name: String::new(),
+            wire_api: WireApi::default(),
+            base_url: None,
+            env_key: None,
+            env_key_instructions: None,
+            http_headers: None,
+            request_max_retries: None,
+            stream_max_retries: None,
+            stream_idle_timeout_ms: None,
+            ..self.clone()
+        };
+        if unsupported_fields != Self::default() {
+            return Err(
+                "only supports changing `base_url`, `env_key`, `env_key_instructions`, \
+`http_headers`, `request_max_retries`, `stream_max_retries`, and `stream_idle_timeout_ms`; \
+other non-default provider fields are not supported"
+                    .to_string(),
+            );
+        }
+        Ok(())
+    }
+
     pub fn validate(&self) -> std::result::Result<(), String> {
         if let Some(gateway) = &self.gateway_oauth {
             gateway.validate(self)?;
+        }
+        if self.wire_api.is_claude() {
+            let mut conflicts = Vec::new();
+            if self.requires_openai_auth {
+                conflicts.push("requires_openai_auth");
+            }
+            if self.aws.is_some() {
+                conflicts.push("aws");
+            }
+            if self.gateway_oauth.is_some() {
+                conflicts.push("gateway_oauth");
+            }
+            if self.supports_websockets {
+                conflicts.push("supports_websockets");
+            }
+            if self.wire_api == WireApi::ClaudeCode {
+                if self.base_url.is_some() {
+                    conflicts.push("base_url");
+                }
+                if self.env_key.is_some() {
+                    conflicts.push("env_key");
+                }
+                if self.experimental_bearer_token.is_some() {
+                    conflicts.push("experimental_bearer_token");
+                }
+                if self.auth.is_some() {
+                    conflicts.push("auth");
+                }
+            }
+            if !conflicts.is_empty() {
+                return Err(format!(
+                    "wire_api = \"{}\" cannot be combined with {}",
+                    self.wire_api,
+                    conflicts.join(", ")
+                ));
+            }
         }
         if let Some(aws) = self.aws.as_ref() {
             if self.supports_websockets {
@@ -565,6 +655,74 @@ other non-default provider fields are not supported"
         }
     }
 
+    /// Built-in provider for the Anthropic Messages API (API-key access).
+    pub fn create_anthropic_provider() -> ModelProviderInfo {
+        ModelProviderInfo {
+            name: ANTHROPIC_PROVIDER_NAME.into(),
+            base_url: Some(ANTHROPIC_DEFAULT_BASE_URL.to_string()),
+            model_catalog_url: None,
+            // Keys come from the isolated Codex Anthropic credential store, falling back to
+            // ANTHROPIC_API_KEY. Setting env_key here would make a stored key alone insufficient.
+            env_key: None,
+            env_key_instructions: None,
+            experimental_bearer_token: None,
+            auth: None,
+            gateway_oauth: None,
+            aws: None,
+            wire_api: WireApi::AnthropicMessages,
+            capabilities: None,
+            query_params: None,
+            http_headers: None,
+            env_http_headers: None,
+            request_max_retries: None,
+            stream_max_retries: None,
+            stream_idle_timeout_ms: None,
+            websocket_connect_timeout_ms: None,
+            requires_openai_auth: false,
+            supports_websockets: false,
+            supports_standalone_web_search: false,
+            include_internal_metadata: false,
+        }
+    }
+
+    /// Built-in provider that drives the official Claude Code CLI with its own sign-in.
+    pub fn create_claude_code_provider() -> ModelProviderInfo {
+        ModelProviderInfo {
+            name: CLAUDE_CODE_PROVIDER_NAME.into(),
+            base_url: None,
+            model_catalog_url: None,
+            env_key: None,
+            env_key_instructions: None,
+            experimental_bearer_token: None,
+            auth: None,
+            gateway_oauth: None,
+            aws: None,
+            wire_api: WireApi::ClaudeCode,
+            capabilities: None,
+            query_params: None,
+            http_headers: None,
+            env_http_headers: None,
+            request_max_retries: None,
+            stream_max_retries: None,
+            stream_idle_timeout_ms: None,
+            websocket_connect_timeout_ms: None,
+            requires_openai_auth: false,
+            supports_websockets: false,
+            supports_standalone_web_search: false,
+            include_internal_metadata: false,
+        }
+    }
+
+    /// Whether this provider speaks the Anthropic Messages API.
+    pub fn is_anthropic(&self) -> bool {
+        self.wire_api == WireApi::AnthropicMessages
+    }
+
+    /// Whether this provider drives the Claude Code CLI.
+    pub fn is_claude_code(&self) -> bool {
+        self.wire_api == WireApi::ClaudeCode
+    }
+
     pub fn create_amazon_bedrock_provider(
         aws: Option<ModelProviderAwsAuthInfo>,
     ) -> ModelProviderInfo {
@@ -665,6 +823,8 @@ pub fn built_in_model_providers(
     let amazon_bedrock_provider = P::create_amazon_bedrock_provider(/*aws*/ None);
     let amazon_bedrock_runtime_provider =
         P::create_amazon_bedrock_runtime_provider(/*aws*/ None);
+    let anthropic_provider = P::create_anthropic_provider();
+    let claude_code_provider = P::create_claude_code_provider();
 
     // We do not want to be in the business of adjucating which third-party
     // providers are bundled with Codex CLI, so we only include the OpenAI and
@@ -677,6 +837,8 @@ pub fn built_in_model_providers(
             AMAZON_BEDROCK_RUNTIME_PROVIDER_ID,
             amazon_bedrock_runtime_provider,
         ),
+        (ANTHROPIC_PROVIDER_ID, anthropic_provider),
+        (CLAUDE_CODE_PROVIDER_ID, claude_code_provider),
         (
             OLLAMA_OSS_PROVIDER_ID,
             create_oss_provider(DEFAULT_OLLAMA_PORT, WireApi::Responses),
@@ -694,8 +856,10 @@ pub fn built_in_model_providers(
 /// Merge configured providers into the built-in provider catalog.
 ///
 /// Configured providers extend the built-in set. Built-in providers are not
-/// generally overridable, but built-in Amazon Bedrock providers allow the user
-/// to customize their endpoint, authentication, headers, and AWS settings.
+/// generally overridable, but the built-in Anthropic and Claude Code providers
+/// allow endpoint, key-variable, header, and retry tuning, and built-in Amazon
+/// Bedrock providers allow the user to customize their endpoint,
+/// authentication, headers, and AWS settings.
 pub fn merge_configured_model_providers(
     mut model_providers: HashMap<String, ModelProviderInfo>,
     configured_model_providers: HashMap<String, ModelProviderInfo>,
@@ -724,6 +888,47 @@ pub fn merge_configured_model_providers(
                         .get_or_insert_default()
                         .extend(http_headers_override);
                 }
+            }
+        } else if matches!(
+            key.as_str(),
+            ANTHROPIC_PROVIDER_ID | CLAUDE_CODE_PROVIDER_ID
+        ) {
+            provider
+                .validate_claude_override()
+                .map_err(|message| format!("model_providers.{key} {message}"))?;
+            if let Some(built_in_provider) = model_providers.get_mut(&key) {
+                if key == CLAUDE_CODE_PROVIDER_ID
+                    && (provider.base_url.is_some() || provider.env_key.is_some())
+                {
+                    return Err(format!(
+                        "model_providers.{key} does not support `base_url` or `env_key`; \
+Claude Code uses its own sign-in"
+                    ));
+                }
+                if let Some(base_url) = provider.base_url.take() {
+                    built_in_provider.base_url = Some(base_url);
+                }
+                if let Some(env_key) = provider.env_key.take() {
+                    built_in_provider.env_key = Some(env_key);
+                }
+                if let Some(instructions) = provider.env_key_instructions.take() {
+                    built_in_provider.env_key_instructions = Some(instructions);
+                }
+                if let Some(http_headers) = provider.http_headers.take() {
+                    built_in_provider
+                        .http_headers
+                        .get_or_insert_default()
+                        .extend(http_headers);
+                }
+                built_in_provider.request_max_retries = provider
+                    .request_max_retries
+                    .or(built_in_provider.request_max_retries);
+                built_in_provider.stream_max_retries = provider
+                    .stream_max_retries
+                    .or(built_in_provider.stream_max_retries);
+                built_in_provider.stream_idle_timeout_ms = provider
+                    .stream_idle_timeout_ms
+                    .or(built_in_provider.stream_idle_timeout_ms);
             }
         } else {
             model_providers.entry(key).or_insert(provider);

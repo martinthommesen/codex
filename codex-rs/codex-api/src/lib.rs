@@ -1,3 +1,4 @@
+pub mod anthropic;
 pub(crate) mod api_bridge;
 pub(crate) mod auth;
 pub(crate) mod common;
