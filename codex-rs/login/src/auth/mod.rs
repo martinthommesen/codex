@@ -1,5 +1,6 @@
 mod access_token;
 mod agent_identity;
+mod anthropic;
 mod auth_headers;
 mod bedrock_access_keys;
 mod bedrock_api_key;
@@ -15,6 +16,10 @@ mod external_bearer;
 mod manager;
 mod revoke;
 
+pub use anthropic::ANTHROPIC_API_KEY_ENV_VAR;
+pub use anthropic::AnthropicAuthConfig;
+pub use anthropic::AnthropicCredential;
+pub use anthropic::AnthropicCredentialSource;
 pub use auth_headers::AuthHeaders;
 pub use bedrock_access_keys::BedrockAccessKeysAuth;
 pub use bedrock_access_keys::login_with_bedrock_access_keys;

@@ -1,6 +1,8 @@
 use regex::Regex;
 use std::sync::LazyLock;
 
+static ANTHROPIC_KEY_REGEX: LazyLock<Regex> =
+    LazyLock::new(|| compile_regex(r"sk-ant-[A-Za-z0-9_-]{20,}"));
 static OPENAI_KEY_REGEX: LazyLock<Regex> = LazyLock::new(|| compile_regex(r"sk-[A-Za-z0-9]{20,}"));
 static AWS_ACCESS_KEY_ID_REGEX: LazyLock<Regex> =
     LazyLock::new(|| compile_regex(r"\bAKIA[0-9A-Z]{16}\b"));
@@ -14,6 +16,7 @@ static SECRET_ASSIGNMENT_REGEX: LazyLock<Regex> = LazyLock::new(|| {
 /// well-known REGEX.
 pub fn redact_secrets(input: String) -> String {
     let redacted = BEARER_TOKEN_REGEX.replace_all(&input, "Bearer [REDACTED_SECRET]");
+    let redacted = ANTHROPIC_KEY_REGEX.replace_all(&redacted, "[REDACTED_SECRET]");
     let redacted = OPENAI_KEY_REGEX.replace_all(&redacted, "[REDACTED_SECRET]");
     let redacted = AWS_ACCESS_KEY_ID_REGEX.replace_all(&redacted, "[REDACTED_SECRET]");
     let redacted = SECRET_ASSIGNMENT_REGEX.replace_all(&redacted, "$1$2$3[REDACTED_SECRET]");
@@ -66,6 +69,38 @@ mod tests {
         for (input, expected) in cases {
             assert_eq!(redact_secrets(input.to_string()), expected);
         }
+    }
+
+    #[test]
+    fn redacts_anthropic_api_keys() {
+        let cases = [
+            (
+                "key sk-ant-api03-AbCdEfGhIjKlMnOpQrStUvWxYz_0123456789-AA done",
+                "key [REDACTED_SECRET] done",
+            ),
+            (
+                "x-api-key: sk-ant-admin01-abcdefghijklmnopqrstuvwx",
+                "x-api-key: [REDACTED_SECRET]",
+            ),
+            (
+                r#"{"api_key":"sk-ant-api03-abcdefghijklmnopqrst-_xyz"}"#,
+                r#"{"api_key":"[REDACTED_SECRET]"}"#,
+            ),
+            (
+                "ANTHROPIC_API_KEY=sk-ant-oat01-abcdefghijklmnopqrstu\nnext",
+                "ANTHROPIC_API_KEY=[REDACTED_SECRET]\nnext",
+            ),
+        ];
+
+        for (input, expected) in cases {
+            assert_eq!(redact_secrets(input.to_string()), expected);
+        }
+    }
+
+    #[test]
+    fn keeps_short_anthropic_like_strings() {
+        let input = "sk-ant-short and sk-ant- prefix";
+        assert_eq!(redact_secrets(input.to_string()), input);
     }
 
     #[test]

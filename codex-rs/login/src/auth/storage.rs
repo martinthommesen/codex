@@ -21,7 +21,7 @@ use std::sync::Mutex;
 use tracing::warn;
 
 #[path = "storage_error.rs"]
-mod storage_error;
+pub(super) mod storage_error;
 
 #[path = "storage_telemetry.rs"]
 mod storage_telemetry;
@@ -242,8 +242,9 @@ static CODEX_AUTH_SECRET_NAME: Lazy<SecretName> =
     });
 const KEYRING_SERVICE: &str = "Codex Auth";
 
-// turns codex_home path into a stable, short key string
-fn compute_store_key(codex_home: &Path) -> std::io::Result<String> {
+/// Turns a codex_home path into a stable, short identifier shared by the credential stores
+/// scoped to that home.
+pub(super) fn codex_home_store_hash(codex_home: &Path) -> String {
     let canonical = codex_home
         .canonicalize()
         .unwrap_or_else(|_| codex_home.to_path_buf());
@@ -252,8 +253,11 @@ fn compute_store_key(codex_home: &Path) -> std::io::Result<String> {
     hasher.update(path_str.as_bytes());
     let digest = hasher.finalize();
     let hex = format!("{digest:x}");
-    let truncated = hex.get(..16).unwrap_or(&hex);
-    Ok(format!("cli|{truncated}"))
+    hex.get(..16).unwrap_or(&hex).to_string()
+}
+
+fn compute_store_key(codex_home: &Path) -> std::io::Result<String> {
+    Ok(format!("cli|{}", codex_home_store_hash(codex_home)))
 }
 
 #[derive(Clone, Debug)]
@@ -592,7 +596,7 @@ pub(super) fn create_auth_storage(
     create_auth_storage_with_store(codex_home, mode, keyring_store, keyring_backend_kind)
 }
 
-fn create_auth_storage_with_store(
+pub(super) fn create_auth_storage_with_store(
     codex_home: PathBuf,
     mode: AuthCredentialsStoreMode,
     keyring_store: Arc<dyn KeyringStore>,

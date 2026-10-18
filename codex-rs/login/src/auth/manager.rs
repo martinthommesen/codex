@@ -39,6 +39,7 @@ use super::agent_identity::record_needs_task_registration;
 use super::agent_identity::register_managed_chatgpt_agent_identity;
 use super::agent_identity::require_agent_identity_authapi_base_url;
 use super::agent_identity::verified_record_from_jwt;
+use super::anthropic::AnthropicAuthConfig;
 use super::change_state::AuthChangeState;
 use super::change_state::same_owner;
 use super::external_bearer::BearerTokenRefresher;
@@ -2963,6 +2964,17 @@ impl AuthManager {
             self.record_permanent_refresh_failure_if_unchanged(attempted_auth, error);
         }
         result
+    }
+
+    /// Returns the Anthropic credential store for this manager's Codex home and storage
+    /// settings. It is isolated from ChatGPT auth, so this manager's login, refresh, and
+    /// logout never modify the Anthropic key.
+    pub fn anthropic_auth_config(&self) -> AnthropicAuthConfig {
+        AnthropicAuthConfig::new(
+            self.codex_home.clone(),
+            self.auth_credentials_store_mode,
+            self.keyring_backend_kind,
+        )
     }
 
     /// Log out by deleting credentials from the selected storage backend and the

@@ -180,7 +180,8 @@ pub fn environment_id_from_cwd(cwd: &Path) -> String {
 }
 
 /// Computes the OS keyring account name used to store a local namespace's passphrase.
-/// Existing namespaces retain their shared key; gateway credentials use an independent key.
+/// Existing namespaces retain their shared key; gateway and Anthropic credentials use
+/// independent keys.
 pub fn compute_keyring_account(codex_home: &Path, namespace: LocalSecretsNamespace) -> String {
     let canonical = codex_home
         .canonicalize()
@@ -197,6 +198,7 @@ pub fn compute_keyring_account(codex_home: &Path, namespace: LocalSecretsNamespa
     // stores from overwriting each other's newly generated encryption key.
     match namespace {
         LocalSecretsNamespace::GatewayOAuth => format!("{home_account}|gateway-oauth"),
+        LocalSecretsNamespace::AnthropicAuth => format!("{home_account}|anthropic-auth"),
         LocalSecretsNamespace::ManagedSecrets
         | LocalSecretsNamespace::CodexAuth
         | LocalSecretsNamespace::McpOAuth => home_account,
@@ -229,6 +231,31 @@ mod tests {
         let hex = format!("{digest:x}");
         let short = hex.get(..12).expect("digest has at least 12 chars");
         assert_eq!(env_id, format!("cwd-{short}"));
+    }
+
+    #[test]
+    fn keyring_accounts_isolate_independent_namespaces() {
+        let codex_home = PathBuf::from("~/.codex");
+        let accounts = [
+            LocalSecretsNamespace::ManagedSecrets,
+            LocalSecretsNamespace::CodexAuth,
+            LocalSecretsNamespace::McpOAuth,
+            LocalSecretsNamespace::GatewayOAuth,
+            LocalSecretsNamespace::AnthropicAuth,
+        ]
+        .map(|namespace| compute_keyring_account(&codex_home, namespace));
+
+        let home_account = accounts[0].clone();
+        assert_eq!(
+            accounts,
+            [
+                home_account.clone(),
+                home_account.clone(),
+                home_account.clone(),
+                format!("{home_account}|gateway-oauth"),
+                format!("{home_account}|anthropic-auth"),
+            ]
+        );
     }
 
     #[test]

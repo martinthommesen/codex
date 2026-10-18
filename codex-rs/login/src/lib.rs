@@ -32,7 +32,11 @@ pub use success_page::CODEX_OPEN_APP_URL;
 pub use success_page::LoginSuccessPage;
 pub use success_page::LoginSuccessPageBrand;
 
+pub use auth::ANTHROPIC_API_KEY_ENV_VAR;
 pub use auth::AgentIdentityAuthPolicy;
+pub use auth::AnthropicAuthConfig;
+pub use auth::AnthropicCredential;
+pub use auth::AnthropicCredentialSource;
 pub use auth::AuthChangeState;
 pub use auth::AuthConfig;
 pub use auth::AuthDotJson;

@@ -19,7 +19,7 @@ impl std::fmt::Debug for CredentialStorageError {
     }
 }
 
-pub(super) fn with_context(
+pub(in crate::auth) fn with_context(
     context: &'static str,
     source: impl Into<anyhow::Error>,
 ) -> std::io::Error {
