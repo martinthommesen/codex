@@ -3014,16 +3014,31 @@ async fn slash_memories_opens_memory_menu() {
 }
 
 #[tokio::test]
-async fn slash_settings_opens_kill_switch_panel() {
+async fn slash_settings_asks_the_app_for_saved_values() {
     let (mut chat, mut rx, mut op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
 
     chat.dispatch_command(SlashCommand::Settings);
 
+    assert_matches!(rx.try_recv(), Ok(AppEvent::OpenSettingsPanel));
+    assert!(op_rx.try_recv().is_err(), "expected no core op to be sent");
+    chat.open_settings_panel(crate::settings_panel::statuses(chat.config_ref()));
     let popup = render_bottom_popup(&chat, /*width*/ 120);
     assert!(popup.contains("Plugins & apps"), "got {popup:?}");
     assert!(popup.contains("[x] On"), "got {popup:?}");
-    assert_matches!(rx.try_recv(), Err(TryRecvError::Empty));
-    assert!(op_rx.try_recv().is_err(), "expected no core op to be sent");
+}
+
+#[tokio::test]
+async fn saved_goals_switch_keeps_running_session_goal_controls() {
+    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+    let mut saved = chat.config_ref().clone();
+    crate::settings_panel::SettingsSwitch::Goals
+        .apply(&mut saved, /*enabled*/ false)
+        .expect("goals is not pinned");
+
+    chat.apply_settings_switch(crate::settings_panel::SettingsSwitch::Goals, &saved);
+
+    assert!(chat.config_ref().features.enabled(Feature::Goals));
+    assert!(chat.builtin_command_flags().goal_command_enabled);
 }
 
 #[tokio::test]
@@ -3043,7 +3058,10 @@ async fn saved_skills_switch_hides_command_and_refreshes_skill_list() {
         op_rx.try_recv(),
         Ok(Op::ListSkills { cwds, force_reload: true }) if cwds == vec![expected_cwd]
     );
-    assert!(op_rx.try_recv().is_err(), "expected a single skills refresh");
+    assert!(
+        op_rx.try_recv().is_err(),
+        "expected a single skills refresh"
+    );
 }
 
 #[tokio::test]

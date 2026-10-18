@@ -252,6 +252,13 @@ where
         input: WorldStateContributionInput<'a>,
     ) -> ExtensionFuture<'a, Vec<WorldStateSectionContribution>> {
         Box::pin(async move {
+            if input
+                .thread_store
+                .get::<SkillsThreadState>()
+                .is_some_and(|state| !state.config().enabled)
+            {
+                return crate::world_state::disabled_skills_world_state_sections();
+            }
             let Some(context) =
                 CatalogContext::new(&self.providers, Arc::clone(&self.event_sink), input)
             else {

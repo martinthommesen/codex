@@ -1323,10 +1323,7 @@ async fn cli_main(
                         let mut feature_overrides = std::collections::BTreeMap::new();
                         // Match Features::apply_map's alias precedence.
                         for (&name, &value) in &features {
-                            if codex_features::canonical_feature_for_key(name).is_none()
-                                && codex_features::feature_for_key(name)
-                                    .is_some_and(|feature| features.contains_key(feature.key()))
-                            {
+                            if name == "imagegenext" && features.contains_key("image_generation") {
                                 continue;
                             }
                             let value = if let Some(table) = value.as_table() {

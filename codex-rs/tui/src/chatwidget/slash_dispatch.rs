@@ -16,6 +16,7 @@ use crate::bottom_pane::slash_commands::SlashCommandItem;
 use crate::bottom_pane::slash_commands::find_slash_command;
 use crate::goal_display::GOAL_USAGE;
 use crate::goal_files::GoalDraft;
+use crate::settings_panel::SettingsSwitch;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum SlashCommandDispatchSource {
@@ -327,10 +328,14 @@ impl ChatWidget {
             }
             SlashCommand::Init => {
                 if !self.config.features.enabled(Feature::AgentsMd) {
+                    let hint = self.turn_back_on_hint(
+                        SettingsSwitch::AgentsMd,
+                        "Turn AGENTS.md back on in /settings.",
+                    );
                     self.add_info_message(
                         "AGENTS.md is turned off, so Codex would not load the file /init creates."
                             .to_string(),
-                        Some("Turn AGENTS.md back on in /settings.".to_string()),
+                        Some(hint),
                     );
                     return;
                 }
@@ -492,7 +497,7 @@ impl ChatWidget {
                 self.open_experimental_popup();
             }
             SlashCommand::Settings => {
-                self.open_settings_panel();
+                self.app_event_tx.send(AppEvent::OpenSettingsPanel);
             }
             SlashCommand::AutoReview => {
                 self.open_auto_review_denials_popup();
@@ -548,10 +553,11 @@ impl ChatWidget {
             }
             SlashCommand::Skills => {
                 if !self.config.features.enabled(Feature::Skills) {
-                    self.add_info_message(
-                        "Skills are turned off.".to_string(),
-                        Some("Turn them back on in /settings.".to_string()),
+                    let hint = self.turn_back_on_hint(
+                        SettingsSwitch::Skills,
+                        "Turn them back on in /settings.",
                     );
+                    self.add_info_message("Skills are turned off.".to_string(), Some(hint));
                     return;
                 }
                 self.open_skills_menu();
@@ -562,10 +568,11 @@ impl ChatWidget {
             }
             SlashCommand::Hooks => {
                 if !self.config.features.enabled(Feature::CodexHooks) {
-                    self.add_info_message(
-                        "Hooks are turned off.".to_string(),
-                        Some("Turn them back on in /settings.".to_string()),
+                    let hint = self.turn_back_on_hint(
+                        SettingsSwitch::Hooks,
+                        "Turn them back on in /settings.",
                     );
+                    self.add_info_message("Hooks are turned off.".to_string(), Some(hint));
                     return;
                 }
                 self.add_hooks_output();

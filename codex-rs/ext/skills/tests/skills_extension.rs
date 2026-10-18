@@ -3010,8 +3010,21 @@ async fn disabled_extension_contributes_no_skill_context_or_requirements() -> Te
                 .iter()
                 .map(WorldStateSectionContribution::id)
                 .collect::<Vec<_>>(),
-            if enabled { vec!["skills"] } else { Vec::new() }
+            if enabled {
+                vec!["skills"]
+            } else {
+                // Disabled sections only retract catalogs a thread already showed.
+                vec!["host_skills", "skills", "cloud_skills"]
+            }
         );
+        if !enabled {
+            assert!(sections.iter().all(|section| {
+                section
+                    .render_diff(PreviousWorldStateSection::Absent)
+                    .1
+                    .is_none()
+            }));
+        }
         assert_eq!(
             read_request_keys(&read_requests).len(),
             usize::from(enabled)

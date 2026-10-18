@@ -728,11 +728,8 @@ impl Features {
                 }
                 _ => {}
             }
-            // An explicit canonical key wins over its legacy alias in the same table.
-            if let Some(feature) = legacy::feature_for_legacy_key(k)
-                && m.contains_key(feature.key())
-            {
-                self.record_legacy_usage(k, feature);
+            if k == "imagegenext" && m.contains_key(Feature::ImageGeneration.key()) {
+                self.record_legacy_usage(k, Feature::ImageGeneration);
                 continue;
             }
             match feature_for_key(k) {

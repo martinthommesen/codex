@@ -1038,7 +1038,7 @@ impl PluginRequestProcessor {
         };
         let plugins_input = config.plugins_config_input();
 
-        let plugin = match read_source {
+        let mut plugin = match read_source {
             Ok(marketplace_path) => {
                 let request = PluginReadRequest {
                     plugin_name,
@@ -1218,6 +1218,13 @@ impl PluginRequestProcessor {
                 remote_plugin_detail_to_info(remote_detail, app_summaries, plugin_policy)
             }
         };
+        if !config.features.enabled(Feature::Skills) {
+            // Plugin skills are never loaded while skills are off, so do not offer them.
+            for skill in &mut plugin.skills {
+                skill.enabled = false;
+            }
+            plugin.onboarding_skill = None;
+        }
 
         Ok(PluginReadResponse { plugin })
     }

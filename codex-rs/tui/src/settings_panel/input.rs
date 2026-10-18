@@ -37,20 +37,16 @@ impl SettingsPanel {
         if self.saving {
             return;
         }
-        let Some(status) = self
+        let Some((switch, enabled)) = self
             .status_index(selected)
             .and_then(|index| self.statuses.get(index))
+            .and_then(|status| status.target.map(|enabled| (status.switch, enabled)))
         else {
             return;
         };
-        if status.locked {
-            return;
-        }
         self.saving = true;
-        self.app_event_tx.send(AppEvent::SaveSettingsSwitch {
-            switch: status.switch,
-            enabled: status.state.toggled(),
-        });
+        self.app_event_tx
+            .send(AppEvent::SaveSettingsSwitch { switch, enabled });
     }
 }
 

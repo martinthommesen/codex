@@ -131,8 +131,11 @@ impl SettingsSwitch {
             .map(|feature| config.features.enabled(*feature))
             .collect::<Vec<_>>();
         match self {
-            // `agents.enabled = false` is what actually removes subagent tools.
-            Self::Subagents => values.push(config.agents_enabled),
+            // `features.multi_agent_v2` overrides `agents.enabled = false`, so either one keeps
+            // subagent tools available.
+            Self::Subagents => {
+                values.push(config.agents_enabled || config.features.enabled(Feature::MultiAgentV2))
+            }
             Self::WebSearch => {
                 values.push(config.web_search_mode.value() != WebSearchMode::Disabled)
             }
@@ -150,21 +153,27 @@ impl SettingsSwitch {
     /// Turns the switch fully on or off in `config`, rejecting values pinned by requirements.
     pub(crate) fn apply(self, config: &mut Config, enabled: bool) -> Result<(), String> {
         for feature in self.features() {
-            config
-                .features
-                .set_enabled(*feature, enabled)
-                .map_err(|err| err.to_string())?;
+            set_feature(config, *feature, enabled)?;
         }
         match self {
-            Self::Subagents => config.agents_enabled = enabled,
-            Self::WebSearch => config
-                .web_search_mode
-                .set(if enabled {
-                    WebSearchMode::Cached
+            Self::Subagents => {
+                config.agents_enabled = enabled;
+                if !enabled {
+                    set_feature(config, Feature::MultiAgentV2, /*enabled*/ false)?;
+                }
+            }
+            Self::WebSearch => {
+                let mode = if enabled {
+                    enabled_web_search_mode(config)
+                        .ok_or_else(|| "requirements only allow disabled web search".to_string())?
                 } else {
                     WebSearchMode::Disabled
-                })
-                .map_err(|err| err.to_string())?,
+                };
+                config
+                    .web_search_mode
+                    .set(mode)
+                    .map_err(|err| err.to_string())?;
+            }
             Self::PluginsAndApps
             | Self::Skills
             | Self::Hooks
@@ -178,16 +187,22 @@ impl SettingsSwitch {
 
     /// Copies only this switch's values, leaving unrelated settings unchanged.
     pub(crate) fn adopt(self, target: &mut Config, source: &Config) {
-        for feature in self.features() {
+        let adopt_feature = |target: &mut Config, feature: Feature| {
             if let Err(err) = target
                 .features
-                .set_enabled(*feature, source.features.enabled(*feature))
+                .set_enabled(feature, source.features.enabled(feature))
             {
                 tracing::warn!(error = %err, feature = feature.key(), "failed to adopt feature state");
             }
+        };
+        for feature in self.features() {
+            adopt_feature(target, *feature);
         }
         match self {
-            Self::Subagents => target.agents_enabled = source.agents_enabled,
+            Self::Subagents => {
+                target.agents_enabled = source.agents_enabled;
+                adopt_feature(target, Feature::MultiAgentV2);
+            }
             Self::WebSearch => {
                 if let Err(err) = target.web_search_mode.set(source.web_search_mode.value()) {
                     tracing::warn!(error = %err, "failed to adopt web search mode");
@@ -204,13 +219,10 @@ impl SettingsSwitch {
     }
 
     /// Explicit values for every key, so runtime enablement and legacy aliases cannot win.
-    pub(crate) fn edits(self, enabled: bool) -> Vec<ConfigEdit> {
+    pub(crate) fn edits(self, enabled: bool, config: &Config) -> Vec<ConfigEdit> {
         let mut edits = Vec::new();
         for feature in self.features() {
-            edits.push(replace_config_value(
-                format!("features.{}", feature.key()),
-                serde_json::json!(enabled),
-            ));
+            edits.push(feature_edit(*feature, enabled));
             edits.extend(
                 legacy_keys_for_feature(*feature)
                     .map(|legacy_key| clear_config_value(format!("features.{legacy_key}"))),
@@ -222,6 +234,9 @@ impl SettingsSwitch {
                     "agents.enabled",
                     serde_json::json!(enabled),
                 ));
+                if !enabled && config.features.enabled(Feature::MultiAgentV2) {
+                    edits.push(feature_edit(Feature::MultiAgentV2, /*enabled*/ false));
+                }
             }
             // Clearing restores the default mode instead of guessing a previous one.
             Self::WebSearch if enabled => edits.push(clear_config_value("web_search")),
@@ -239,6 +254,39 @@ impl SettingsSwitch {
         }
         edits
     }
+}
+
+fn feature_edit(feature: Feature, enabled: bool) -> ConfigEdit {
+    replace_config_value(
+        format!("features.{}", feature.key()),
+        serde_json::json!(enabled),
+    )
+}
+
+fn set_feature(config: &mut Config, feature: Feature, enabled: bool) -> Result<(), String> {
+    config
+        .features
+        .set_enabled(feature, enabled)
+        .map_err(|err| err.to_string())?;
+    // Requirements restore pinned features silently, so compare the effective value.
+    if config.features.enabled(feature) != enabled {
+        return Err(format!(
+            "`features.{}` is pinned by requirements",
+            feature.key()
+        ));
+    }
+    Ok(())
+}
+
+/// The mode an unset `web_search` resolves to: the default when allowed, else another allowed one.
+pub(crate) fn enabled_web_search_mode(config: &Config) -> Option<WebSearchMode> {
+    [
+        WebSearchMode::Cached,
+        WebSearchMode::Indexed,
+        WebSearchMode::Live,
+    ]
+    .into_iter()
+    .find(|mode| config.web_search_mode.can_set(mode).is_ok())
 }
 
 /// Combined state of the keys behind one switch.
@@ -272,8 +320,19 @@ impl SwitchState {
 pub(crate) struct SwitchStatus {
     pub(crate) switch: SettingsSwitch,
     pub(crate) state: SwitchState,
-    /// Requirements pin a value, so toggling would be rejected.
-    pub(crate) locked: bool,
+    /// Value activating the row requests, or `None` when requirements pin every direction.
+    pub(crate) target: Option<bool>,
+}
+
+impl SwitchStatus {
+    fn locked(self) -> bool {
+        self.target.is_none()
+    }
+
+    /// Requirements block the usual toggle direction.
+    fn managed(self) -> bool {
+        self.target != Some(self.state.toggled())
+    }
 }
 
 pub(crate) fn statuses(config: &Config) -> Vec<SwitchStatus> {
@@ -281,11 +340,20 @@ pub(crate) fn statuses(config: &Config) -> Vec<SwitchStatus> {
         .into_iter()
         .map(|switch| {
             let state = switch.state(config);
-            let mut probe = config.clone();
+            let can_apply = |enabled| switch.apply(&mut config.clone(), enabled).is_ok();
+            let preferred = state.toggled();
+            // A partial switch with a key pinned off can still turn everything else off.
+            let target = if can_apply(preferred) {
+                Some(preferred)
+            } else if state == SwitchState::Partial && can_apply(!preferred) {
+                Some(!preferred)
+            } else {
+                None
+            };
             SwitchStatus {
                 switch,
                 state,
-                locked: switch.apply(&mut probe, state.toggled()).is_err(),
+                target,
             }
         })
         .collect()

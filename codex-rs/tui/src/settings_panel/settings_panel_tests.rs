@@ -4,7 +4,13 @@ use super::*;
 use crate::app_event::AppEvent;
 use crate::bottom_pane::BottomPaneView;
 use crate::keymap::RuntimeKeymap;
+use crate::legacy_core::config::ManagedFeatures;
 use crate::render::renderable::Renderable;
+use codex_config::Constrained;
+use codex_config::ConstraintError;
+use codex_config::FeatureRequirementsToml;
+use codex_config::RequirementSource;
+use codex_config::Sourced;
 use crossterm::event::KeyCode;
 use crossterm::event::KeyEvent;
 use crossterm::event::KeyModifiers;
@@ -19,7 +25,7 @@ fn status(switch: SettingsSwitch, state: SwitchState) -> SwitchStatus {
     SwitchStatus {
         switch,
         state,
-        locked: false,
+        target: Some(state.toggled()),
     }
 }
 
@@ -31,7 +37,7 @@ fn mixed_statuses() -> Vec<SwitchStatus> {
             SettingsSwitch::PluginsAndApps => status(switch, SwitchState::Partial),
             SettingsSwitch::Hooks | SettingsSwitch::Memories => status(switch, SwitchState::Off),
             SettingsSwitch::WebSearch => SwitchStatus {
-                locked: true,
+                target: None,
                 ..status(switch, SwitchState::On)
             },
             _ => status(switch, SwitchState::On),
@@ -118,7 +124,7 @@ fn enter_requests_the_opposite_state_once_until_refreshed() {
     assert!(rx.try_recv().is_err(), "a save is already in flight");
 
     let mut statuses = mixed_statuses();
-    statuses[1].state = SwitchState::Off;
+    statuses[1] = status(SettingsSwitch::Skills, SwitchState::Off);
     assert!(panel.update_settings_panel(&SettingsPanelUpdate {
         statuses,
         keymap: RuntimeKeymap::defaults().list,
@@ -208,11 +214,12 @@ async fn switches_read_and_apply_config() {
     assert_eq!(SettingsSwitch::WebSearch.state(&config), SwitchState::Off);
 }
 
-#[test]
-fn edits_write_explicit_values_and_clear_legacy_aliases() {
+#[tokio::test]
+async fn edits_write_explicit_values_and_clear_legacy_aliases() {
+    let (_codex_home, config) = test_config().await;
     let edits = |switch: SettingsSwitch, enabled: bool| {
         switch
-            .edits(enabled)
+            .edits(enabled, &config)
             .into_iter()
             .map(|edit| (edit.key_path, edit.value))
             .collect::<Vec<_>>()
@@ -258,4 +265,94 @@ fn edits_write_explicit_values_and_clear_legacy_aliases() {
 fn narrow_panel_keeps_descriptions_readable() {
     let (panel, _rx) = panel(mixed_statuses());
     insta::assert_snapshot!("settings_narrow", render(&panel, /*width*/ 70));
+}
+
+#[tokio::test]
+async fn pinned_features_lock_only_the_blocked_direction() {
+    let (_codex_home, mut config) = test_config().await;
+    let mut warnings = Vec::new();
+    config.features = ManagedFeatures::from_configured_with_warnings(
+        config.features.get().clone(),
+        Some(Sourced {
+            value: FeatureRequirementsToml {
+                entries: [("apps".to_string(), false), ("skills".to_string(), true)]
+                    .into_iter()
+                    .collect(),
+            },
+            source: RequirementSource::Unknown,
+        }),
+        &mut warnings,
+    )
+    .expect("pins are valid");
+
+    let statuses = statuses(&config);
+    let plugins = statuses[0];
+    assert_eq!(plugins.state, SwitchState::Partial);
+    // Apps cannot turn on, but plugins can still turn off.
+    assert_eq!(plugins.target, Some(false));
+    assert!(plugins.managed());
+    let skills = statuses[1];
+    assert_eq!(skills.state, SwitchState::On);
+    assert_eq!(skills.target, None);
+    assert!(
+        SettingsSwitch::Skills
+            .apply(&mut config, /*enabled*/ false)
+            .is_err()
+    );
+}
+
+#[tokio::test]
+async fn web_search_turns_on_with_a_mode_requirements_allow() {
+    let (_codex_home, mut config) = test_config().await;
+    config.web_search_mode = Constrained::new(WebSearchMode::Disabled, |mode| match mode {
+        WebSearchMode::Live | WebSearchMode::Disabled => Ok(()),
+        WebSearchMode::Cached | WebSearchMode::Indexed => Err(ConstraintError::InvalidValue {
+            field_name: "web_search",
+            candidate: format!("{mode:?}"),
+            allowed: "[live, disabled]".to_string(),
+            requirement_source: RequirementSource::Unknown,
+        }),
+    })
+    .expect("disabled is allowed");
+
+    let web_search = statuses(&config)[6];
+    assert_eq!(
+        (web_search.switch, web_search.state, web_search.target),
+        (SettingsSwitch::WebSearch, SwitchState::Off, Some(true))
+    );
+    SettingsSwitch::WebSearch
+        .apply(&mut config, /*enabled*/ true)
+        .expect("live is allowed");
+    assert_eq!(config.web_search_mode.value(), WebSearchMode::Live);
+}
+
+#[tokio::test]
+async fn subagents_switch_also_turns_off_multi_agent_v2() {
+    let (_codex_home, mut config) = test_config().await;
+    config
+        .features
+        .set_enabled(Feature::MultiAgentV2, /*enabled*/ true)
+        .expect("not pinned");
+    config.agents_enabled = false;
+    config
+        .features
+        .set_enabled(Feature::Collab, /*enabled*/ false)
+        .expect("not pinned");
+    // V2 overrides `agents.enabled = false`, so subagents are still partly on.
+    assert_eq!(
+        SettingsSwitch::Subagents.state(&config),
+        SwitchState::Partial
+    );
+    assert!(
+        SettingsSwitch::Subagents
+            .edits(/*enabled*/ false, &config)
+            .into_iter()
+            .any(|edit| edit.key_path == "features.multi_agent_v2" && edit.value == json!(false))
+    );
+
+    SettingsSwitch::Subagents
+        .apply(&mut config, /*enabled*/ false)
+        .expect("not pinned");
+    assert_eq!(SettingsSwitch::Subagents.state(&config), SwitchState::Off);
+    assert!(!config.features.enabled(Feature::MultiAgentV2));
 }

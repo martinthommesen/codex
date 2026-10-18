@@ -38,8 +38,8 @@ and ignores `$skill` mentions. `features.agents_md = false` stops loading both
 `~/.codex/AGENTS.md` and project `AGENTS.md` files; instructions supplied by a
 host application are still used.
 
-Saving a switch removes legacy aliases for the same feature (such as
-`features.connectors`), and a canonical key now takes precedence over its
-alias when both are set. Values pinned in `requirements.toml` show as managed
-and cannot be changed from `/settings`. A profile or a trusted project's
-`.codex/config.toml` can still override the user value.
+Saving a switch also removes legacy aliases for the same feature (such as
+`features.connectors`) so they cannot override it. Values pinned in
+`requirements.toml` show as managed and cannot be changed from `/settings`. A
+profile or a trusted project's `.codex/config.toml` can still override the user
+value.

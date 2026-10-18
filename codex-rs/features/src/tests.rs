@@ -458,37 +458,6 @@ fn canonical_image_generation_toggle_wins_over_extension_alias() {
 }
 
 #[test]
-fn canonical_feature_keys_win_over_legacy_aliases() {
-    for (canonical_key, alias_key, feature) in [
-        ("apps", "connectors", Feature::Apps),
-        ("memories", "memory_tool", Feature::MemoryTool),
-        ("hooks", "codex_hooks", Feature::CodexHooks),
-        ("multi_agent", "collab", Feature::Collab),
-    ] {
-        for (canonical, alias) in [(false, true), (true, false)] {
-            let entries = BTreeMap::from([
-                (canonical_key.to_string(), canonical),
-                (alias_key.to_string(), alias),
-            ]);
-            let mut features = Features::with_defaults();
-            features.apply_map(&entries);
-            assert_eq!(
-                features.enabled(feature),
-                canonical,
-                "`{canonical_key}` should win over `{alias_key}`"
-            );
-        }
-    }
-}
-
-#[test]
-fn legacy_alias_applies_without_canonical_key() {
-    let mut features = Features::with_defaults();
-    features.apply_map(&BTreeMap::from([("connectors".to_string(), false)]));
-    assert!(!features.enabled(Feature::Apps));
-}
-
-#[test]
 fn legacy_keys_for_feature_lists_aliases() {
     assert_eq!(
         crate::legacy_keys_for_feature(Feature::Apps).collect::<Vec<_>>(),

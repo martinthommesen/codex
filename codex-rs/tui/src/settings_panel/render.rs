@@ -38,7 +38,7 @@ fn value_label(status: SwitchStatus) -> String {
         SwitchState::Off => "[ ] Off",
         SwitchState::Partial => "[-] Partial",
     };
-    if status.locked {
+    if status.managed() {
         format!("{label} · managed")
     } else {
         label.to_string()
@@ -58,8 +58,8 @@ fn item(
     context: ItemContext,
 ) -> SelectionItem {
     let switch = status.switch;
-    let accept_label = (!status.locked).then_some("toggle");
-    let description = if status.locked {
+    let accept_label = (!status.locked()).then_some("toggle");
+    let description = if status.locked() {
         LOCKED_DESCRIPTION
     } else {
         switch.description()
@@ -80,7 +80,7 @@ fn item(
         name: switch.label().to_string(),
         category_tag: Some(format!("{value_label:<VALUE_COLUMN_WIDTH$}")),
         description: Some(description),
-        is_disabled: status.locked,
+        is_disabled: status.locked(),
         footer_hint: Some(panel_hint(keymap, search_hint, accept_label)),
         search_footer_hint: Some(search_footer_hint),
         search_value: Some(format!(
