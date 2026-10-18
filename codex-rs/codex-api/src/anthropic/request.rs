@@ -82,6 +82,8 @@ pub struct AnthropicRequestOptions {
     pub model: String,
     pub max_tokens: u64,
     pub thinking: AnthropicThinking,
+    /// Return readable thinking summaries (`display: "summarized"`) instead of omitting them.
+    pub summarize_thinking: bool,
     pub effort: Option<&'static str>,
     pub parallel_tool_calls: bool,
     pub prompt_caching: bool,
@@ -141,7 +143,12 @@ pub fn build_anthropic_request(
         AnthropicThinking::Omit => None,
         AnthropicThinking::Disabled => Some(json!({"type": "disabled"})),
         AnthropicThinking::Adaptive => {
-            let mut thinking = json!({"type": "adaptive", "display": "summarized"});
+            let display = if options.summarize_thinking {
+                "summarized"
+            } else {
+                "omitted"
+            };
+            let mut thinking = json!({"type": "adaptive", "display": display});
             if options.drop_mismatched_thinking {
                 thinking["block_binding"] = json!({"prefix_mismatch_behavior": "drop_block"});
                 betas.push(THINKING_BINDING_BETA);

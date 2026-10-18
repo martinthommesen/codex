@@ -1,6 +1,7 @@
 use super::*;
 use crate::anthropic::tools::translate_tools;
 use bytes::Bytes;
+use codex_protocol::models::MessagePhase;
 use futures::stream;
 use pretty_assertions::assert_eq;
 use serde_json::json;
@@ -103,7 +104,10 @@ fn streams_thinking_text_and_tool_calls() {
     ));
     assert!(matches!(
         iter.next(),
-        Some(ResponseEvent::OutputItemDone(ResponseItem::Message { .. }))
+        Some(ResponseEvent::OutputItemDone(ResponseItem::Message {
+            phase: Some(MessagePhase::Commentary),
+            ..
+        }))
     ));
     match iter.next() {
         Some(ResponseEvent::OutputItemDone(ResponseItem::FunctionCall {
@@ -111,12 +115,14 @@ fn streams_thinking_text_and_tool_calls() {
             namespace,
             arguments,
             call_id,
+            encrypted_function_args,
             ..
         })) => {
             assert_eq!(name, "shell");
             assert_eq!(namespace, None);
             assert_eq!(arguments, r#"{"command":["ls"]}"#);
             assert_eq!(call_id, "toolu_1");
+            assert_eq!(encrypted_function_args, Some(Vec::new()));
         }
         other => panic!("unexpected event {other:?}"),
     }
@@ -213,6 +219,13 @@ fn end_turn_and_redacted_thinking() {
     assert!(events.iter().any(|event| matches!(
         event,
         ResponseEvent::OutputTextDelta(delta) if delta == "Done."
+    )));
+    assert!(events.iter().any(|event| matches!(
+        event,
+        ResponseEvent::OutputItemDone(ResponseItem::Message {
+            phase: Some(MessagePhase::FinalAnswer),
+            ..
+        })
     )));
     assert!(matches!(
         events.last(),

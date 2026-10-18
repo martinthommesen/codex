@@ -5,6 +5,7 @@
 //! Scenarios are chosen by markers in the user message text:
 //! - `[tool]`: stream text plus a `tool_use` for the first bridged tool, call it over MCP, then
 //!   stream a final answer echoing the tool result;
+//! - `[exec:<command>]`: the same round trip through Codex's `exec_command` tool;
 //! - `[hang]`: stream a partial answer and wait (exits when interrupted);
 //! - anything else: reply with `echo: <text>`.
 //!
@@ -239,11 +240,21 @@ async fn run(args: &[String]) -> std::io::Result<()> {
             })
             .unwrap_or_default();
         message_counter += 1;
-        if text.contains("[tool]") {
+        if let Some(command) = exec_marker(&text) {
+            let Some(tool) = tool_names
+                .iter()
+                .find(|name| name.ends_with("exec_command"))
+            else {
+                return Err(std::io::Error::other("exec_command was not listed"));
+            };
+            let arguments = json!({"cmd": command, "yield_time_ms": 5000});
+            tool_scenario(&session_id, &mut mcp, tool, arguments, message_counter).await?;
+        } else if text.contains("[tool]") {
             let Some(tool) = tool_names.first() else {
                 return Err(std::io::Error::other("no tools were listed"));
             };
-            tool_scenario(&session_id, &mut mcp, tool, message_counter).await?;
+            let arguments = json!({"command": "echo hi"});
+            tool_scenario(&session_id, &mut mcp, tool, arguments, message_counter).await?;
         } else if text.contains("[hang]") {
             stream_message_start(&session_id, &format!("msg_fake_{message_counter}"));
             emit_stream_event(
@@ -268,14 +279,21 @@ async fn run(args: &[String]) -> std::io::Result<()> {
     Ok(())
 }
 
+/// Returns the command inside an `[exec:<command>]` marker.
+fn exec_marker(text: &str) -> Option<&str> {
+    let start = text.find("[exec:")? + "[exec:".len();
+    let end = text[start..].find(']')? + start;
+    Some(&text[start..end])
+}
+
 async fn tool_scenario(
     session_id: &str,
     mcp: &mut Mcp,
     tool: &str,
+    arguments: Value,
     message_counter: usize,
 ) -> std::io::Result<()> {
     let tool_use_id = format!("toolu_fake_{message_counter}");
-    let arguments = json!({"command": "echo hi"});
     stream_message_start(session_id, &format!("msg_fake_{message_counter}_a"));
     emit_stream_event(
         session_id,

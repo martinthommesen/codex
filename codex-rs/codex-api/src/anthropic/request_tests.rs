@@ -98,6 +98,7 @@ fn options() -> AnthropicRequestOptions {
         model: "claude-opus-5-5".to_string(),
         max_tokens: 32_000,
         thinking: AnthropicThinking::Adaptive,
+        summarize_thinking: true,
         effort: Some("high"),
         parallel_tool_calls: true,
         prompt_caching: true,
@@ -380,4 +381,18 @@ fn tool_blocks_become_text_when_no_tools_are_declared() {
             ]}
         ])
     );
+}
+
+#[test]
+fn thinking_display_follows_summary_preference() {
+    let mut opts = options();
+    opts.summarize_thinking = false;
+    opts.drop_mismatched_thinking = false;
+    let prepared = build_anthropic_request("", &[user("hi")], &[], &opts);
+    let body = serde_json::to_value(&prepared.request).expect("serialize");
+    assert_eq!(
+        body["thinking"],
+        json!({"type": "adaptive", "display": "omitted"})
+    );
+    assert!(prepared.betas.is_empty());
 }

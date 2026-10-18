@@ -10,8 +10,11 @@ use codex_arg0::Arg0DispatchPaths;
 use codex_arg0::arg0_dispatch_or_else;
 use codex_chatgpt::apply_command::ApplyCommand;
 use codex_chatgpt::apply_command::run_apply_command;
+use codex_cli::LoginProvider;
 use codex_cli::read_access_token_from_stdin;
 use codex_cli::read_api_key_from_stdin;
+use codex_cli::run_login_anthropic;
+use codex_cli::run_login_claude_code;
 use codex_cli::run_login_status;
 use codex_cli::run_login_with_access_token;
 use codex_cli::run_login_with_api_key;
@@ -518,6 +521,12 @@ struct LoginCommand {
     #[clap(skip)]
     config_overrides: CliConfigOverrides,
 
+    /// Provider to sign in to. `anthropic` stores an Anthropic API key read from stdin
+    /// (with --with-api-key); `claude-code` connects the official Claude Code CLI and its own
+    /// sign-in. Each provider's credentials are stored separately from the others.
+    #[arg(long = "provider", value_enum, global = true)]
+    provider: Option<LoginProvider>,
+
     #[arg(
         long = "with-api-key",
         help = "Read the API key from stdin (e.g. `printenv OPENAI_API_KEY | codex login --with-api-key`)"
@@ -566,6 +575,11 @@ enum LoginSubcommand {
 struct LogoutCommand {
     #[clap(skip)]
     config_overrides: CliConfigOverrides,
+
+    /// Provider to sign out of (default: openai). Signing out of one provider never affects
+    /// another; `all` signs out of every provider.
+    #[arg(long = "provider", value_enum)]
+    provider: Option<LoginProvider>,
 }
 
 #[derive(Debug, Parser)]
@@ -1619,11 +1633,21 @@ async fn cli_main(
                 &mut login_cli.config_overrides,
                 root_config_overrides.clone(),
             );
-            match login_cli.action {
-                Some(LoginSubcommand::Status) => {
-                    run_login_status(login_cli.config_overrides).await;
+            match (login_cli.action, login_cli.provider) {
+                (Some(LoginSubcommand::Status), provider) => {
+                    run_login_status(login_cli.config_overrides, provider).await;
                 }
-                None => {
+                (None, Some(LoginProvider::All)) => {
+                    eprintln!("`--provider all` is only supported by `codex logout`.");
+                    std::process::exit(1);
+                }
+                (None, Some(LoginProvider::Anthropic)) => {
+                    run_login_anthropic(login_cli.config_overrides, login_cli.with_api_key).await;
+                }
+                (None, Some(LoginProvider::ClaudeCode)) => {
+                    run_login_claude_code(login_cli.config_overrides).await;
+                }
+                (None, Some(LoginProvider::Openai) | None) => {
                     if login_cli.with_api_key && login_cli.with_access_token {
                         eprintln!(
                             "Choose one login credential source: --with-api-key or --with-access-token."
@@ -1663,7 +1687,7 @@ async fn cli_main(
                 &mut logout_cli.config_overrides,
                 root_config_overrides.clone(),
             );
-            run_logout(logout_cli.config_overrides).await;
+            run_logout(logout_cli.config_overrides, logout_cli.provider).await;
         }
         Some(Subcommand::Completion(completion_cli)) => {
             reject_remote_mode_for_subcommand(

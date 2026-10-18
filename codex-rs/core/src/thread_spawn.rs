@@ -35,6 +35,8 @@ pub(crate) struct ThreadSpawnRequest {
     /// `None` starts fresh; `FullHistory` uses native fork preparation.
     pub fork_mode: Option<SpawnAgentForkMode>,
     pub agent_type: Option<String>,
+    /// Provider id for the child (for example `anthropic`); `None` inherits the parent's.
+    pub model_provider: Option<String>,
     pub model: Option<String>,
     pub reasoning_effort: Option<ReasoningEffort>,
 }
@@ -67,6 +69,7 @@ pub(crate) async fn spawn(
         message,
         fork_mode,
         agent_type,
+        model_provider,
         model,
         reasoning_effort,
     } = request;
@@ -89,6 +92,7 @@ pub(crate) async fn spawn(
             version: SpawnConfigVersion::V2,
             full_history_fork: matches!(fork_mode, Some(SpawnAgentForkMode::FullHistory)),
             role_name,
+            model_provider: model_provider.as_deref(),
             model: model.as_deref(),
             reasoning_effort,
         },

@@ -129,6 +129,14 @@ pub struct ClaudeCodeSession {
     abort: watch::Sender<u64>,
 }
 
+impl std::fmt::Debug for ClaudeCodeSession {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ClaudeCodeSession")
+            .field("config", &self.config)
+            .finish_non_exhaustive()
+    }
+}
+
 impl ClaudeCodeSession {
     pub fn new(config: ClaudeCodeSessionConfig) -> Self {
         let (abort, _) = watch::channel(0);

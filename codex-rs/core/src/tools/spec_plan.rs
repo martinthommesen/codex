@@ -2,6 +2,8 @@ use crate::agent::exceeds_thread_spawn_depth_limit;
 use crate::agent::next_thread_spawn_depth;
 use crate::environment_selection::TurnEnvironmentSnapshot;
 use crate::image_preparation::unified_image_budget_enabled;
+use crate::provider_models::collaboration_messages_require_plaintext;
+use crate::provider_models::spawn_provider_options;
 use crate::session::session::Session;
 use crate::session::turn_context::TurnContext;
 use crate::tools::code_mode::execute_spec::create_code_mode_tool;
@@ -1438,6 +1440,12 @@ fn add_core_utility_tools(context: &CoreToolPlanContext<'_>, registry: &mut Tool
 fn add_collaboration_tools(context: &CoreToolPlanContext<'_>, registry: &mut ToolRegistry) {
     let turn_context = context.turn_context;
     if collab_tools_enabled(turn_context, context.model_info) {
+        let spawn_providers = spawn_provider_options(
+            &turn_context.config,
+            turn_context.auth_manager.as_deref(),
+            &turn_context.available_models,
+        );
+        let plaintext_messages = collaboration_messages_require_plaintext(&spawn_providers);
         if multi_agent_v2_enabled(turn_context) {
             let model_messages = ResolvedModelMessages::from_model(context.model_info);
             let spawn_agent_description =
@@ -1474,6 +1482,8 @@ fn add_collaboration_tools(context: &CoreToolPlanContext<'_>, registry: &mut Too
                                 .multi_agent_v2
                                 .usage_hint_text
                                 .clone(),
+                            providers: spawn_providers.clone(),
+                            plaintext_messages,
                         },
                         spawn_agent_description.map(str::to_owned),
                     ),
@@ -1488,7 +1498,7 @@ fn add_collaboration_tools(context: &CoreToolPlanContext<'_>, registry: &mut Too
             if !turn_context.config.multi_agent_v2.disable_direct_message {
                 registry.register_trusted_with_exposure(
                     multi_agent_v2_handler(
-                        SendMessageHandlerV2,
+                        SendMessageHandlerV2::new(plaintext_messages),
                         tool_namespace,
                         model_messages.multi_agent_tool_description_override("send_message"),
                         model_messages.multi_agent_tool_parameters_override("send_message"),
@@ -1497,7 +1507,7 @@ fn add_collaboration_tools(context: &CoreToolPlanContext<'_>, registry: &mut Too
                 );
                 registry.register_trusted_with_exposure(
                     multi_agent_v2_handler(
-                        FollowupTaskHandlerV2,
+                        FollowupTaskHandlerV2::new(plaintext_messages),
                         tool_namespace,
                         model_messages.multi_agent_tool_description_override("followup_task"),
                         model_messages.multi_agent_tool_parameters_override("followup_task"),
@@ -1555,6 +1565,8 @@ fn add_collaboration_tools(context: &CoreToolPlanContext<'_>, registry: &mut Too
                     hide_agent_type_model_reasoning: false,
                     expose_spawn_agent_model_overrides: true,
                     usage_hint_text: turn_context.config.multi_agent_v2.usage_hint_text.clone(),
+                    providers: spawn_providers,
+                    plaintext_messages,
                 }),
                 exposure,
             );

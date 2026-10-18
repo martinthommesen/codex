@@ -12,6 +12,7 @@ fn scrubs_provider_and_codex_secrets_only() {
         ("CODEX_REMOTE_AUTH_TOKEN", true),
         ("CODEX_GITHUB_TOKEN", true),
         ("OPENAI_IDENTITY_TOKEN_FILE", true),
+        ("CLAUDECODE", true),
         ("CLAUDE_CODE_OAUTH_TOKEN", false),
         ("CODEX_CLAUDE_CODE_PATH", false),
         ("CODEX_HOME", false),

@@ -18,6 +18,7 @@ use codex_client::ByteStream;
 use codex_client::StreamResponse;
 use codex_protocol::error::ResponseIncompleteError;
 use codex_protocol::models::ContentItem;
+use codex_protocol::models::MessagePhase;
 use codex_protocol::models::ReasoningItemReasoningSummary;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::protocol::TokenUsage;
@@ -175,6 +176,8 @@ pub struct AnthropicStreamTranslator {
     stop_reason: Option<String>,
     stop_details: Option<Value>,
     blocks: BTreeMap<usize, BlockState>,
+    /// Finished text whose phase depends on what the model does next.
+    pending_text: Option<String>,
     produced_output: bool,
     completed: bool,
 }
@@ -188,6 +191,7 @@ impl AnthropicStreamTranslator {
             stop_reason: None,
             stop_details: None,
             blocks: BTreeMap::new(),
+            pending_text: None,
             produced_output: false,
             completed: false,
         }
@@ -232,7 +236,11 @@ impl AnthropicStreamTranslator {
             AnthropicStreamEvent::ContentBlockStart {
                 index,
                 content_block,
-            } => self.start_block(index, &content_block, &mut out),
+            } => {
+                // More output follows, so earlier text was mid-turn commentary.
+                self.flush_pending_text(Some(MessagePhase::Commentary), &mut out);
+                self.start_block(index, &content_block, &mut out);
+            }
             AnthropicStreamEvent::ContentBlockDelta { index, delta } => {
                 self.apply_delta(index, &delta, &mut out);
             }
@@ -240,6 +248,14 @@ impl AnthropicStreamTranslator {
             AnthropicStreamEvent::MessageDelta { delta, usage } => {
                 if delta.stop_reason.is_some() {
                     self.stop_reason = delta.stop_reason;
+                }
+                if let Some(stop_reason) = self.stop_reason.as_deref() {
+                    let phase = if stop_reason == "tool_use" || stop_reason == "pause_turn" {
+                        MessagePhase::Commentary
+                    } else {
+                        MessagePhase::FinalAnswer
+                    };
+                    self.flush_pending_text(Some(phase), &mut out);
                 }
                 if delta.stop_details.is_some() {
                     self.stop_details = delta.stop_details;
@@ -254,6 +270,7 @@ impl AnthropicStreamTranslator {
                 for index in open {
                     self.stop_block(index, &mut out);
                 }
+                self.flush_pending_text(Some(MessagePhase::FinalAnswer), &mut out);
                 out.push(self.completion()?);
                 self.completed = true;
             }
@@ -276,6 +293,7 @@ impl AnthropicStreamTranslator {
                     .to_string();
                 out.push(ResponseEvent::OutputItemAdded(assistant_message(
                     String::new(),
+                    /*phase*/ None,
                 )));
                 if !text.is_empty() {
                     out.push(ResponseEvent::OutputTextDelta(text.clone()));
@@ -385,7 +403,8 @@ impl AnthropicStreamTranslator {
         match state {
             BlockState::Text { text } => {
                 self.produced_output = true;
-                out.push(ResponseEvent::OutputItemDone(assistant_message(text)));
+                self.flush_pending_text(Some(MessagePhase::Commentary), out);
+                self.pending_text = Some(text);
             }
             BlockState::Thinking {
                 thinking,
@@ -437,6 +456,14 @@ impl AnthropicStreamTranslator {
         }
     }
 
+    fn flush_pending_text(&mut self, phase: Option<MessagePhase>, out: &mut Vec<ResponseEvent>) {
+        if let Some(text) = self.pending_text.take() {
+            out.push(ResponseEvent::OutputItemDone(assistant_message(
+                text, phase,
+            )));
+        }
+    }
+
     fn tool_call_item(&self, call_id: String, wire_name: &str, input: Value) -> ResponseItem {
         let target = self.tool_names.resolve(wire_name);
         match target.kind {
@@ -472,7 +499,9 @@ impl AnthropicStreamTranslator {
                     name: target.name,
                     namespace: target.namespace,
                     arguments,
-                    encrypted_function_args: None,
+                    // Claude arguments are plaintext; this marks collaboration messages as
+                    // directly readable by other agents.
+                    encrypted_function_args: Some(Vec::new()),
                     call_id,
                     internal_chat_message_metadata_passthrough: None,
                 }
@@ -542,7 +571,7 @@ impl AnthropicStreamTranslator {
     }
 }
 
-fn assistant_message(text: String) -> ResponseItem {
+fn assistant_message(text: String, phase: Option<MessagePhase>) -> ResponseItem {
     ResponseItem::Message {
         encrypted_content: None,
         status: None,
@@ -553,7 +582,7 @@ fn assistant_message(text: String) -> ResponseItem {
             annotations: None,
             logprobs: None,
         }],
-        phase: None,
+        phase,
         internal_chat_message_metadata_passthrough: None,
     }
 }

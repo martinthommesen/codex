@@ -111,7 +111,12 @@ pub fn anthropic_wire_tool_name_with_limit(
     let max_len = max_len.clamp(16, MAX_TOOL_NAME_LEN);
     let joined = match namespace {
         Some(namespace) if !namespace.is_empty() && namespace != DEFAULT_FUNCTION_NAMESPACE => {
-            format!("{namespace}{name}")
+            // MCP namespaces already end with `__`; others get a readable separator.
+            if namespace.ends_with('_') {
+                format!("{namespace}{name}")
+            } else {
+                format!("{namespace}__{name}")
+            }
         }
         _ => name.to_string(),
     };

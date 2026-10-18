@@ -14,6 +14,8 @@ pub const SCRUBBED_ENV_VARS: &[&str] = &[
     "OPENAI_API_KEY",
     "CODEX_API_KEY",
     "CODEX_ACCESS_TOKEN",
+    // Set inside a running Claude Code session; Codex starts an independent session.
+    "CLAUDECODE",
 ];
 
 /// Settings forced for model sessions:

@@ -102,6 +102,7 @@ async fn handle_spawn_agent(
             version: SpawnConfigVersion::V1,
             full_history_fork: args.fork_context,
             role_name,
+            model_provider: args.model_provider.as_deref(),
             model: args.model.as_deref(),
             reasoning_effort: args.reasoning_effort.clone(),
         },
@@ -221,6 +222,7 @@ struct SpawnAgentArgs {
     message: Option<String>,
     items: Option<Vec<UserInput>>,
     agent_type: Option<String>,
+    model_provider: Option<String>,
     model: Option<String>,
     reasoning_effort: Option<ReasoningEffort>,
     #[serde(default)]

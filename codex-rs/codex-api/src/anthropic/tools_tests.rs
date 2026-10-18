@@ -13,6 +13,10 @@ fn wire_names_are_stable_and_valid() {
         anthropic_wire_tool_name(Some("mcp__github__"), "create_issue"),
         "mcp__github__create_issue"
     );
+    assert_eq!(
+        anthropic_wire_tool_name(Some("collaboration"), "spawn_agent"),
+        "collaboration__spawn_agent"
+    );
 
     let dotted = anthropic_wire_tool_name(Some("mcp__srv__"), "get.thing");
     assert!(dotted.starts_with("mcp__srv__get_thing_"));

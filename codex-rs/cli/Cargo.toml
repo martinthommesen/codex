@@ -45,6 +45,7 @@ codex-cloud-config = { workspace = true }
 codex-cloud-tasks = { path = "../cloud-tasks" }
 codex-utils-cli = { workspace = true }
 codex-config = { workspace = true }
+codex-claude-code = { workspace = true }
 codex-core = { workspace = true }
 codex-core-plugins = { workspace = true }
 codex-history = { workspace = true }
@@ -60,6 +61,7 @@ codex-git-attribution = { workspace = true }
 codex-git-utils = { workspace = true }
 codex-install-context = { workspace = true }
 codex-login = { workspace = true }
+codex-model-provider-info = { workspace = true }
 codex-memories-write = { workspace = true }
 codex-mcp = { workspace = true }
 codex-model-provider = { workspace = true }

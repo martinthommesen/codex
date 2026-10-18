@@ -1813,7 +1813,12 @@ impl Session {
                     tx_event.clone(),
                     codex_responses_headers,
                     crate::cyber_access_program::ApiKeyCyberAccessPrograms::from_config(&config),
-                ),
+                )
+                .with_claude_code_context(crate::client::ClaudeCodeContext {
+                    cwd: config.cwd.to_path_buf(),
+                    codex_home: config.codex_home.to_path_buf(),
+                    codex_self_exe: config.codex_self_exe.clone(),
+                }),
                 executed_tool_calls: executed_tool_calls.clone(),
                 code_mode_service: crate::tools::code_mode::CodeModeService::new(
                     thread_id,

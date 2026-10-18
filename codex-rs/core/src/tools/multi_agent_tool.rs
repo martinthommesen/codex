@@ -30,14 +30,22 @@ pub(super) fn multi_agent_v2_handler(
             && let Some(properties) = tool.parameters.properties
         {
             // Argument transport requires these markers even without server encryption config.
+            // Plaintext mode (cross-provider agent trees) clears them instead.
             for (name, schema) in *properties {
-                if schema.encrypted == Some(true) {
-                    let property = parameters
+                if let Some(property) = parameters
+                    .properties
+                    .as_mut()
+                    .and_then(|properties| properties.get_mut(&name))
+                {
+                    property.encrypted = (schema.encrypted == Some(true)).then_some(true);
+                } else if schema.encrypted == Some(true) {
+                    return Err("schema omits an encrypted parameter");
+                } else if name == "model_provider" {
+                    // Harness-owned provider selection survives catalog schema overrides.
+                    parameters
                         .properties
-                        .as_mut()
-                        .and_then(|properties| properties.get_mut(&name))
-                        .ok_or("schema omits an encrypted parameter")?;
-                    property.encrypted = Some(true);
+                        .get_or_insert_default()
+                        .insert(name, schema);
                 }
             }
         }
