@@ -8,6 +8,7 @@ use crate::CODEX_MCP_SERVER_NAME;
 use codex_api::anthropic::AnthropicToolNameMap;
 use codex_api::anthropic::AnthropicToolTarget;
 use codex_api::anthropic::anthropic_wire_tool_name_with_limit;
+use codex_api::anthropic::tool_name_collision_note;
 use codex_api::anthropic::translate_tools;
 use codex_uds::UnixListener;
 use serde_json::Value;
@@ -68,8 +69,15 @@ impl ToolRegistry {
                 &target.name,
                 MCP_TOOL_NAME_LIMIT,
             );
-            if registry.targets.contains_key(&mcp_name) {
-                warn!(tool = %mcp_name, "skipping Codex tool whose bridged name collides");
+            // `translate_tools` already merged re-declarations of the same tool, so a shorter
+            // bridged name can only collide with a different tool.
+            if let Some(existing) = registry.targets.get(&mcp_name) {
+                registry.unsupported.push(tool_name_collision_note(
+                    target.namespace.as_deref(),
+                    &target.name,
+                    &wire_tool_name(&mcp_name),
+                    existing,
+                ));
                 continue;
             }
             let mut definition = serde_json::Map::new();

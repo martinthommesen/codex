@@ -140,7 +140,7 @@ async fn oauth_never_accepts_api_key_authentication() {
     let client = AnthropicMessagesClient::new(
         transport.clone(),
         provider("https://api.anthropic.com/v1"),
-        Arc::new(AnthropicApiKeyAuth::new("api-key-must-not-be-used")),
+        Arc::new(AnthropicApiKeyAuth::new("api-key-must-not-be-used").expect("valid key")),
     );
     assert!(
         client

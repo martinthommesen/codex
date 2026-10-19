@@ -74,6 +74,14 @@ fn claude_models_manager() -> SharedModelsManager {
     ))
 }
 
+/// Builds `x-api-key` auth, failing with a clear error (that never echoes the key) when the key
+/// cannot be sent instead of sending the request without credentials.
+fn api_key_auth(api_key: String) -> Result<SharedAuthProvider> {
+    let auth = AnthropicApiKeyAuth::new(api_key)
+        .map_err(|err| CodexErr::InvalidRequest(err.to_string()))?;
+    Ok(Arc::new(auth))
+}
+
 /// Provider for the Anthropic Messages API.
 #[derive(Clone, Debug)]
 pub(crate) struct AnthropicModelProvider {
@@ -111,7 +119,7 @@ impl AnthropicModelProvider {
     async fn resolve_api_auth(&self) -> Result<SharedAuthProvider> {
         // An explicit `env_key` (for example a gateway's key variable) wins.
         if let Some(key) = self.info.api_key()? {
-            return Ok(Arc::new(AnthropicApiKeyAuth::new(key)));
+            return api_key_auth(key);
         }
         // Bearer-token gateways use the generic provider auth paths.
         if self.info.experimental_bearer_token.is_some() {
@@ -122,7 +130,7 @@ impl AnthropicModelProvider {
             return resolve_provider_auth(auth.as_ref(), &self.info);
         }
         match self.resolve_api_key()? {
-            Some(api_key) => Ok(Arc::new(AnthropicApiKeyAuth::new(api_key))),
+            Some(api_key) => api_key_auth(api_key),
             None => Err(CodexErr::EnvVar(EnvVarError {
                 var: ANTHROPIC_API_KEY_ENV_VAR.to_string(),
                 instructions: Some(MISSING_KEY_INSTRUCTIONS.to_string()),

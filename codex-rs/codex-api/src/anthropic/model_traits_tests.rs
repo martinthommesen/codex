@@ -87,6 +87,27 @@ fn legacy_models_use_budget_tokens() {
 }
 
 #[test]
+fn provider_prefixed_slugs_use_the_traits_of_their_claude_model() {
+    for model in [
+        "us.anthropic.claude-sonnet-4-5-20250929-v1:0",
+        "anthropic/claude-haiku-4-5",
+        "anthropic/claude-haiku-4.5",
+    ] {
+        let traits = ClaudeModelTraits::for_model(model);
+        assert_eq!(
+            traits.thinking,
+            ClaudeThinkingStyle::BudgetTokens,
+            "{model}"
+        );
+        assert!(traits.efforts.is_empty(), "{model}");
+    }
+    assert_eq!(
+        ClaudeModelTraits::for_model("anthropic.claude-opus-4-6"),
+        ClaudeModelTraits::for_model("claude-opus-4-6")
+    );
+}
+
+#[test]
 fn supported_efforts_follow_model_traits() {
     assert_eq!(
         ClaudeModelTraits::for_model("claude-opus-5-5").supported_reasoning_efforts(),

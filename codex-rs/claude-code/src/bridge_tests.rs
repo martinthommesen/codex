@@ -4,6 +4,7 @@ use super::ToolRegistry;
 use super::wire_tool_name;
 use codex_api::anthropic::AnthropicToolKind;
 use codex_api::anthropic::AnthropicToolTarget;
+use codex_api::anthropic::anthropic_wire_tool_name_with_limit;
 use pretty_assertions::assert_eq;
 use serde_json::Value;
 use serde_json::json;
@@ -361,4 +362,23 @@ async fn calls_codex_never_received_are_released_after_the_grace_period() {
         (json!(2), json!(true))
     );
     assert_eq!(core.parked_count(), 1);
+}
+
+#[test]
+fn bridged_name_collisions_are_reported() {
+    let long_name = "y".repeat(60);
+    let truncated = anthropic_wire_tool_name_with_limit(None, &long_name, MCP_TOOL_NAME_LIMIT);
+    let registry = ToolRegistry::from_declarations(&[
+        json!({"type": "function", "name": long_name, "parameters": {"type": "object"}}),
+        json!({"type": "function", "name": truncated, "parameters": {"type": "object"}}),
+    ]);
+    assert_eq!(registry.tools.len(), 1);
+    assert_eq!(registry.targets[&truncated].name, long_name);
+    assert_eq!(
+        registry.unsupported,
+        vec![format!(
+            "tool `{truncated}` is not available to Claude: its tool name `mcp__codex__{truncated}` \
+is already used by tool `{long_name}`"
+        )]
+    );
 }

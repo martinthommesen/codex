@@ -388,6 +388,19 @@ fn refused_responses_run_no_tool_calls_and_record_no_answer() {
     ));
 }
 
+#[test]
+fn input_transformations_from_message_start_are_kept() {
+    let dropped = json!({"type": "thinking_dropped", "path": "messages.1.content.0", "reason": "prefix_binding_mismatch"});
+    let mut translator = AnthropicStreamTranslator::new(tool_names());
+    translator
+        .handle(event(json!({
+            "type": "message_start",
+            "message": {"id": "msg_1", "input_transformations": [dropped]}
+        })))
+        .expect("message_start");
+    assert_eq!(translator.input_transformations(), [dropped].as_slice());
+}
+
 #[tokio::test]
 async fn spawned_stream_reads_sse_bytes() {
     let body = [

@@ -16,6 +16,7 @@ mod tools;
 pub use client::ANTHROPIC_VERSION;
 pub use client::AnthropicApiKeyAuth;
 pub use client::AnthropicMessagesClient;
+pub use client::InvalidAnthropicApiKey;
 pub use error::anthropic_stream_error;
 pub use error::is_thinking_replay_rejection;
 pub use error::map_anthropic_transport_error;
@@ -53,6 +54,7 @@ pub use tools::TranslatedTools;
 pub use tools::anthropic_tool_use_id;
 pub use tools::anthropic_wire_tool_name;
 pub use tools::anthropic_wire_tool_name_with_limit;
+pub use tools::tool_name_collision_note;
 pub use tools::translate_tools;
 
 #[cfg(test)]

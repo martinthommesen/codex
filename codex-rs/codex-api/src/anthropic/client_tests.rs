@@ -73,7 +73,7 @@ async fn configured_betas_are_merged_with_request_betas() {
     let client = AnthropicMessagesClient::new(
         transport.clone(),
         provider,
-        Arc::new(AnthropicApiKeyAuth::new("sk-ant-test".to_string())),
+        Arc::new(AnthropicApiKeyAuth::new("sk-ant-test").expect("valid key")),
     );
     assert!(client.stream(&prepared, HeaderMap::new()).await.is_err());
 
@@ -87,4 +87,23 @@ async fn configured_betas_are_merged_with_request_betas() {
     let mut expected = vec!["context-1m-2025-08-07".to_string()];
     expected.extend(prepared.betas.iter().map(ToString::to_string));
     assert_eq!(betas, vec![expected.join(",")]);
+}
+
+#[test]
+fn api_keys_are_trimmed_and_unsendable_keys_are_rejected_without_echoing_them() {
+    let headers = AnthropicApiKeyAuth::new(" sk-ant-test\r\n")
+        .expect("surrounding whitespace is trimmed")
+        .to_auth_headers();
+    let values = headers
+        .get_all(API_KEY_HEADER)
+        .iter()
+        .map(|value| value.to_str().expect("ascii"))
+        .collect::<Vec<_>>();
+    assert_eq!(values, vec!["sk-ant-test"]);
+
+    for key in ["sk-ant-a\u{7}b", " \r\n"] {
+        let err = AnthropicApiKeyAuth::new(key).expect_err("unsendable key");
+        assert!(!err.to_string().contains("sk-ant"), "{err}");
+        assert!(err.to_string().contains("ANTHROPIC_API_KEY"), "{err}");
+    }
 }

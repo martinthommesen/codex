@@ -475,3 +475,91 @@ fn only_the_most_recent_images_are_sent_when_a_request_would_carry_too_many() {
         prepared.notes
     );
 }
+
+#[test]
+fn thinking_blocks_without_a_signature_are_not_replayed() {
+    let input = vec![
+        user("hi"),
+        reasoning("unsigned", Some("anthropic.thinking.v1:")),
+        reasoning("", Some("anthropic.redacted_thinking.v1:")),
+        reasoning("signed", Some("anthropic.thinking.v1:sig")),
+        assistant("ok"),
+        user("next"),
+    ];
+    let prepared = build_anthropic_request("", &input, &[], &options());
+    let body = serde_json::to_value(&prepared.request).expect("serialize");
+    assert_eq!(
+        body["messages"][1]["content"],
+        json!([
+            {"type": "thinking", "thinking": "signed", "signature": "sig"},
+            {"type": "text", "text": "ok"}
+        ])
+    );
+    assert_eq!(
+        prepared.notes,
+        vec!["a Claude thinking block without a signature was not replayed".to_string()]
+    );
+}
+
+#[test]
+fn duplicate_tool_outputs_answer_the_call_once() {
+    let input = vec![
+        user("go"),
+        function_call("c1", "shell", "{}"),
+        function_output("c1", "a", Some(true)),
+        function_output("c1", "b", Some(true)),
+    ];
+    let history = translate_history(&input, /*strip_thinking*/ false);
+    assert_eq!(
+        history.messages[2].content,
+        vec![
+            json!({"type": "tool_result", "tool_use_id": "c1", "content": "a"}),
+            json!({"type": "text", "text": "[output of call c1]\nb"}),
+        ]
+    );
+}
+
+#[test]
+fn image_data_urls_are_parsed_case_insensitively_and_must_be_base64() {
+    fn image(image_url: &str) -> ResponseItem {
+        ResponseItem::Message {
+            encrypted_content: None,
+            status: None,
+            id: None,
+            role: "user".to_string(),
+            content: vec![ContentItem::InputImage {
+                image: ImageReference::Inline {
+                    image_url: image_url.to_string(),
+                },
+                detail: None,
+            }],
+            phase: None,
+            internal_chat_message_metadata_passthrough: None,
+        }
+    }
+
+    let parameters = translate_history(
+        &[image("DATA:Image/PNG;charset=x;BASE64,AAAA")],
+        /*strip_thinking*/ false,
+    );
+    assert_eq!(
+        parameters.messages[0].content,
+        vec![
+            json!({"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "AAAA"}})
+        ]
+    );
+    assert!(parameters.notes.is_empty(), "{:?}", parameters.notes);
+
+    let percent_encoded = translate_history(
+        &[image("data:image/png,%89PNG")],
+        /*strip_thinking*/ false,
+    );
+    assert_eq!(
+        percent_encoded.messages[0].content,
+        vec![json!({"type": "text", "text": "[image omitted: not base64-encoded]"})]
+    );
+    assert_eq!(
+        percent_encoded.notes,
+        vec!["an inline image that is not base64-encoded was omitted".to_string()]
+    );
+}

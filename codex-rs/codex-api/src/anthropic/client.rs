@@ -36,17 +36,32 @@ const API_KEY_HEADER: &str = "x-api-key";
 
 /// Adds `x-api-key` authentication for Anthropic API keys.
 ///
-/// The key is never included in `Debug` output.
+/// The key is never included in `Debug` output or in errors.
 #[derive(Clone)]
 pub struct AnthropicApiKeyAuth {
-    api_key: String,
+    api_key: HeaderValue,
 }
 
+/// An Anthropic API key that is empty or cannot be sent in an HTTP header.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error(
+    "the Anthropic API key is empty or contains a character that cannot be sent in an HTTP \
+header (such as a stray carriage return or another control character); check ANTHROPIC_API_KEY \
+or the variable named by the provider's `env_key`"
+)]
+pub struct InvalidAnthropicApiKey;
+
 impl AnthropicApiKeyAuth {
-    pub fn new(api_key: impl Into<String>) -> Self {
-        Self {
-            api_key: api_key.into(),
+    /// Validates the key up front, so a malformed key fails loudly instead of being sent
+    /// without credentials. Surrounding whitespace (for example from a CRLF env file) is trimmed.
+    pub fn new(api_key: impl AsRef<str>) -> Result<Self, InvalidAnthropicApiKey> {
+        let api_key = api_key.as_ref().trim();
+        if api_key.is_empty() {
+            return Err(InvalidAnthropicApiKey);
         }
+        let mut api_key = HeaderValue::from_str(api_key).map_err(|_| InvalidAnthropicApiKey)?;
+        api_key.set_sensitive(true);
+        Ok(Self { api_key })
     }
 }
 
@@ -60,10 +75,10 @@ impl fmt::Debug for AnthropicApiKeyAuth {
 
 impl AuthProvider for AnthropicApiKeyAuth {
     fn add_auth_headers(&self, headers: &mut HeaderMap) {
-        if let Ok(mut value) = HeaderValue::from_str(&self.api_key) {
-            value.set_sensitive(true);
-            headers.insert(HeaderName::from_static(API_KEY_HEADER), value);
-        }
+        headers.insert(
+            HeaderName::from_static(API_KEY_HEADER),
+            self.api_key.clone(),
+        );
     }
 }
 

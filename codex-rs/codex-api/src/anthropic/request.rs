@@ -32,6 +32,9 @@ pub const ANTHROPIC_REDACTED_THINKING_PREFIX: &str = "anthropic.redacted_thinkin
 /// Beta that lets requests ask the API to drop (instead of reject) thinking blocks whose
 /// conversation prefix changed.
 pub const THINKING_BINDING_BETA: &str = "thinking-binding-controls-2026-08-01";
+/// Thinking captured without a signature (for example through a gateway that drops
+/// `signature_delta` events) cannot be replayed.
+const UNSIGNED_THINKING_NOTE: &str = "a Claude thinking block without a signature was not replayed";
 
 /// Returns whether a history item carries Anthropic-only reasoning state.
 ///
@@ -340,6 +343,11 @@ fn translate_item(item: &ResponseItem, strip_thinking: bool, builder: &mut Histo
                 if strip_thinking {
                     return;
                 }
+                if signature.is_empty() {
+                    // The API always rejects a missing signature, even with `drop_block`.
+                    builder.note(UNSIGNED_THINKING_NOTE);
+                    return;
+                }
                 let thinking: String = summary
                     .iter()
                     .map(|ReasoningItemReasoningSummary::SummaryText { text }| text.as_str())
@@ -350,6 +358,10 @@ fn translate_item(item: &ResponseItem, strip_thinking: bool, builder: &mut Histo
                 );
             } else if let Some(data) = encrypted.strip_prefix(ANTHROPIC_REDACTED_THINKING_PREFIX) {
                 if strip_thinking {
+                    return;
+                }
+                if data.is_empty() {
+                    builder.note(UNSIGNED_THINKING_NOTE);
                     return;
                 }
                 builder.push(
@@ -534,18 +546,19 @@ fn user_content_block(item: &ContentItem, builder: &mut HistoryBuilder) -> Optio
 fn image_block(image: &ImageReference, builder: &mut HistoryBuilder) -> Option<Value> {
     match image {
         ImageReference::Inline { image_url } => {
-            if let Some(rest) = image_url.strip_prefix("data:")
-                && let Some((meta, data)) = rest.split_once(',')
-            {
-                let media_type = meta.strip_suffix(";base64").unwrap_or(meta);
+            if let Some((media_type, is_base64, data)) = parse_data_url(image_url) {
                 if !matches!(
-                    media_type,
+                    media_type.as_str(),
                     "image/jpeg" | "image/png" | "image/gif" | "image/webp"
                 ) {
                     builder.note(format!(
                         "image type {media_type} is not supported by Anthropic models"
                     ));
                     return Some(text_block("[image omitted: unsupported image type]"));
+                }
+                if !is_base64 {
+                    builder.note("an inline image that is not base64-encoded was omitted");
+                    return Some(text_block("[image omitted: not base64-encoded]"));
                 }
                 return Some(json!({
                     "type": "image",
@@ -568,6 +581,20 @@ fn image_block(image: &ImageReference, builder: &mut HistoryBuilder) -> Option<V
             ))
         }
     }
+}
+
+/// Splits a `data:` URL into its lowercased media type, whether it is base64-encoded, and its data.
+/// The scheme and parameters are case-insensitive, and parameters may precede `base64`.
+fn parse_data_url(url: &str) -> Option<(String, bool, &str)> {
+    let (scheme, rest) = url.split_at_checked("data:".len())?;
+    if !scheme.eq_ignore_ascii_case("data:") {
+        return None;
+    }
+    let (meta, data) = rest.split_once(',')?;
+    let mut parameters = meta.split(';');
+    let media_type = parameters.next().unwrap_or("").trim().to_ascii_lowercase();
+    let is_base64 = parameters.any(|parameter| parameter.trim().eq_ignore_ascii_case("base64"));
+    Some((media_type, is_base64, data))
 }
 
 fn message_text(content: &[ContentItem]) -> String {
@@ -658,8 +685,8 @@ fn repair_turns(messages: &mut Vec<AnthropicMessage>, notes: &mut Vec<String>) {
         index += 2;
     }
 
-    // Tool results must answer a tool_use in the immediately preceding assistant turn; any other
-    // result is kept as plain text. Results must also lead their user turn.
+    // Tool results must answer a tool_use in the immediately preceding assistant turn, once; any
+    // other result is kept as plain text. Results must also lead their user turn.
     let mut previous_tool_uses: BTreeSet<String> = BTreeSet::new();
     for message in messages.iter_mut() {
         if message.role == "assistant" {
@@ -680,7 +707,7 @@ fn repair_turns(messages: &mut Vec<AnthropicMessage>, notes: &mut Vec<String>) {
                     .and_then(Value::as_str)
                     .unwrap_or_default()
                     .to_string();
-                if previous_tool_uses.contains(&id) {
+                if previous_tool_uses.remove(&id) {
                     results.push(block);
                 } else {
                     let text = match block.get("content") {

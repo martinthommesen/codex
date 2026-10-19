@@ -48,10 +48,12 @@ impl ClaudeModelTraits {
     /// adaptive thinking, which is the most widely accepted shape.
     pub fn for_model(model: &str) -> Self {
         let slug = model.trim().to_ascii_lowercase();
-        let slug = slug
-            .strip_prefix("anthropic.")
-            .unwrap_or(slug.as_str())
-            .to_string();
+        // Provider and gateway ids put a prefix before the Claude slug (`anthropic.`,
+        // `us.anthropic.`, `anthropic/`), and some write versions with dots (`claude-haiku-4.5`).
+        let slug = match slug.find("claude-") {
+            Some(start) => slug[start..].replace('.', "-"),
+            None => slug,
+        };
         let starts = |prefix: &str| slug.starts_with(prefix);
         if starts("claude-fable-") || starts("claude-mythos-") || starts("claude-opus-5-5") {
             return Self::current(ClaudeThinkingStyle::AdaptiveAlwaysOn, ALL_EFFORTS);

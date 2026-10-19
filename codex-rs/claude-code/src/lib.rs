@@ -54,9 +54,10 @@ pub fn resolve_claude_command(explicit: Option<&Path>) -> PathBuf {
 }
 
 /// Notes for tool declarations that cannot be exposed to Claude Code (for example hosted OpenAI
-/// tools), so callers can report the capability gap instead of dropping the tools silently.
+/// tools, or tools whose bridged names collide), so callers can report the capability gap instead
+/// of dropping the tools silently.
 pub fn unsupported_tool_notes(tools: &[serde_json::Value]) -> Vec<String> {
-    codex_api::anthropic::translate_tools(tools).unsupported
+    bridge::ToolRegistry::from_declarations(tools).unsupported
 }
 
 #[cfg(test)]

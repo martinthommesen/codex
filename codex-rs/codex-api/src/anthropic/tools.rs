@@ -328,6 +328,15 @@ fn push_tool(
     if !seen.insert(wire.clone()) {
         // Duplicate or colliding declarations (for example `a__b` and namespace `a` with `b`)
         // keep the first declaration for both the advertised schema and the routing target.
+        // Re-declarations of the same tool are expected; a different tool is reported.
+        let existing = translated.names.resolve(&wire);
+        if existing.name != name
+            || effective_namespace(existing.namespace.as_deref()) != effective_namespace(namespace)
+        {
+            translated
+                .unsupported
+                .push(tool_name_collision_note(namespace, name, &wire, &existing));
+        }
         return;
     }
     translated.names.register(namespace, name, kind);
@@ -336,6 +345,32 @@ fn push_tool(
         description,
         input_schema,
     });
+}
+
+/// Explains that a tool is not offered because a different tool already uses its wire name.
+pub fn tool_name_collision_note(
+    namespace: Option<&str>,
+    name: &str,
+    wire: &str,
+    existing: &AnthropicToolTarget,
+) -> String {
+    format!(
+        "tool {} is not available to Claude: its tool name `{wire}` is already used by tool {}",
+        tool_label(namespace, name),
+        tool_label(existing.namespace.as_deref(), &existing.name)
+    )
+}
+
+fn tool_label(namespace: Option<&str>, name: &str) -> String {
+    match effective_namespace(namespace) {
+        Some(namespace) => format!("`{name}` in namespace `{namespace}`"),
+        None => format!("`{name}`"),
+    }
+}
+
+/// The default `functions` namespace names the same tools as no namespace.
+fn effective_namespace(namespace: Option<&str>) -> Option<&str> {
+    namespace.filter(|namespace| !namespace.is_empty() && *namespace != DEFAULT_FUNCTION_NAMESPACE)
 }
 
 fn joined_description(namespace: Option<(&str, &str)>, declaration: &Value) -> String {

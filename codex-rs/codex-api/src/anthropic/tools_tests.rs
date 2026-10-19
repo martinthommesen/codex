@@ -203,14 +203,23 @@ fn colliding_declarations_keep_the_first_schema_and_target() {
         }]
     });
 
-    for (declarations, property, namespace, name) in [
+    for (declarations, property, namespace, name, note) in [
         (
             vec![top_level.clone(), namespaced.clone()],
             "first",
             None,
             "alpha__beta",
+            "tool `beta` in namespace `alpha` is not available to Claude: its tool name \
+`alpha__beta` is already used by tool `alpha__beta`",
         ),
-        (vec![namespaced, top_level], "second", Some("alpha"), "beta"),
+        (
+            vec![namespaced, top_level.clone()],
+            "second",
+            Some("alpha"),
+            "beta",
+            "tool `alpha__beta` is not available to Claude: its tool name `alpha__beta` is \
+already used by tool `beta` in namespace `alpha`",
+        ),
     ] {
         let translated = translate_tools(&declarations);
         assert_eq!(translated.tools.len(), 1);
@@ -224,5 +233,22 @@ fn colliding_declarations_keep_the_first_schema_and_target() {
                 kind: AnthropicToolKind::Function,
             }
         );
+        assert_eq!(translated.unsupported, vec![note.to_string()]);
     }
+
+    // Re-declaring the same tool (including under the default `functions` namespace) is not a
+    // collision.
+    let default_namespace = json!({
+        "type": "namespace",
+        "name": "functions",
+        "description": "",
+        "tools": [top_level]
+    });
+    let translated = translate_tools(&[top_level.clone(), top_level, default_namespace]);
+    assert_eq!(translated.tools.len(), 1);
+    assert!(
+        translated.unsupported.is_empty(),
+        "{:?}",
+        translated.unsupported
+    );
 }

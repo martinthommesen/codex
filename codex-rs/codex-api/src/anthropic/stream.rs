@@ -80,6 +80,10 @@ pub struct AnthropicMessageStart {
     pub model: Option<String>,
     #[serde(default)]
     pub usage: Option<AnthropicUsage>,
+    /// Replayed thinking blocks the API dropped or let through despite a failed check
+    /// (sent with the thinking-binding beta).
+    #[serde(default)]
+    pub input_transformations: Vec<Value>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize, PartialEq)]
@@ -196,6 +200,7 @@ pub struct AnthropicStreamTranslator {
     held_tool_calls: Vec<HeldToolCall>,
     /// At least one tool call was emitted, so a `max_tokens` stop still has work to continue.
     emitted_tool_calls: bool,
+    input_transformations: Vec<Value>,
     completed: bool,
 }
 
@@ -211,6 +216,7 @@ impl AnthropicStreamTranslator {
             pending_text: None,
             held_tool_calls: Vec::new(),
             emitted_tool_calls: false,
+            input_transformations: Vec::new(),
             completed: false,
         }
     }
@@ -235,6 +241,11 @@ impl AnthropicStreamTranslator {
         self.message_id.as_deref()
     }
 
+    /// `input_transformations` reported in `message_start`.
+    pub fn input_transformations(&self) -> &[Value] {
+        &self.input_transformations
+    }
+
     /// Processes one stream event and returns the Codex events it produces.
     pub fn handle(&mut self, event: AnthropicStreamEvent) -> Result<Vec<ResponseEvent>, ApiError> {
         let mut out = Vec::new();
@@ -244,6 +255,8 @@ impl AnthropicStreamTranslator {
                 if let Some(usage) = message.usage.as_ref() {
                     self.usage.merge(usage);
                 }
+                log_input_transformations(&message.input_transformations);
+                self.input_transformations = message.input_transformations;
                 out.push(ResponseEvent::Created {
                     response_id: message.id,
                 });
@@ -631,8 +644,8 @@ impl AnthropicStreamTranslator {
                     _ => ApiError::InvalidRequest { message },
                 });
             }
-            Some(_) => {
-                debug!("unrecognized Anthropic stop_reason");
+            Some(stop_reason) => {
+                warn!(stop_reason, "unrecognized Anthropic stop_reason");
                 None
             }
             None => None,
@@ -643,6 +656,28 @@ impl AnthropicStreamTranslator {
             usage_metadata: None,
             end_turn,
         })
+    }
+}
+
+/// Logs replayed thinking blocks the API dropped or flagged. A `prefix_binding_mismatch` means
+/// Codex changed history that an earlier thinking block was bound to.
+fn log_input_transformations(transformations: &[Value]) {
+    let mut counts: BTreeMap<(&str, &str), usize> = BTreeMap::new();
+    for transformation in transformations {
+        let kind = transformation.get("type").and_then(Value::as_str);
+        let reason = transformation.get("reason").and_then(Value::as_str);
+        *counts
+            .entry((kind.unwrap_or(""), reason.unwrap_or("")))
+            .or_default() += 1;
+    }
+    for ((kind, reason), blocks) in counts {
+        let message =
+            format!("Anthropic reported {blocks} replayed thinking block(s) as {kind} ({reason})");
+        if reason == "prefix_binding_mismatch" {
+            warn!("{message}");
+        } else {
+            debug!("{message}");
+        }
     }
 }
 

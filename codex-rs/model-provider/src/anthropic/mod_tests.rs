@@ -78,6 +78,31 @@ async fn explicit_env_key_is_sent_as_x_api_key() {
     }
 }
 
+#[tokio::test]
+async fn env_key_that_cannot_be_sent_fails_without_echoing_it() {
+    const VAR: &str = "CODEX_TEST_ANTHROPIC_INVALID_KEY_5c1e";
+    // SAFETY: the variable name is unique to this test.
+    unsafe {
+        std::env::set_var(VAR, "sk-ant-bad\u{1}key");
+    }
+    let mut info = ModelProviderInfo::create_anthropic_provider();
+    info.env_key = Some(VAR.to_string());
+    let provider = AnthropicModelProvider::new(info, /*auth_manager*/ None);
+    let error = match provider.api_auth().await {
+        Ok(_) => panic!("an unsendable key must not resolve to auth"),
+        Err(error) => error.to_string(),
+    };
+    assert!(
+        error.contains("cannot be sent in an HTTP header"),
+        "{error}"
+    );
+    assert!(!error.contains("sk-ant-bad"), "{error}");
+    // SAFETY: the variable name is unique to this test.
+    unsafe {
+        std::env::remove_var(VAR);
+    }
+}
+
 #[test]
 fn anthropic_errors_use_anthropic_mapping() {
     let provider = AnthropicModelProvider::new(
