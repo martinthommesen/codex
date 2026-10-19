@@ -24,6 +24,7 @@ use std::time::Duration;
 use std::time::Instant;
 use tokio::io::AsyncBufReadExt;
 use tokio::io::AsyncRead;
+use tokio::io::AsyncReadExt;
 use tokio::io::AsyncWrite;
 use tokio::io::AsyncWriteExt;
 use tokio::io::BufReader;
@@ -43,6 +44,16 @@ const INVALID_PARAMS: i64 = -32602;
 /// Unix socket paths must stay well below the platform `sun_path` limit.
 const MAX_SOCKET_PATH_LEN: usize = 100;
 const UNEXPECTED_CALL_MESSAGE: &str = "Codex did not receive this tool call from Claude Code, so it was not run. Call the tool again.";
+/// Longest MCP message (one line) a client may send; far above any tool call's arguments.
+const MAX_MESSAGE_BYTES: usize = 16 * 1024 * 1024;
+/// Tool calls one connection may have waiting for Codex at once.
+const MAX_PARKED_PER_CONNECTION: usize = 128;
+/// Answers kept for calls that have not arrived yet; the oldest is dropped beyond this.
+const MAX_PREPARED: usize = 128;
+const UNTAGGED_CALL_MESSAGE: &str =
+    "Codex only answers tool calls that carry Claude Code's tool_use id.";
+const TOO_MANY_CALLS_MESSAGE: &str =
+    "Too many tool calls are waiting for Codex. Call the tool again once they finish.";
 
 /// Codex tools as exposed through the bridge.
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -147,6 +158,9 @@ struct BridgeState {
     parked: Vec<ParkedCall>,
     /// Outputs supplied before Claude Code sent the matching `tools/call`.
     prepared: Vec<PreparedAnswer>,
+    /// A call carried a tool_use id. Claude Code then tags all its calls, so calls without one
+    /// come from another client and are refused instead of matched by name.
+    tagged_calls_seen: bool,
 }
 
 /// Shared bridge state; the socket listener lives in [`Bridge`].
@@ -187,6 +201,7 @@ impl BridgeCore {
             .parked
             .iter()
             .position(|call| call.tool_use_id.as_deref() == Some(call_id))
+            // Id-less calls stay parked only while no call carried an id (`tagged_calls_seen`).
             .or_else(|| {
                 state
                     .parked
@@ -198,11 +213,16 @@ impl BridgeCore {
                 let call = state.parked.remove(position);
                 respond(&state, &call, result);
             }
-            None => state.prepared.push(PreparedAnswer {
-                call_id: call_id.to_string(),
-                mcp_name: mcp_name.to_string(),
-                result,
-            }),
+            None => {
+                if state.prepared.len() >= MAX_PREPARED {
+                    state.prepared.remove(0);
+                }
+                state.prepared.push(PreparedAnswer {
+                    call_id: call_id.to_string(),
+                    mcp_name: mcp_name.to_string(),
+                    result,
+                });
+            }
         }
     }
 
@@ -243,6 +263,11 @@ impl BridgeCore {
     #[cfg(test)]
     pub(crate) fn parked_count(&self) -> usize {
         self.lock().parked.len()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn prepared_count(&self) -> usize {
+        self.lock().prepared.len()
     }
 
     fn register_connection(&self, tx: mpsc::UnboundedSender<String>) -> u64 {
@@ -352,17 +377,42 @@ impl BridgeCore {
             .and_then(Value::as_str)
             .map(str::to_string);
         let mut state = self.lock();
-        // An answer Codex already supplied wins even if the next request exposes a different
-        // tool set (for example a compaction request with no tools): Claude Code sends serial
-        // calls only after earlier ones resolve, and Codex has already run this one.
-        if let Some(tool_use_id) = &tool_use_id
-            && let Some(position) = state
-                .prepared
-                .iter()
-                .position(|answer| &answer.call_id == tool_use_id)
-        {
-            let answer = state.prepared.remove(position);
-            return Some(result_response(id, answer.result));
+        match &tool_use_id {
+            Some(tool_use_id) => {
+                if !state.tagged_calls_seen {
+                    state.tagged_calls_seen = true;
+                    let (untagged, tagged): (Vec<_>, Vec<_>) = std::mem::take(&mut state.parked)
+                        .into_iter()
+                        .partition(|call| call.tool_use_id.is_none());
+                    state.parked = tagged;
+                    for call in &untagged {
+                        respond(
+                            &state,
+                            call,
+                            crate::history::error_tool_result(UNTAGGED_CALL_MESSAGE),
+                        );
+                    }
+                }
+                // An answer Codex already supplied wins even if the next request exposes a
+                // different tool set (for example a compaction request with no tools): Claude
+                // Code sends serial calls only after earlier ones resolve, and Codex has already
+                // run this one.
+                if let Some(position) = state
+                    .prepared
+                    .iter()
+                    .position(|answer| &answer.call_id == tool_use_id)
+                {
+                    let answer = state.prepared.remove(position);
+                    return Some(result_response(id, answer.result));
+                }
+            }
+            None if state.tagged_calls_seen => {
+                return Some(result_response(
+                    id,
+                    crate::history::error_tool_result(UNTAGGED_CALL_MESSAGE),
+                ));
+            }
+            None => {}
         }
         if !state.registry.targets.contains_key(mcp_name) {
             return Some(result_response(
@@ -380,6 +430,17 @@ impl BridgeCore {
         {
             let answer = state.prepared.remove(position);
             return Some(result_response(id, answer.result));
+        }
+        let parked_here = state
+            .parked
+            .iter()
+            .filter(|call| call.connection == connection)
+            .count();
+        if parked_here >= MAX_PARKED_PER_CONNECTION {
+            return Some(result_response(
+                id,
+                crate::history::error_tool_result(TOO_MANY_CALLS_MESSAGE),
+            ));
         }
         debug!(tool = %mcp_name, "parking Claude Code tool call until Codex supplies the output");
         state.parked.push(ParkedCall {
@@ -445,9 +506,20 @@ impl BridgeCore {
         let mut line = Vec::new();
         loop {
             line.clear();
-            match reader.read_until(b'\n', &mut line).await {
+            let read = (&mut reader)
+                .take(MAX_MESSAGE_BYTES as u64 + 1)
+                .read_until(b'\n', &mut line)
+                .await;
+            match read {
                 Ok(0) | Err(_) => break,
                 Ok(_) => {}
+            }
+            if line.len() > MAX_MESSAGE_BYTES {
+                warn!(
+                    limit = MAX_MESSAGE_BYTES,
+                    "closing a Codex tool bridge connection that sent an oversized message"
+                );
+                break;
             }
             if line.iter().all(u8::is_ascii_whitespace) {
                 continue;
@@ -506,6 +578,18 @@ impl Bridge {
                 return Err(err);
             }
         };
+        // Owner-only whatever the umask, as defense in depth: the private directory already keeps
+        // other users out.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            if let Err(err) =
+                std::fs::set_permissions(&socket_path, std::fs::Permissions::from_mode(0o600))
+            {
+                let _ = std::fs::remove_dir_all(&socket_dir);
+                return Err(err);
+            }
+        }
         let core = Arc::new(BridgeCore::default());
         let accept_task = tokio::spawn(accept_loop(listener, Arc::clone(&core)));
         Ok(Self {
@@ -542,9 +626,14 @@ fn private_socket_dir() -> PathBuf {
     candidate
 }
 
-/// Access control is the private socket directory (0700, or a user-only DACL on Windows). There
-/// is deliberately no `ensure_non_elevated_peer` check: it rejects every peer when Codex runs
-/// elevated, and a connection can only park calls, never make Codex run a tool.
+/// Access control is the private socket directory (0700, or a user-only DACL on Windows) and, on
+/// Unix, an owner-only socket. Other processes of the same user can still connect, but a
+/// connection can only park calls, never make Codex run a tool; id-less calls are refused once
+/// calls carry tool_use ids, and message size and queued calls are bounded. Peers are not checked
+/// against the Claude Code process tree: the peer is a grandchild, sometimes behind shims, ancestry
+/// checks need per-OS code and are racy under PID reuse, and a same-user process can read Codex's
+/// rollouts or attach to Claude Code anyway. There is deliberately no `ensure_non_elevated_peer`
+/// check either: it rejects every peer when Codex runs elevated.
 async fn accept_loop(mut listener: UnixListener, core: Arc<BridgeCore>) {
     loop {
         match listener.accept().await {

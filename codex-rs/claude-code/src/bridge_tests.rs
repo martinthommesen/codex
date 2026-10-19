@@ -1,4 +1,7 @@
 use super::BridgeCore;
+use super::MAX_MESSAGE_BYTES;
+use super::MAX_PARKED_PER_CONNECTION;
+use super::MAX_PREPARED;
 use super::MCP_TOOL_NAME_LIMIT;
 use super::ToolRegistry;
 use super::wire_tool_name;
@@ -381,4 +384,131 @@ fn bridged_name_collisions_are_reported() {
 is already used by tool `{long_name}`"
         )]
     );
+}
+
+#[tokio::test]
+async fn id_less_calls_are_refused_once_calls_carry_tool_use_ids() {
+    let core = Arc::new(BridgeCore::default());
+    core.set_tools(shell_registry());
+    let mut claude = Client::connect(&core);
+    claude.initialize().await;
+    let mut squatter = Client::connect(&core);
+    squatter.initialize().await;
+
+    // An id-less call parked before Claude Code's first tagged call is released by that call.
+    squatter.send(call(1, "shell", None)).await;
+    squatter
+        .send(json!({"jsonrpc": "2.0", "id": 2, "method": "ping"}))
+        .await;
+    assert_eq!(squatter.recv().await["id"], json!(2));
+    claude.send(call(1, "shell", Some("toolu_a"))).await;
+    let refused = squatter.recv().await;
+    assert_eq!(
+        (refused["id"].clone(), refused["result"]["isError"].clone()),
+        (json!(1), json!(true))
+    );
+    core.answer("toolu_a", "shell", text_result("first"));
+    assert_eq!(claude.recv().await["result"], text_result("first"));
+
+    // Later id-less calls fail at once and never receive Codex's answers.
+    squatter.send(call(3, "shell", None)).await;
+    let refused = squatter.recv().await;
+    assert_eq!(
+        (refused["id"].clone(), refused["result"]["isError"].clone()),
+        (json!(3), json!(true))
+    );
+    core.answer("toolu_b", "shell", text_result("second"));
+    squatter.assert_silent().await;
+    claude.send(call(2, "shell", Some("toolu_b"))).await;
+    assert_eq!(claude.recv().await["result"], text_result("second"));
+}
+
+#[tokio::test]
+async fn overlong_messages_close_only_that_connection() {
+    let core = Arc::new(BridgeCore::default());
+    core.set_tools(shell_registry());
+    let (client, server) = tokio::io::duplex(64 * 1024);
+    core.spawn_connection(server);
+    let (read, mut writer) = tokio::io::split(client);
+    let mut lines = BufReader::new(read).lines();
+    tokio::spawn(async move {
+        let _ = writer.write_all(&vec![b'x'; MAX_MESSAGE_BYTES + 1]).await;
+    });
+    let next = tokio::time::timeout(Duration::from_secs(10), lines.next_line())
+        .await
+        .expect("the bridge closes the connection");
+    assert_eq!(next.expect("read"), None);
+
+    let mut other = Client::connect(&core);
+    other
+        .send(json!({"jsonrpc": "2.0", "id": 1, "method": "ping"}))
+        .await;
+    assert_eq!(other.recv().await["id"], json!(1));
+}
+
+#[tokio::test]
+async fn parked_calls_per_connection_are_bounded() {
+    let core = Arc::new(BridgeCore::default());
+    core.set_tools(shell_registry());
+    let mut client = Client::connect(&core);
+    client.initialize().await;
+
+    let limit = MAX_PARKED_PER_CONNECTION as i64;
+    for id in 0..limit {
+        client
+            .send(call(id, "shell", Some(&format!("toolu_{id}"))))
+            .await;
+    }
+    client.send(call(limit, "shell", Some("toolu_over"))).await;
+    let response = client.recv().await;
+    assert_eq!(
+        (
+            response["id"].clone(),
+            response["result"]["isError"].clone()
+        ),
+        (json!(limit), json!(true))
+    );
+    assert_eq!(core.parked_count(), MAX_PARKED_PER_CONNECTION);
+}
+
+#[tokio::test]
+async fn prepared_answers_are_bounded() {
+    let core = Arc::new(BridgeCore::default());
+    core.set_tools(shell_registry());
+    let mut client = Client::connect(&core);
+    client.initialize().await;
+
+    for index in 0..=MAX_PREPARED {
+        core.answer(
+            &format!("toolu_{index}"),
+            "shell",
+            text_result(&index.to_string()),
+        );
+    }
+    assert_eq!(core.prepared_count(), MAX_PREPARED);
+    // The newest answers are kept; the oldest was dropped.
+    client
+        .send(call(1, "shell", Some(&format!("toolu_{MAX_PREPARED}"))))
+        .await;
+    assert_eq!(
+        client.recv().await["result"],
+        text_result(&MAX_PREPARED.to_string())
+    );
+    client.send(call(2, "shell", Some("toolu_0"))).await;
+    client.assert_silent().await;
+    assert_eq!(core.parked_count(), 1);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn bridge_socket_is_owner_only() {
+    use super::Bridge;
+    use std::os::unix::fs::PermissionsExt;
+
+    let bridge = Bridge::start().await.expect("bridge");
+    let mode = std::fs::metadata(bridge.socket_path())
+        .expect("socket metadata")
+        .permissions()
+        .mode();
+    assert_eq!(mode & 0o777, 0o600);
 }
