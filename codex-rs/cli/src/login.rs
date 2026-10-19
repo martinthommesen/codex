@@ -503,6 +503,11 @@ pub async fn run_login_claude_oauth(cli_config_overrides: CliConfigOverrides) ->
     exit_with(crate::claude_oauth_login::login(&config).await);
 }
 
+/// Prints login status in the order OpenAI, Anthropic, Claude Code, Claude OAuth.
+///
+/// Exit status: without `--provider` (or with `openai`), 0 only when the OpenAI login is usable;
+/// the Claude lines are informational. With `anthropic`, `claude-code` or `claude-oauth`, 0 when
+/// that provider is usable. With `all`, 0 when at least one provider is usable. Otherwise 1.
 pub async fn run_login_status(
     cli_config_overrides: CliConfigOverrides,
     provider: Option<LoginProvider>,
@@ -545,10 +550,6 @@ pub async fn run_login_status(
     if anthropic_ok {
         eprintln!("{anthropic}");
     }
-    let (claude_oauth_ok, claude_oauth) = crate::claude_oauth_login::status(&config);
-    if claude_oauth_ok {
-        eprintln!("{claude_oauth}");
-    }
     if config
         .codex_home
         .join(codex_core::provider_models::CLAUDE_CODE_CONNECTED_MARKER)
@@ -556,6 +557,10 @@ pub async fn run_login_status(
     {
         let (_, claude_code) = crate::claude_login::claude_code_status(&config).await;
         eprintln!("{claude_code}");
+    }
+    let (claude_oauth_ok, claude_oauth) = crate::claude_oauth_login::status(&config);
+    if claude_oauth_ok {
+        eprintln!("{claude_oauth}");
     }
     std::process::exit(if logged_in { 0 } else { 1 });
 }
@@ -623,22 +628,31 @@ pub async fn run_logout(
             exit_with(crate::claude_oauth_login::logout(&config));
         }
         Some(LoginProvider::All) => {
-            for result in [
-                crate::claude_login::logout_anthropic(&config),
-                crate::claude_login::logout_claude_code(&config),
-                crate::claude_oauth_login::logout(&config),
-            ] {
-                match result {
-                    Ok(message) => eprintln!("{message}"),
-                    Err(message) => {
-                        eprintln!("{message}");
-                        std::process::exit(1);
-                    }
-                }
-            }
+            // Attempt every provider even after a failure so one broken store never leaves the
+            // others signed in; exit non-zero if any of them failed.
+            let mut failed = false;
+            let mut report = |result: Result<String, String>| {
+                failed |= result.is_err();
+                let (Ok(message) | Err(message)) = result;
+                eprintln!("{message}");
+            };
+            report(crate::claude_login::logout_anthropic(&config));
+            report(crate::claude_login::logout_claude_code(&config));
+            report(crate::claude_oauth_login::logout(&config));
+            report(
+                logout_openai(&config)
+                    .await
+                    .map(|message| format!("OpenAI: {message}"))
+                    .map_err(|message| format!("OpenAI: {message}")),
+            );
+            std::process::exit(if failed { 1 } else { 0 });
         }
-        Some(LoginProvider::Openai) | None => {}
+        Some(LoginProvider::Openai) | None => exit_with(logout_openai(&config).await),
     }
+}
+
+/// Signs out of ChatGPT/OpenAI and clears managed Amazon Bedrock configuration.
+async fn logout_openai(config: &Config) -> Result<String, String> {
     let auth_route_config = config.auth_route_config();
 
     // Cleanup is independent of the current feature gate. Retain the grant lock
@@ -672,46 +686,38 @@ pub async fn run_logout(
         eprintln!("Warning: failed to remove enterprise authorization; continuing account logout");
     }
 
-    let logged_out = match logout_with_revoke(
+    let logged_out = logout_with_revoke(
         &config.codex_home,
         config.cli_auth_credentials_store_mode,
         config.auth_keyring_backend_kind(),
         &auth_route_config,
     )
     .await
-    {
-        Ok(logged_out) => logged_out,
-        Err(err) => {
-            eprintln!("Error logging out: {err}");
-            std::process::exit(1);
-        }
-    };
+    .map_err(|err| format!("Error logging out: {err}"))?;
     drop(enterprise_guard);
 
     let cleared_bedrock_config =
-        if let Some(paths) = ConfigEditsBuilder::bedrock_provider_config_paths_to_clear(&config) {
+        if let Some(paths) = ConfigEditsBuilder::bedrock_provider_config_paths_to_clear(config) {
             let edits = paths
                 .into_iter()
                 .map(|segments| ConfigEdit::ClearPath { segments });
-            if let Err(err) = ConfigEditsBuilder::for_config(&config)
+            ConfigEditsBuilder::for_config(config)
                 .with_edits(edits)
                 .apply()
                 .await
-            {
-                eprintln!("Error clearing Amazon Bedrock configuration after logout: {err}");
-                std::process::exit(1);
-            }
+                .map_err(|err| {
+                    format!("Error clearing Amazon Bedrock configuration after logout: {err}")
+                })?;
             true
         } else {
             false
         };
 
-    if logged_out || cleared_bedrock_config {
-        eprintln!("Successfully logged out");
+    Ok(if logged_out || cleared_bedrock_config {
+        "Successfully logged out".to_string()
     } else {
-        eprintln!("Not logged in");
-    }
-    std::process::exit(0);
+        "Not logged in".to_string()
+    })
 }
 
 fn exit_with(result: Result<String, String>) -> ! {

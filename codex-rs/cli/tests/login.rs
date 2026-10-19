@@ -7,7 +7,10 @@ use anyhow::Context;
 use anyhow::Result;
 use app_test_support::ChatGptAuthFixture;
 use app_test_support::write_chatgpt_auth;
+use codex_claude_code::CLAUDE_CODE_PATH_ENV_VAR;
 use codex_config::types::AuthCredentialsStoreMode;
+use codex_login::ANTHROPIC_API_KEY_ENV_VAR;
+use codex_login::AnthropicAuthConfig;
 use codex_login::AuthKeyringBackendKind;
 use codex_login::CLIENT_ID;
 use codex_login::CODEX_ACCESS_TOKEN_ENV_VAR;
@@ -101,6 +104,132 @@ fn login_status_validates_configured_workload_identity() -> Result<()> {
         .failure()
         .stderr(contains("could not read workload identity assertion file"));
 
+    Ok(())
+}
+
+/// A `codex` command that ignores credentials from the developer's environment.
+fn isolated_codex_command(codex_home: &Path) -> Result<assert_cmd::Command> {
+    let mut cmd = codex_command(codex_home)?;
+    cmd.env_remove(ANTHROPIC_API_KEY_ENV_VAR)
+        .env_remove("CODEX_API_KEY")
+        .env_remove("OPENAI_API_KEY")
+        .env_remove(CODEX_ACCESS_TOKEN_ENV_VAR)
+        .env(
+            CLAUDE_CODE_PATH_ENV_VAR,
+            codex_home.join("missing-claude-executable"),
+        );
+    Ok(cmd)
+}
+
+#[test]
+fn login_provider_all_is_rejected() -> Result<()> {
+    let codex_home = TempDir::new()?;
+    write_file_auth_config(codex_home.path())?;
+
+    isolated_codex_command(codex_home.path())?
+        .args(["login", "--provider", "all"])
+        .assert()
+        .failure()
+        .stderr(contains(
+            "`--provider all` is supported by `codex login status` and `codex logout`.",
+        ));
+
+    assert!(!codex_home.path().join("auth.json").exists());
+    Ok(())
+}
+
+#[test]
+fn login_status_provider_all_reports_every_provider() -> Result<()> {
+    let codex_home = TempDir::new()?;
+    write_file_auth_config(codex_home.path())?;
+
+    isolated_codex_command(codex_home.path())?
+        .args(["login", "status", "--provider", "all"])
+        .assert()
+        .failure()
+        .stderr(contains("OpenAI: Not logged in"));
+
+    codex_login::login_with_api_key(
+        codex_home.path(),
+        "sk-openai-test-status-all",
+        AuthCredentialsStoreMode::File,
+        AuthKeyringBackendKind::Direct,
+    )?;
+    let assert = isolated_codex_command(codex_home.path())?
+        .args(["login", "status", "--provider", "all"])
+        .assert()
+        .success();
+    let stderr = String::from_utf8_lossy(&assert.get_output().stderr);
+    let line_index = |prefix: &str| {
+        stderr
+            .lines()
+            .position(|line| line.starts_with(prefix))
+            .unwrap_or_else(|| panic!("missing `{prefix}` in {stderr}"))
+    };
+    let order = [
+        line_index("OpenAI: Logged in using an API key"),
+        line_index("Anthropic API: not configured"),
+        line_index("Claude Code: "),
+        line_index("Claude OAuth (experimental): not configured"),
+    ];
+    assert!(order.is_sorted(), "{stderr}");
+    Ok(())
+}
+
+#[test]
+fn logout_all_attempts_every_provider_after_a_failure() -> Result<()> {
+    let codex_home = TempDir::new()?;
+    write_file_auth_config(codex_home.path())?;
+    codex_login::login_with_api_key(
+        codex_home.path(),
+        "sk-openai-test-logout-all",
+        AuthCredentialsStoreMode::File,
+        AuthKeyringBackendKind::Direct,
+    )?;
+    AnthropicAuthConfig::new(
+        codex_home.path().to_path_buf(),
+        AuthCredentialsStoreMode::File,
+        AuthKeyringBackendKind::Direct,
+    )
+    .save_api_key("sk-ant-api03-test-logout-all")?;
+    // A directory where the Claude Code marker file belongs makes that logout fail.
+    std::fs::create_dir_all(codex_home.path().join("claude-code/connected.json"))?;
+
+    isolated_codex_command(codex_home.path())?
+        .args(["logout", "--provider", "all"])
+        .assert()
+        .failure()
+        .stderr(contains("OpenAI: Successfully logged out"))
+        .stderr(contains("Removed the stored Anthropic API key"))
+        .stderr(contains("Failed to remove"))
+        .stderr(contains("No Claude OAuth credentials were stored by Codex"));
+
+    assert!(!codex_home.path().join("auth.json").exists());
+    assert!(!codex_home.path().join("anthropic_auth.json").exists());
+    Ok(())
+}
+
+#[test]
+fn logout_all_succeeds_when_every_provider_signs_out() -> Result<()> {
+    let codex_home = TempDir::new()?;
+    write_file_auth_config(codex_home.path())?;
+    codex_login::login_with_api_key(
+        codex_home.path(),
+        "sk-openai-test-logout-all",
+        AuthCredentialsStoreMode::File,
+        AuthKeyringBackendKind::Direct,
+    )?;
+
+    isolated_codex_command(codex_home.path())?
+        .args(["logout", "--provider", "all"])
+        .assert()
+        .success()
+        .stderr(contains("OpenAI: Successfully logged out"))
+        .stderr(contains("No stored Anthropic API key"))
+        .stderr(contains("Claude Code was not connected to Codex"))
+        .stderr(contains("No Claude OAuth credentials were stored by Codex"));
+
+    assert!(!codex_home.path().join("auth.json").exists());
     Ok(())
 }
 

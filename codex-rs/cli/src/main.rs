@@ -573,6 +573,11 @@ struct LoginCommand {
 #[derive(Debug, clap::Subcommand)]
 enum LoginSubcommand {
     /// Show login status.
+    ///
+    /// Exit status: without --provider (or with `openai`), 0 only when the OpenAI login is
+    /// usable; connected Claude providers are listed but do not affect it. With `anthropic`,
+    /// `claude-code` or `claude-oauth`, 0 when that provider is usable. With `all`, 0 when at
+    /// least one provider is usable. Otherwise 1.
     Status,
 }
 
@@ -582,7 +587,7 @@ struct LogoutCommand {
     config_overrides: CliConfigOverrides,
 
     /// Provider to sign out of (default: openai). Signing out of one provider never affects
-    /// another; `all` signs out of every provider.
+    /// another; `all` attempts every provider and exits non-zero if any of them fails.
     #[arg(long = "provider", value_enum)]
     provider: Option<LoginProvider>,
 }

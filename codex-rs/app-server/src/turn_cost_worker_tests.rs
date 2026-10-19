@@ -75,6 +75,7 @@ async fn worker_does_not_start_for_claude_providers() {
     for model_provider in [
         ModelProviderInfo::create_anthropic_provider(),
         ModelProviderInfo::create_claude_code_provider(),
+        ModelProviderInfo::create_claude_oauth_provider(),
     ] {
         config.model_provider = model_provider;
         let auth_manager = AuthManager::from_auth_for_testing(CodexAuth::from_api_key("sk-test"));

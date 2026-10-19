@@ -22,6 +22,15 @@ fn claude_oauth_login_status_and_logout_select_the_isolated_provider() {
 }
 
 #[test]
+fn login_status_help_documents_exit_codes() {
+    let cli = MultitoolCli::try_parse_from(["codex", "login", "status", "--help"])
+        .expect_err("help display");
+    let help = cli.to_string();
+    assert!(help.contains("Exit status"), "{help}");
+    assert!(help.contains("at least one provider"), "{help}");
+}
+
+#[test]
 fn login_help_marks_claude_oauth_experimental() {
     let cli = MultitoolCli::try_parse_from(["codex", "login", "--help"]).expect_err("help display");
     let help = cli.to_string();
