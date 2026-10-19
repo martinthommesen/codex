@@ -698,6 +698,8 @@ fn without_user_layers(stack: &codex_config::ConfigLayerStack) -> codex_config::
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum OverrideLayer {
     CommandLine,
+    /// A flag the remote app server was started with, which this TUI cannot change.
+    ServerLaunch,
     Project,
     Profile,
     /// The main `config.toml` under a selected profile, whose file `/settings` writes instead.
@@ -743,7 +745,8 @@ impl OverrideLayer {
                 profile: Some(_), ..
             } => Some(Self::Profile),
             Source::User { profile: None, .. } => Some(Self::BaseUser),
-            Source::SessionFlags => Some(Self::CommandLine),
+            // config/read reports only the server's own flags; this TUI's come from `launch`.
+            Source::SessionFlags => Some(Self::ServerLaunch),
             Source::Project { .. } => Some(Self::Project),
             Source::Mdm { .. }
             | Source::EnterpriseManaged { .. }
@@ -767,6 +770,9 @@ impl OverrideLayer {
         match self {
             Self::CommandLine => {
                 format!("a command-line flag for this Codex session still sets `{key}`")
+            }
+            Self::ServerLaunch => {
+                format!("the app server was started with a flag that still sets `{key}`")
             }
             Self::Project => format!("this project's .codex/config.toml still sets `{key}`"),
             Self::Profile => format!("the selected profile still sets `{key}`"),

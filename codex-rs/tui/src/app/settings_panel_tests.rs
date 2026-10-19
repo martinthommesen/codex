@@ -363,12 +363,12 @@ fn layer(source: ApiSource, config: serde_json::Value) -> serde_json::Value {
     serde_json::json!({ "name": source, "version": "1", "config": config })
 }
 
-/// Resolves a remote save of `switch` with this TUI forwarding `features`.
-fn resolve_with_launch_features(
+/// Resolves a remote save of `switch` with this TUI forwarding `overrides`.
+fn resolve_with_launch(
     switch: SettingsSwitch,
     enabled: bool,
     effective_config: &mut ConfigReadResponse,
-    features: serde_json::Value,
+    overrides: Option<HashMap<String, serde_json::Value>>,
 ) -> RemoteResolution {
     let launch_origins = HashMap::new();
     resolve_remote_save(
@@ -376,12 +376,27 @@ fn resolve_with_launch_features(
         enabled,
         effective_config,
         &RemoteLaunch {
-            overrides: Some(HashMap::from([("features".to_string(), features)])),
+            overrides,
             origins: &launch_origins,
             web_search_source: None,
             web_search_modes: None,
         },
         &user_file("config.toml"),
+    )
+}
+
+/// Resolves a remote save of `switch` with this TUI forwarding `features`.
+fn resolve_with_launch_features(
+    switch: SettingsSwitch,
+    enabled: bool,
+    effective_config: &mut ConfigReadResponse,
+    features: serde_json::Value,
+) -> RemoteResolution {
+    resolve_with_launch(
+        switch,
+        enabled,
+        effective_config,
+        Some(HashMap::from([("features".to_string(), features)])),
     )
 }
 
@@ -599,4 +614,62 @@ fn a_feature_the_server_resolved_with_its_own_flags_is_read_from_its_layer() {
         &effective_config,
         Feature::MemoryTool
     ));
+}
+
+#[test]
+fn the_app_servers_own_flags_are_named_as_the_servers() {
+    // Without features from this TUI, the server's `--enable memories` reaches new threads.
+    let mut effective_config = config_read(serde_json::json!({
+        "config": { "features": { "memories": true } },
+        "origins": { "features.memories": origin(ApiSource::SessionFlags) },
+    }));
+    let resolution = resolve_with_launch(
+        SettingsSwitch::Memories,
+        /*enabled*/ false,
+        &mut effective_config,
+        /*overrides*/ None,
+    );
+    assert_eq!(
+        (resolution.winner, resolution.unverified),
+        (
+            Some((OverrideLayer::ServerLaunch, "features.memories".to_string())),
+            None
+        )
+    );
+
+    // Forwarded features never replace the server's `-c agents.enabled=false`.
+    let mut effective_config = config_read(serde_json::json!({
+        "config": {
+            "agents": { "enabled": false },
+            "features": { "multi_agent": true },
+        },
+        "origins": { "agents.enabled": origin(ApiSource::SessionFlags) },
+        "layers": [
+            layer(ApiSource::SessionFlags, serde_json::json!({ "agents": { "enabled": false } })),
+        ],
+    }));
+    let resolution = resolve_with_launch_features(
+        SettingsSwitch::Subagents,
+        /*enabled*/ true,
+        &mut effective_config,
+        serde_json::json!({ "multi_agent": true }),
+    );
+    let (notice, outcome) = save_notice(
+        SettingsSwitch::Subagents,
+        /*enabled*/ true,
+        SwitchState::Off,
+        SwitchState::On,
+        SaveCheck {
+            overridden: Some("Overridden by session flags".to_string()),
+            unverified: resolution.unverified,
+            winner: resolution.winner,
+        },
+    );
+    assert_eq!(
+        (notice.as_str(), outcome),
+        (
+            "Subagents saved, but it is overridden: the app server was started with a flag that still sets `agents.enabled`",
+            SaveOutcome::Failed
+        )
+    );
 }
