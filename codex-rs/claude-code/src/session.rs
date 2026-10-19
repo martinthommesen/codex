@@ -276,14 +276,12 @@ are {}",
             inner.process = Some(ClaudeProcess::spawn(&spec, key.clone())?);
         }
 
-        if prefix_matches {
-            send_incremental(&mut inner, &core, input, leading_len).await;
+        let payload = if prefix_matches {
+            Payload::Incremental
         } else {
-            let payload = fresh_payload(input, leading_len);
-            send_user_message(&mut inner, payload).await;
-        }
-        inner.synced_len = input.len();
-        inner.prefix_hash = prefix_hash(input);
+            Payload::Fresh
+        };
+        deliver_input(&mut inner, &core, input, leading_len, payload).await;
 
         let (tx, rx_event) = mpsc::channel(EVENT_CHANNEL_CAPACITY);
         let driver = Driver {
@@ -386,13 +384,45 @@ fn fresh_payload(input: &[ResponseItem], leading_len: usize) -> Vec<Value> {
     blocks
 }
 
-/// Sends what Codex added since the last segment.
+/// How much of the conversation a request sends to Claude Code.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Payload {
+    /// What Codex added since the last segment.
+    Incremental,
+    /// The whole conversation, seeding a fresh session.
+    Fresh,
+}
+
+/// Sends `input` to Claude Code and advances the sync cursor only once it was delivered, so input
+/// that never reached the CLI is replayed by the next request instead of being skipped.
+///
+/// Delivered means written to the CLI's stdin, or, for tool results, handed to the bridge while
+/// the process is running. A process that dies after a successful write but before reading it can
+/// still lose the message; rolling the cursor back then could duplicate one the CLI had recorded.
+async fn deliver_input(
+    inner: &mut SessionInner,
+    core: &BridgeCore,
+    input: &[ResponseItem],
+    leading_len: usize,
+    payload: Payload,
+) {
+    let delivered = match payload {
+        Payload::Incremental => send_incremental(inner, core, input, leading_len).await,
+        Payload::Fresh => send_user_message(inner, fresh_payload(input, leading_len)).await,
+    };
+    if delivered {
+        inner.synced_len = input.len();
+        inner.prefix_hash = prefix_hash(input);
+    }
+}
+
+/// Sends what Codex added since the last segment; `false` when writing to Claude Code failed.
 async fn send_incremental(
     inner: &mut SessionInner,
     core: &BridgeCore,
     input: &[ResponseItem],
     leading_len: usize,
-) {
+) -> bool {
     let start = inner.synced_len.max(leading_len).min(input.len());
     let mut answers: Vec<(OutstandingCall, Value)> = Vec::new();
     let mut blocks = Vec::new();
@@ -422,6 +452,15 @@ async fn send_incremental(
             .map(|call| (call, error_tool_result(MISSING_OUTPUT_MESSAGE))),
     );
     if !answers.is_empty() {
+        // Answers for a process that has exited would be lost; the next request replays them to
+        // its replacement as notes instead.
+        if inner
+            .process
+            .as_mut()
+            .is_none_or(ClaudeProcess::is_closed)
+        {
+            return false;
+        }
         if !blocks.is_empty()
             && let Some((_, result)) = answers.last_mut()
         {
@@ -432,27 +471,32 @@ async fn send_incremental(
         for (call, result) in answers {
             core.answer(&call.call_id, &call.mcp_name, result);
         }
-        return;
+        return true;
     }
     if !blocks.is_empty() {
         if inner.query_in_flight {
             settle_query(inner, core).await;
         }
-        send_user_message(inner, blocks).await;
+        send_user_message(inner, blocks).await
     } else if !inner.query_in_flight {
-        send_user_message(inner, vec![text_block("Continue.")]).await;
+        send_user_message(inner, vec![text_block("Continue.")]).await
+    } else {
+        true
     }
 }
 
-async fn send_user_message(inner: &mut SessionInner, blocks: Vec<Value>) {
+/// Writes a user message to Claude Code; `false` when the write failed.
+async fn send_user_message(inner: &mut SessionInner, blocks: Vec<Value>) -> bool {
     let Some(process) = inner.process.as_mut() else {
-        return;
+        return false;
     };
     if let Err(err) = process.send(&user_message_line(blocks)).await {
         // The driver reports the exit (with stderr) when stdout closes.
         debug!(error = %err, "failed to write to Claude Code stdin");
+        return false;
     }
     inner.query_in_flight = true;
+    true
 }
 
 fn interrupt_request() -> Value {
@@ -965,10 +1009,14 @@ impl Driver {
                 return Step::Done;
             }
         }
-        let payload = fresh_payload(&fallback.input, fallback.leading_len);
-        send_user_message(&mut self.inner, payload).await;
-        self.inner.synced_len = fallback.input.len();
-        self.inner.prefix_hash = prefix_hash(&fallback.input);
+        deliver_input(
+            &mut self.inner,
+            &self.core,
+            &fallback.input,
+            fallback.leading_len,
+            Payload::Fresh,
+        )
+        .await;
         Step::Continue
     }
 
