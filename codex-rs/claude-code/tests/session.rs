@@ -15,6 +15,7 @@ use pretty_assertions::assert_eq;
 use serde_json::Value;
 use serde_json::json;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Duration;
 use tempfile::TempDir;
 use tokio::time::timeout;
@@ -166,6 +167,33 @@ async fn collect(mut stream: ResponseStream) -> Vec<ResponseEvent> {
 async fn run_turn(session: &ClaudeCodeSession, input: &[ResponseItem]) -> Vec<ResponseEvent> {
     let stream = session.stream(request(input)).await.expect("stream");
     collect(stream).await
+}
+
+/// Runs a turn that must end with an error.
+async fn run_failing_turn(session: &ClaudeCodeSession, input: &[ResponseItem]) {
+    let mut stream = session.stream(request(input)).await.expect("stream");
+    let mut failed = false;
+    while let Some(event) = timeout(EVENT_TIMEOUT, stream.rx_event.recv())
+        .await
+        .expect("events")
+    {
+        failed |= event.is_err();
+    }
+    assert!(failed, "the turn did not fail");
+}
+
+/// Waits for the `[hang]` scenario's partial answer, then drops the stream.
+async fn drop_after_partial_answer(mut stream: ResponseStream) {
+    loop {
+        match timeout(EVENT_TIMEOUT, stream.rx_event.recv()).await {
+            Ok(Some(Ok(ResponseEvent::OutputTextDelta(delta)))) => {
+                assert_eq!(delta, "partial");
+                return;
+            }
+            Ok(Some(Ok(_))) => {}
+            other => panic!("unexpected stream state: {other:?}"),
+        }
+    }
 }
 
 /// Output items in the order Codex would record them.
@@ -375,18 +403,8 @@ async fn dropped_stream_interrupts_and_next_turn_resumes() {
     let fixture = Fixture::new();
     let session = ClaudeCodeSession::new(fixture.config());
     let mut input = vec![message("user", "[hang]")];
-    let mut stream = session.stream(request(&input)).await.expect("stream");
-    loop {
-        match timeout(EVENT_TIMEOUT, stream.rx_event.recv()).await {
-            Ok(Some(Ok(ResponseEvent::OutputTextDelta(delta)))) => {
-                assert_eq!(delta, "partial");
-                break;
-            }
-            Ok(Some(Ok(_))) => {}
-            other => panic!("unexpected stream state: {other:?}"),
-        }
-    }
-    drop(stream);
+    let stream = session.stream(request(&input)).await.expect("stream");
+    drop_after_partial_answer(stream).await;
 
     input.push(message("user", "next"));
     let events = run_turn(&session, &input).await;
@@ -398,6 +416,133 @@ async fn dropped_stream_interrupts_and_next_turn_resumes() {
     assert_eq!(
         option_value(&argvs[1], "--resume").as_deref(),
         Some(THREAD_ID)
+    );
+}
+
+#[tokio::test]
+async fn an_interrupt_the_cli_survives_reuses_the_live_process() {
+    let fixture = Fixture::new();
+    std::fs::write(fixture.cwd.join("fake-claude-survive-interrupt"), "").expect("flag");
+    let session = ClaudeCodeSession::new(fixture.config());
+    let mut input = vec![message("user", "[hang]")];
+    let stream = session.stream(request(&input)).await.expect("stream");
+    drop_after_partial_answer(stream).await;
+
+    input.push(message("user", "next"));
+    let events = run_turn(&session, &input).await;
+    assert_eq!(assistant_texts(&events), vec!["echo: next".to_string()]);
+    assert_eq!(fixture.records("interrupt").len(), 1);
+    assert_eq!(
+        fixture.spawn_argvs().len(),
+        1,
+        "the interrupted process is reused"
+    );
+    assert_eq!(
+        fixture.user_message_texts(),
+        vec![vec!["[hang]".to_string()], vec!["next".to_string()]]
+    );
+}
+
+#[tokio::test]
+async fn a_crash_after_startup_resumes_without_repeating_the_prompt() {
+    let fixture = Fixture::new();
+    let session = ClaudeCodeSession::new(fixture.config());
+    let input = vec![message("user", "hello")];
+    let fail_flag = fixture.cwd.join("fake-claude-fail-turn");
+    std::fs::write(&fail_flag, "crash-after-init").expect("flag");
+    run_failing_turn(&session, &input).await;
+    std::fs::remove_file(&fail_flag).expect("remove flag");
+
+    // Claude Code recorded the prompt before it crashed, so the retry resumes that session and
+    // asks it to continue instead of sending the prompt a second time.
+    let events = run_turn(&session, &input).await;
+    assert_eq!(
+        assistant_texts(&events),
+        vec!["echo: Continue.".to_string()]
+    );
+    let argvs = fixture.spawn_argvs();
+    assert_eq!(argvs.len(), 2);
+    assert_eq!(
+        option_value(&argvs[1], "--resume").as_deref(),
+        Some(THREAD_ID)
+    );
+    assert_eq!(
+        fixture.user_message_texts(),
+        vec![vec!["hello".to_string()], vec!["Continue.".to_string()]]
+    );
+}
+
+#[tokio::test]
+async fn an_error_result_does_not_resend_the_prompt() {
+    let fixture = Fixture::new();
+    let session = ClaudeCodeSession::new(fixture.config());
+    let input = vec![message("user", "hello")];
+    let fail_flag = fixture.cwd.join("fake-claude-fail-turn");
+    std::fs::write(&fail_flag, "error-after-init").expect("flag");
+    run_failing_turn(&session, &input).await;
+    std::fs::remove_file(&fail_flag).expect("remove flag");
+
+    // The failed query is part of the live session already.
+    let events = run_turn(&session, &input).await;
+    assert_eq!(
+        assistant_texts(&events),
+        vec!["echo: Continue.".to_string()]
+    );
+    assert_eq!(fixture.spawn_argvs().len(), 1);
+    assert_eq!(
+        fixture.user_message_texts(),
+        vec![vec!["hello".to_string()], vec!["Continue.".to_string()]]
+    );
+}
+
+#[tokio::test]
+async fn an_error_before_startup_reseeds_the_retry() {
+    let fixture = Fixture::new();
+    let session = ClaudeCodeSession::new(fixture.config());
+    run_turn(&session, &[message("user", "first question")]).await;
+
+    // A rewritten history needs a fresh session, which fails before Claude Code created it.
+    let rewritten = vec![
+        message("user", "summary of earlier work"),
+        message("assistant", "noted"),
+        message("user", "follow up"),
+    ];
+    let fail_flag = fixture.cwd.join("fake-claude-fail-turn");
+    std::fs::write(&fail_flag, "error-before-init").expect("flag");
+    run_failing_turn(&session, &rewritten).await;
+    std::fs::remove_file(&fail_flag).expect("remove flag");
+
+    let events = run_turn(&session, &rewritten).await;
+    assert_eq!(
+        assistant_texts(&events),
+        vec!["echo: follow up".to_string()]
+    );
+    let messages = fixture.user_message_texts();
+    let reseeded = messages.last().expect("reseeded message");
+    assert!(
+        reseeded[0].starts_with("<prior_conversation>"),
+        "{reseeded:?}"
+    );
+    assert_eq!(reseeded.last().map(String::as_str), Some("follow up"));
+}
+
+#[tokio::test]
+async fn trailing_control_items_keep_the_prompt_live() {
+    let fixture = Fixture::new();
+    let session = ClaudeCodeSession::new(fixture.config());
+    let input = vec![
+        message("user", "hello"),
+        ResponseItem::AdditionalTools {
+            id: None,
+            role: "developer".to_string(),
+            tools: Arc::from(Vec::new()),
+        },
+    ];
+    let events = run_turn(&session, &input).await;
+    assert_eq!(assistant_texts(&events), vec!["echo: hello".to_string()]);
+    assert_eq!(
+        fixture.user_message_texts(),
+        vec![vec!["hello".to_string()]]
     );
 }
 
@@ -454,15 +599,7 @@ async fn a_session_lost_before_startup_is_reseeded_on_retry() {
     ];
     let crash_flag = fixture.cwd.join("fake-claude-crash-before-init");
     std::fs::write(&crash_flag, "").expect("flag");
-    let mut stream = session.stream(request(&rewritten)).await.expect("stream");
-    let mut failed = false;
-    while let Some(event) = timeout(EVENT_TIMEOUT, stream.rx_event.recv())
-        .await
-        .expect("events")
-    {
-        failed |= event.is_err();
-    }
-    assert!(failed, "the lost process fails the turn");
+    run_failing_turn(&session, &rewritten).await;
     std::fs::remove_file(&crash_flag).expect("remove flag");
 
     // Codex retries the same request; the new process must get the whole conversation again.

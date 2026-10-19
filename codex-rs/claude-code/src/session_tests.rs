@@ -57,6 +57,51 @@ then run `codex login --provider claude-code`)"
     );
 }
 
+#[test]
+fn a_fresh_payload_keeps_a_prompt_followed_by_control_items_live() {
+    use super::fresh_payload;
+    use crate::history::leading_system;
+    use codex_protocol::models::ContentItem;
+    use codex_protocol::models::ImageReference;
+    use codex_protocol::models::ResponseItem;
+    use std::sync::Arc;
+
+    let input = vec![
+        ResponseItem::Message {
+            id: None,
+            role: "user".to_string(),
+            content: vec![
+                ContentItem::InputText {
+                    text: "look".to_string(),
+                },
+                ContentItem::InputImage {
+                    image: ImageReference::Inline {
+                        image_url: "data:image/png;base64,AAAA".to_string(),
+                    },
+                    detail: None,
+                },
+            ],
+            phase: None,
+            status: None,
+            encrypted_content: None,
+            internal_chat_message_metadata_passthrough: None,
+        },
+        ResponseItem::AdditionalTools {
+            id: None,
+            role: "developer".to_string(),
+            tools: Arc::from(Vec::new()),
+        },
+    ];
+    let (leading_len, _) = leading_system(&input);
+    assert_eq!(
+        fresh_payload(&input, leading_len),
+        vec![
+            json!({"type": "text", "text": "look"}),
+            json!({"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "AAAA"}}),
+        ]
+    );
+}
+
 /// Input that never reached Claude Code must stay unsynced, so the next request replays it.
 mod undelivered_input {
     use super::super::Payload;

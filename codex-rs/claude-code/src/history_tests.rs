@@ -10,12 +10,14 @@ use super::trailing_user_input_start;
 use super::truncate_head;
 use super::user_message_line;
 use codex_protocol::ResponseItemId;
+use codex_protocol::models::ConfigurationReasoning;
 use codex_protocol::models::ContentItem;
 use codex_protocol::models::FunctionCallOutputBody;
 use codex_protocol::models::FunctionCallOutputContentItem;
 use codex_protocol::models::FunctionCallOutputPayload;
 use codex_protocol::models::ImageReference;
 use codex_protocol::models::ResponseItem;
+use codex_protocol::openai_models::ReasoningEffort;
 use pretty_assertions::assert_eq;
 use serde_json::json;
 use std::sync::Arc;
@@ -111,6 +113,28 @@ fn trailing_user_input_stops_at_model_output() {
         trailing_user_input_start(&[function_output("c", "x")], 0),
         1
     );
+}
+
+#[test]
+fn trailing_user_input_passes_transparent_control_items() {
+    let items = vec![
+        message("user", "q1"),
+        message("assistant", "a1"),
+        message("user", "q2"),
+        ResponseItem::AdditionalTools {
+            id: None,
+            role: "developer".to_string(),
+            tools: Arc::from(Vec::new()),
+        },
+        ResponseItem::ConfigurationUpdate {
+            reasoning: ConfigurationReasoning {
+                effort: ReasoningEffort::High,
+            },
+        },
+        ResponseItem::CompactionTrigger {},
+        ResponseItem::Other,
+    ];
+    assert_eq!(trailing_user_input_start(&items, 0), 2);
 }
 
 #[test]

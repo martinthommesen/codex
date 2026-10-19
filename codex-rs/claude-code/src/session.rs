@@ -939,6 +939,10 @@ impl Driver {
             self.stop_process().await;
             return self.run_fallback().await;
         }
+        // A started session holds this query's input even when the query failed, so the cursor
+        // stays advanced and a retry continues it rather than repeating the input. Without
+        // `system/init` there is no session, so the next request reseeds a fresh one.
+        forget_unstarted_session(&mut self.inner);
         self.inner.query_in_flight = false;
         let is_error = value
             .get("is_error")

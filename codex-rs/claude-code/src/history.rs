@@ -63,14 +63,23 @@ pub(crate) fn leading_system(items: &[ResponseItem]) -> (usize, Vec<String>) {
                     texts.push(text);
                 }
             }
-            ResponseItem::AdditionalTools { .. }
-            | ResponseItem::ConfigurationUpdate { .. }
-            | ResponseItem::CompactionTrigger {}
-            | ResponseItem::Other => {}
+            item if is_transparent_control(item) => {}
             _ => return (index, texts),
         }
     }
     (items.len(), texts)
+}
+
+/// Request controls without conversation content, which neither end a leading developer run nor
+/// a trailing user input run.
+fn is_transparent_control(item: &ResponseItem) -> bool {
+    matches!(
+        item,
+        ResponseItem::AdditionalTools { .. }
+            | ResponseItem::ConfigurationUpdate { .. }
+            | ResponseItem::CompactionTrigger {}
+            | ResponseItem::Other
+    )
 }
 
 /// Base instructions followed by the hoisted leading developer/system messages.
@@ -83,11 +92,13 @@ pub(crate) fn build_system_prompt(base_instructions: &str, hoisted: &[String]) -
     parts.join("\n\n")
 }
 
-/// Start of the trailing run of new user input (user/developer messages and agent messages),
-/// never before `floor`.
+/// Start of the trailing run of new user input (user/developer messages and agent messages, with
+/// request controls in between), never before `floor`.
 pub(crate) fn trailing_user_input_start(items: &[ResponseItem], floor: usize) -> usize {
     let mut start = items.len();
-    while start > floor && is_user_input(&items[start - 1]) {
+    while start > floor
+        && (is_user_input(&items[start - 1]) || is_transparent_control(&items[start - 1]))
+    {
         start -= 1;
     }
     start.max(floor)

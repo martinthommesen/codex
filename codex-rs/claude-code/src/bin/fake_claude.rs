@@ -11,6 +11,11 @@
 //!
 //! Marker files in the working directory simulate failures: `fake-claude-fail-resume` makes
 //! `--resume` fail, and `fake-claude-crash-before-init` makes a new session exit during startup.
+//! `fake-claude-fail-turn` fails each user message it sees as its contents say:
+//! `crash-after-init` exits after `system/init`, `error-after-init` reports an error `result`
+//! after `system/init`, and `error-before-init` reports one before it (the last two keep running).
+//! With `fake-claude-survive-interrupt`, an interrupt ends the query with an error `result` and
+//! the process keeps running, like the real CLI; otherwise it exits.
 //!
 //! Session processes record what they observe in `fake-claude-record.jsonl` in their working
 //! directory; `auth status --json` prints `$FAKE_CLAUDE_AUTH_JSON`.
@@ -32,6 +37,10 @@ const RECORD_FILE: &str = "fake-claude-record.jsonl";
 const FAIL_RESUME_FILE: &str = "fake-claude-fail-resume";
 /// When this file exists in the working directory, a new session exits before `system/init`.
 const CRASH_BEFORE_INIT_FILE: &str = "fake-claude-crash-before-init";
+/// When this file exists in the working directory, user messages fail as its contents say.
+const FAIL_TURN_FILE: &str = "fake-claude-fail-turn";
+/// When this file exists in the working directory, the process survives interrupts.
+const SURVIVE_INTERRUPT_FILE: &str = "fake-claude-survive-interrupt";
 /// JSON printed by `auth status --json`.
 const AUTH_JSON_ENV: &str = "FAKE_CLAUDE_AUTH_JSON";
 /// When set, `auth` commands append what they observe to this file.
@@ -247,13 +256,23 @@ async fn run(args: &[String]) -> std::io::Result<()> {
                     "type": "control_response",
                     "response": {"subtype": "success", "request_id": message["request_id"]},
                 }));
-                std::process::exit(0);
+                if !std::path::Path::new(SURVIVE_INTERRUPT_FILE).exists() {
+                    std::process::exit(0);
+                }
+                emit_error_result(&session_id);
+                continue;
             }
             Some("user") => {}
             _ => continue,
         }
         let content = message["message"]["content"].clone();
         record(json!({"event": "user_message", "content": content}));
+        let failure = std::fs::read_to_string(FAIL_TURN_FILE).ok();
+        let failure = failure.as_deref().map(str::trim);
+        if failure == Some("error-before-init") && !initialized {
+            emit_error_result(&session_id);
+            continue;
+        }
         if !initialized {
             initialized = true;
             emit(json!({
@@ -263,6 +282,17 @@ async fn run(args: &[String]) -> std::io::Result<()> {
                 "mcp_servers": [{"name": "codex", "status": "connected"}],
                 "tools": tool_names.iter().map(|name| format!("mcp__codex__{name}")).collect::<Vec<_>>(),
             }));
+        }
+        match failure {
+            Some("crash-after-init") => {
+                eprintln!("fake claude crashed during the turn");
+                std::process::exit(1);
+            }
+            Some("error-after-init") => {
+                emit_error_result(&session_id);
+                continue;
+            }
+            _ => {}
         }
         let text: String = content
             .as_array()
@@ -445,6 +475,16 @@ fn stream_text_message(session_id: &str, message_id: &str, text: &str, stop_reas
         json!({"type": "message_delta", "delta": {"stop_reason": stop_reason}, "usage": {"output_tokens": 7}}),
     );
     emit_stream_event(session_id, json!({"type": "message_stop"}));
+}
+
+fn emit_error_result(session_id: &str) {
+    emit(json!({
+        "type": "result",
+        "subtype": "error_during_execution",
+        "is_error": true,
+        "errors": ["fake claude failed the turn"],
+        "session_id": session_id,
+    }));
 }
 
 fn emit_result(session_id: &str, text: &str) {
