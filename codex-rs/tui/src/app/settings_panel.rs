@@ -456,13 +456,25 @@ fn resolve_remote_save(
     written: &AbsolutePathBuf,
     server_override: Option<&codex_app_server_protocol::ConfigLayerSource>,
 ) -> RemoteResolution {
-    let server_flags_replaced = server_feature_flags_replaced(
-        switch,
-        enabled,
-        launch.overrides.as_ref(),
-        &effective_config.origins,
-    );
+    // The overlay changes values, not origins, so origins still name the server's own flags.
     let flagged = overlay_launch_overrides(effective_config, launch.overrides.as_ref());
+    let server_flags_replaced = |covered: &HashSet<String>| {
+        server_feature_flags_replaced(
+            switch,
+            enabled,
+            launch.overrides.as_ref(),
+            &effective_config.origins,
+            covered,
+        )
+    };
+    // Server flags on keys this TUI forwards are overwritten in the overlay already; the rest
+    // leave something behind that config/read cannot show.
+    let unchecked = server_flags_replaced(&flagged);
+    let server_override_stands = !(server_flags_replaced(&HashSet::new())
+        && matches!(
+            server_override,
+            Some(codex_app_server_protocol::ConfigLayerSource::SessionFlags)
+        ));
     let requirements_disallow = launch
         .web_search_modes
         .is_some_and(|modes| constrain_web_search(effective_config, modes.as_deref()));
@@ -485,16 +497,12 @@ fn resolve_remote_save(
                 (key.as_str(), flag_precedence, Some(layer))
             })),
     );
-    // This TUI's own forwarded flag reaches new threads, so it decides even when the server's
-    // flags are replaced.
-    let launch_decides = winner.as_ref().is_some_and(|(layer, key)| {
-        flagged.contains(key)
-            && matches!(layer, OverrideLayer::CommandLine | OverrideLayer::Profile)
-    });
     let winner = winner
         .map(|(layer, key)| {
             // Name the launch key the user set, such as a legacy search feature.
-            let key = if launch_decides {
+            let launched = flagged.contains(&key)
+                && matches!(layer, OverrideLayer::CommandLine | OverrideLayer::Profile);
+            let key = if launched {
                 launch_source_key(&key, web_search_source).to_string()
             } else {
                 key
@@ -506,24 +514,22 @@ fn resolve_remote_save(
         });
     RemoteResolution {
         winner,
-        unverified: (server_flags_replaced && !launch_decides).then(|| {
+        unverified: unchecked.then(|| {
             "the app server's own feature flags do not reach threads this TUI starts".to_string()
         }),
-        server_override_stands: !(server_flags_replaced
-            && matches!(
-                server_override,
-                Some(codex_app_server_protocol::ConfigLayerSource::SessionFlags)
-            )),
+        server_override_stands,
     }
 }
 
 /// Whether the app server's own `[features]` launch flags decide `switch`. thread/start replaces
 /// them with the table this TUI sends, so what they leave behind is not visible in config/read.
+/// Keys in `covered`, which that table sets itself, are already resolved and do not count.
 fn server_feature_flags_replaced(
     switch: SettingsSwitch,
     enabled: bool,
     launch_overrides: Option<&HashMap<String, serde_json::Value>>,
     origins: &HashMap<String, codex_app_server_protocol::ConfigLayerMetadata>,
+    covered: &HashSet<String>,
 ) -> bool {
     launch_overrides.is_some_and(|overrides| overrides.contains_key("features"))
         && origins.iter().any(|(key, origin)| {
@@ -531,6 +537,7 @@ fn server_feature_flags_replaced(
                 origin.name,
                 codex_app_server_protocol::ConfigLayerSource::SessionFlags
             ) && key.starts_with("features.")
+                && !covered.contains(key)
                 // Turning Subagents on, an agreeing `multi_agent_v2` flag can still hide an
                 // opposing `agents.enabled`; the other switches decide the same way both ways.
                 && (decides_switch(switch, enabled, key)

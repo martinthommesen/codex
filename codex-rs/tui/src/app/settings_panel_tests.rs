@@ -375,6 +375,7 @@ fn replaced_server_feature_flags_that_can_hide_an_opposing_layer() {
             enabled,
             Some(&launch_overrides),
             &origins(key),
+            &HashSet::new(),
         )
     };
 
@@ -399,6 +400,15 @@ fn replaced_server_feature_flags_that_can_hide_an_opposing_layer() {
         /*enabled*/ true,
         /*launch_overrides*/ None,
         &origins("features.multi_agent_v2.enabled"),
+        &HashSet::new(),
+    ));
+    // A key this TUI forwards itself overwrites the server's flag.
+    assert!(!server_feature_flags_replaced(
+        SettingsSwitch::Subagents,
+        /*enabled*/ true,
+        Some(&launch_overrides),
+        &origins("features.multi_agent_v2.enabled"),
+        &HashSet::from(["features.multi_agent_v2.enabled".to_string()]),
     ));
 }
 
@@ -450,4 +460,57 @@ fn remote_save_trusts_this_tuis_own_flag_over_replaced_server_flags() {
     );
     assert!(resolution.unverified.is_some());
     assert!(!resolution.server_override_stands);
+}
+
+#[test]
+fn remote_save_keeps_the_caveat_when_a_replaced_server_flag_on_another_key_decides() {
+    let written = user_file("config.toml");
+    let launch_origins = HashMap::new();
+    let launch = |features: serde_json::Value| RemoteLaunch {
+        overrides: Some(HashMap::from([("features".to_string(), features)])),
+        origins: &launch_origins,
+        web_search_source: None,
+        web_search_modes: None,
+    };
+
+    // The server's `--enable multi_agent_v2` would turn subagents on, but it does not reach new
+    // threads; only this TUI's `--disable multi_agent` does.
+    let mut effective_config = config_read(serde_json::json!({
+        "config": {
+            "agents": { "enabled": true },
+            "features": { "multi_agent": true, "multi_agent_v2": true },
+        },
+        "origins": {
+            "agents.enabled": origin(ApiSource::User { file: written.clone(), profile: None }),
+            "features.multi_agent": origin(ApiSource::User { file: written.clone(), profile: None }),
+            "features.multi_agent_v2.enabled": origin(ApiSource::SessionFlags),
+        },
+    }));
+    let resolution = resolve_remote_save(
+        SettingsSwitch::Subagents,
+        /*enabled*/ true,
+        &mut effective_config,
+        &launch(serde_json::json!({ "multi_agent": false })),
+        &written,
+        /*server_override*/ None,
+    );
+    assert!(resolution.unverified.is_some());
+
+    // The same holds when the TUI's flag and the server's are on different keys of one switch.
+    let mut effective_config = config_read(serde_json::json!({
+        "config": { "features": { "apps": false, "plugins": true } },
+        "origins": {
+            "features.apps": origin(ApiSource::User { file: written.clone(), profile: None }),
+            "features.plugins": origin(ApiSource::SessionFlags),
+        },
+    }));
+    let resolution = resolve_remote_save(
+        SettingsSwitch::PluginsAndApps,
+        /*enabled*/ false,
+        &mut effective_config,
+        &launch(serde_json::json!({ "apps": true })),
+        &written,
+        /*server_override*/ None,
+    );
+    assert!(resolution.unverified.is_some());
 }
