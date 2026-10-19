@@ -231,6 +231,9 @@ struct ModelClientState {
     last_inference_tools: StdMutex<Option<Arc<[ToolSpec]>>>,
     /// Warnings about unsupported settings already shown for Claude providers.
     claude_warnings_emitted: anthropic_messages::ClaudeWarningsEmitted,
+    /// Set once Anthropic rejected replayed thinking; later requests in this session omit
+    /// replayed thinking and `block_binding`.
+    claude_strip_thinking: AtomicBool,
     /// Successfully completed OAuth responses for this account and Codex conversation only.
     claude_oauth_continuity: anthropic_messages::ClaudeOAuthContinuityState,
     /// Claude Code CLI process bridge, created on first use by the `claude-code` provider.
@@ -615,6 +618,7 @@ impl ModelClient {
                 cached_websocket_session: StdMutex::new(WebsocketSession::default()),
                 last_inference_tools: StdMutex::new(None),
                 claude_warnings_emitted: StdMutex::new(HashSet::new()),
+                claude_strip_thinking: AtomicBool::new(false),
                 claude_oauth_continuity: anthropic_messages::ClaudeOAuthContinuityState::default(),
                 claude_code_session: OnceLock::new(),
             }),

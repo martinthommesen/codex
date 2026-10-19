@@ -7,6 +7,7 @@
 use std::collections::HashSet;
 use std::sync::Arc;
 use std::sync::Mutex;
+use std::sync::atomic::Ordering;
 
 use codex_api::anthropic::AnthropicMessagesClient;
 use codex_api::anthropic::AnthropicRequestOptions;
@@ -120,7 +121,7 @@ impl ModelClientSession {
             warnings.push("Experimental Claude OAuth uses undocumented Claude Code compatibility behavior. Anthropic may restrict third-party subscription authentication. Subscription-quota billing is unverified; check Claude Settings > Usage and disable extra usage before relying on subscription limits. Codex never falls back to an API key or another provider.".into());
         }
 
-        let mut strip_thinking = false;
+        let mut strip_thinking = client.state.claude_strip_thinking.load(Ordering::Relaxed);
         loop {
             let options = AnthropicRequestOptions {
                 model: model_info.slug.clone(),
@@ -180,7 +181,9 @@ impl ModelClientSession {
                 }
                 Err(err) if !strip_thinking && is_thinking_replay_rejection(&err) => {
                     // A replayed thinking block was rejected (for example after history was
-                    // edited). Retry once without replayed thinking, as Anthropic recommends.
+                    // edited). Retry once without replayed thinking, as Anthropic recommends. The
+                    // rejected blocks stay in history, so the rest of the session omits them too
+                    // instead of paying for the same rejection on every request.
                     warn!("Anthropic rejected replayed thinking blocks; retrying without them");
                     inference_trace_attempt.record_failed(
                         &err,
@@ -195,6 +198,10 @@ continuing without replaying them."
                                 .to_string(),
                         ],
                     );
+                    client
+                        .state
+                        .claude_strip_thinking
+                        .store(true, Ordering::Relaxed);
                     strip_thinking = true;
                 }
                 Err(err) => {

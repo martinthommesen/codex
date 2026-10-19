@@ -707,6 +707,136 @@ async fn anthropic_key_is_not_sent_across_a_redirect() -> Result<()> {
     Ok(())
 }
 
+fn thinking_block(index: u64, thinking: &str, signature: &str) -> Vec<Value> {
+    vec![
+        json!({
+            "type": "content_block_start",
+            "index": index,
+            "content_block": {"type": "thinking", "thinking": "", "signature": ""}
+        }),
+        json!({"type": "content_block_delta", "index": index, "delta": {"type": "thinking_delta", "thinking": thinking}}),
+        json!({"type": "content_block_delta", "index": index, "delta": {"type": "signature_delta", "signature": signature}}),
+        json!({"type": "content_block_stop", "index": index}),
+    ]
+}
+
+/// Rejects `/v1/messages` requests accepted by `matcher` with a 400, ahead of other responses.
+async fn mount_messages_rejection<M>(server: &MockServer, matcher: M, message: &str)
+where
+    M: Fn(&Request) -> bool + Send + Sync + 'static,
+{
+    Mock::given(method("POST"))
+        .and(path_regex(".*/v1/messages$"))
+        .and(matcher)
+        .respond_with(ResponseTemplate::new(400).set_body_json(json!({
+            "type": "error",
+            "error": {"type": "invalid_request_error", "message": message}
+        })))
+        .with_priority(1)
+        .mount(server)
+        .await;
+}
+
+async fn messages_requests(server: &MockServer) -> Vec<Request> {
+    server
+        .received_requests()
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|request| request.url.path().ends_with("/v1/messages"))
+        .collect()
+}
+
+async fn run_successful_turn(test: &TestCodex, prompt: &str) -> Result<()> {
+    start_turn(
+        test,
+        prompt,
+        AskForApproval::Never,
+        SandboxPolicy::new_read_only_policy(),
+    )
+    .await?;
+    let complete = wait_for_event_match(&test.codex, |event| match event {
+        EventMsg::TurnComplete(complete) => Some(complete.clone()),
+        _ => None,
+    })
+    .await;
+    assert_eq!(complete.error, None, "turn `{prompt}` failed");
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn anthropic_rejected_thinking_is_not_replayed_again_in_the_session() -> Result<()> {
+    skip_if_no_network!(Ok(()));
+    let server = start_mock_server().await;
+    // The API rejects a tampered signature even with `drop_block`.
+    mount_messages_rejection(
+        &server,
+        |request| request_text(request).contains("sig-tampered"),
+        "messages.1.content.0: Invalid `signature` in `thinking` block",
+    )
+    .await;
+    let mut first = vec![message_start("msg_1", CLAUDE_PARENT_MODEL)];
+    first.extend(thinking_block(0, "Thinking it over.", "sig-tampered"));
+    first.extend(text_block(1, "first answer"));
+    first.extend(message_end("end_turn"));
+    mount_messages_once(&server, |_| true, anthropic_sse(first)).await;
+    mount_messages_fallback(
+        &server,
+        anthropic_text_sse("msg_2", CLAUDE_PARENT_MODEL, "ok"),
+    )
+    .await;
+    let test = build(&server, ANTHROPIC_PROVIDER_ID, CLAUDE_PARENT_MODEL).await?;
+
+    for prompt in ["first", "second", "third"] {
+        run_successful_turn(&test, prompt).await?;
+    }
+
+    let requests = messages_requests(&server).await;
+    let replayed = requests
+        .iter()
+        .filter(|request| request_text(request).contains("sig-tampered"))
+        .count();
+    // Turn 2 replays the block once and retries without it; turn 3 never sends it.
+    assert_eq!((requests.len(), replayed), (4, 1));
+    let last = requests.last().expect("a third-turn request");
+    assert!(!request_text(last).contains("block_binding"));
+    assert!(
+        !header(last, "anthropic-beta")
+            .unwrap_or_default()
+            .contains("thinking-binding-controls")
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn anthropic_block_binding_rejection_is_remembered_for_the_session() -> Result<()> {
+    skip_if_no_network!(Ok(()));
+    let server = start_mock_server().await;
+    // A gateway that forwards the body but not the beta header rejects `block_binding`.
+    mount_messages_rejection(
+        &server,
+        |request| request_text(request).contains("block_binding"),
+        "thinking.block_binding: Extra inputs are not permitted",
+    )
+    .await;
+    mount_messages_fallback(
+        &server,
+        anthropic_text_sse("msg_1", CLAUDE_PARENT_MODEL, "ok"),
+    )
+    .await;
+    let test = build(&server, ANTHROPIC_PROVIDER_ID, CLAUDE_PARENT_MODEL).await?;
+
+    for prompt in ["first", "second"] {
+        run_successful_turn(&test, prompt).await?;
+    }
+
+    // Turn 1 is rejected once and retried without `block_binding`; turn 2 never sends it.
+    let requests = messages_requests(&server).await;
+    assert_eq!(requests.len(), 3);
+    assert!(!request_text(&requests[2]).contains("block_binding"));
+    Ok(())
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn realtime_is_refused_on_a_claude_provider() -> Result<()> {
     skip_if_no_network!(Ok(()));
