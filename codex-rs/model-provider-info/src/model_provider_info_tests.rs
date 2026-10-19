@@ -884,6 +884,59 @@ model_catalog_url = "https://gateway.example/codex/catalog?token=catalog-secret"
 }
 
 #[test]
+fn claude_built_in_overrides_merge_but_redefinitions_are_rejected() {
+    let gateway = ModelProviderInfo {
+        base_url: Some("https://gateway.example/v1".to_string()),
+        env_key: Some("GATEWAY_KEY".to_string()),
+        ..ModelProviderInfo::default()
+    };
+    let merged = merge_configured_model_providers(
+        built_in_model_providers(/*openai_base_url*/ None),
+        std::collections::HashMap::from([(ANTHROPIC_PROVIDER_ID.to_string(), gateway)]),
+    )
+    .expect("partial override of the built-in anthropic provider");
+    let anthropic = &merged[ANTHROPIC_PROVIDER_ID];
+    assert_eq!(anthropic.wire_api, WireApi::AnthropicMessages);
+    assert_eq!(anthropic.name, "Anthropic");
+    assert_eq!(
+        anthropic.base_url.as_deref(),
+        Some("https://gateway.example/v1")
+    );
+
+    // A pre-existing custom provider with this id (custom providers always carry a name) would
+    // otherwise be converted to the Messages API without notice.
+    let legacy = ModelProviderInfo {
+        name: "Anthropic via LiteLLM".to_string(),
+        base_url: Some("http://localhost:4000/v1".to_string()),
+        env_key: Some("LITELLM_KEY".to_string()),
+        ..ModelProviderInfo::default()
+    };
+    let error = merge_configured_model_providers(
+        built_in_model_providers(/*openai_base_url*/ None),
+        std::collections::HashMap::from([(ANTHROPIC_PROVIDER_ID.to_string(), legacy)]),
+    )
+    .expect_err("redefining the built-in must fail loudly");
+    assert!(
+        error.starts_with("model_providers.anthropic is the built-in"),
+        "{error}"
+    );
+
+    let restated = ModelProviderInfo {
+        name: "Anthropic".to_string(),
+        wire_api: WireApi::AnthropicMessages,
+        request_max_retries: Some(2),
+        ..ModelProviderInfo::default()
+    };
+    assert!(
+        merge_configured_model_providers(
+            built_in_model_providers(/*openai_base_url*/ None),
+            std::collections::HashMap::from([(ANTHROPIC_PROVIDER_ID.to_string(), restated)]),
+        )
+        .is_ok()
+    );
+}
+
+#[test]
 fn anthropic_provider_without_base_url_targets_the_anthropic_api() {
     let custom = ModelProviderInfo {
         name: "Custom Claude".to_string(),

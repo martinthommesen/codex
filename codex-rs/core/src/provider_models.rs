@@ -5,9 +5,15 @@
 //! levels, and tool shapes. Catalogs are shared by all threads of a thread manager.
 
 use std::collections::HashMap;
+use std::path::Path;
+use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::LazyLock;
 use std::sync::Mutex as StdMutex;
+use std::time::Duration;
+use std::time::Instant;
 
+use codex_config::types::AuthCredentialsStoreMode;
 use codex_features::Feature;
 use codex_login::AuthManager;
 use codex_model_provider::claude_model_catalog;
@@ -90,6 +96,21 @@ impl std::fmt::Debug for ProviderModelsRegistry {
         f.debug_struct("ProviderModelsRegistry")
             .field("root_provider_id", &self.root_provider_id)
             .finish_non_exhaustive()
+    }
+}
+
+/// Rejects moving an agent onto `provider_id` while managed requirements pin a different
+/// provider (`model_provider` in requirements.toml), which applies to the whole agent tree.
+pub(crate) fn check_required_model_provider(
+    config: &Config,
+    provider_id: &str,
+) -> Result<(), String> {
+    match config.config_layer_stack.required_model_provider() {
+        Some(required) if required != provider_id => Err(format!(
+            "model_provider `{provider_id}` is not allowed because managed requirements pin \
+model_provider `{required}`"
+        )),
+        _ => Ok(()),
     }
 }
 
@@ -192,6 +213,64 @@ uses the official claude CLI and its own sign-in)"
     }
 }
 
+/// How long a credential-store probe made while building tool specs is reused.
+///
+/// Tool specs are rebuilt for every sampling request, and these probes read the OS keyring and,
+/// for encrypted stores, run a scrypt decryption that takes about a second, synchronously on a
+/// runtime thread. `spawn_agent` itself re-checks the connection without this cache.
+const SPAWN_OPTION_PROBE_TTL: Duration = Duration::from_secs(30);
+
+type SpawnOptionProbes = StdMutex<HashMap<(PathBuf, String, bool), (Instant, ProviderConnection)>>;
+
+static SPAWN_OPTION_PROBES: LazyLock<SpawnOptionProbes> = LazyLock::new(Default::default);
+
+/// [`provider_connection`] for listing spawn options, reusing recent credential-store probes.
+/// Cheap checks (connection markers, environment variables, cached ChatGPT auth) stay live.
+fn spawn_option_connection(
+    provider_id: &str,
+    provider: &ModelProviderInfo,
+    auth_manager: Option<&AuthManager>,
+    codex_home: &Path,
+) -> ProviderConnection {
+    // A file-stored Anthropic key is a cheap read and stays live; keyring-backed stores and the
+    // encrypted Claude OAuth store are not.
+    let reads_slow_credential_store = auth_manager.is_some_and(|manager| {
+        provider.env_key.is_none()
+            && provider.experimental_bearer_token.is_none()
+            && provider.auth.is_none()
+            && match provider.wire_api {
+                WireApi::ClaudeOAuth => true,
+                WireApi::AnthropicMessages => {
+                    manager.anthropic_auth_config().store_mode != AuthCredentialsStoreMode::File
+                }
+                WireApi::ClaudeCode | WireApi::Responses => false,
+            }
+    });
+    if !reads_slow_credential_store {
+        return provider_connection(provider, auth_manager, codex_home);
+    }
+    let key = (
+        codex_home.to_path_buf(),
+        provider_id.to_string(),
+        provider.wire_api == WireApi::ClaudeOAuth,
+    );
+    let now = Instant::now();
+    if let Some((probed_at, connection)) = SPAWN_OPTION_PROBES
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get(&key)
+        && now.duration_since(*probed_at) < SPAWN_OPTION_PROBE_TTL
+    {
+        return connection.clone();
+    }
+    let connection = provider_connection(provider, auth_manager, codex_home);
+    SPAWN_OPTION_PROBES
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert(key, (now, connection.clone()));
+    connection
+}
+
 /// One provider offered to `spawn_agent`.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct SpawnProviderOption {
@@ -226,13 +305,13 @@ pub(crate) fn spawn_provider_options(
         CLAUDE_CODE_PROVIDER_ID,
         CLAUDE_OAUTH_PROVIDER_ID,
     ] {
-        if candidate == current_id {
+        if candidate == current_id || check_required_model_provider(config, candidate).is_err() {
             continue;
         }
         let Some(provider) = config.model_providers.get(candidate) else {
             continue;
         };
-        if provider_connection(provider, auth_manager, &config.codex_home)
+        if spawn_option_connection(candidate, provider, auth_manager, &config.codex_home)
             != ProviderConnection::Connected
         {
             continue;

@@ -174,6 +174,9 @@ struct HeldToolCall {
     id: String,
     name: String,
     input: Value,
+    /// The input parsed as JSON, or a later content block started, so the block was not cut off
+    /// by `max_tokens`.
+    complete: bool,
 }
 
 /// Stateful translator for one streamed message.
@@ -187,9 +190,12 @@ pub struct AnthropicStreamTranslator {
     blocks: BTreeMap<usize, BlockState>,
     /// Finished text whose phase depends on what the model does next.
     pending_text: Option<String>,
-    /// Tool calls whose input may have been cut off; released once the stop reason is known.
+    /// Tool calls of this message, in model order. They are released only once the stop reason
+    /// is known, because a `refusal` (or a cut-off by `max_tokens`) can still end the message
+    /// and its tool calls must then not run.
     held_tool_calls: Vec<HeldToolCall>,
-    produced_output: bool,
+    /// At least one tool call was emitted, so a `max_tokens` stop still has work to continue.
+    emitted_tool_calls: bool,
     completed: bool,
 }
 
@@ -204,7 +210,7 @@ impl AnthropicStreamTranslator {
             blocks: BTreeMap::new(),
             pending_text: None,
             held_tool_calls: Vec::new(),
-            produced_output: false,
+            emitted_tool_calls: false,
             completed: false,
         }
     }
@@ -249,8 +255,12 @@ impl AnthropicStreamTranslator {
                 index,
                 content_block,
             } => {
-                // More output follows, so earlier text was mid-turn commentary.
+                // More output follows, so earlier text was mid-turn commentary and earlier tool
+                // calls were not cut off.
                 self.flush_pending_text(Some(MessagePhase::Commentary), &mut out);
+                for call in &mut self.held_tool_calls {
+                    call.complete = true;
+                }
                 self.start_block(index, &content_block, &mut out);
             }
             AnthropicStreamEvent::ContentBlockDelta { index, delta } => {
@@ -260,15 +270,23 @@ impl AnthropicStreamTranslator {
             AnthropicStreamEvent::MessageDelta { delta, usage } => {
                 if delta.stop_reason.is_some() {
                     self.stop_reason = delta.stop_reason;
-                    self.release_held_tool_calls(&mut out);
                 }
                 if let Some(stop_reason) = self.stop_reason.as_deref() {
-                    let phase = if stop_reason == "tool_use" || stop_reason == "pause_turn" {
-                        MessagePhase::Commentary
+                    if stop_reason == "refusal" {
+                        // Partial output of a refused response is discarded, not recorded as
+                        // the final answer and replayed.
+                        self.pending_text = None;
                     } else {
-                        MessagePhase::FinalAnswer
-                    };
-                    self.flush_pending_text(Some(phase), &mut out);
+                        let phase = if stop_reason == "tool_use" || stop_reason == "pause_turn" {
+                            MessagePhase::Commentary
+                        } else {
+                            MessagePhase::FinalAnswer
+                        };
+                        self.flush_pending_text(Some(phase), &mut out);
+                    }
+                    // Text is finished first, so a tool call never inherits the id of a still
+                    // active message item.
+                    self.release_held_tool_calls(&mut out);
                 }
                 if delta.stop_details.is_some() {
                     self.stop_details = delta.stop_details;
@@ -283,8 +301,12 @@ impl AnthropicStreamTranslator {
                 for index in open {
                     self.stop_block(index, &mut out);
                 }
+                if self.stop_reason.as_deref() == Some("refusal") {
+                    self.pending_text = None;
+                } else {
+                    self.flush_pending_text(Some(MessagePhase::FinalAnswer), &mut out);
+                }
                 self.release_held_tool_calls(&mut out);
-                self.flush_pending_text(Some(MessagePhase::FinalAnswer), &mut out);
                 out.push(self.completion()?);
                 self.completed = true;
             }
@@ -416,7 +438,6 @@ impl AnthropicStreamTranslator {
         };
         match state {
             BlockState::Text { text } => {
-                self.produced_output = true;
                 self.flush_pending_text(Some(MessagePhase::Commentary), out);
                 self.pending_text = Some(text);
             }
@@ -443,30 +464,27 @@ impl AnthropicStreamTranslator {
                 input_json,
                 initial_input,
             } => {
-                // Blocks close before `message_delta` reports the stop reason, so input that is
-                // empty or unparseable may have been cut off by `max_tokens`; hold it until then.
-                let held = if input_json.trim().is_empty() {
-                    match initial_input {
+                // Blocks close before `message_delta` reports the stop reason. Every call is held
+                // until then: a `refusal` must not run any of them, and input that is empty or
+                // unparseable may have been cut off by `max_tokens`.
+                let (input, complete) = if input_json.trim().is_empty() {
+                    let input = match initial_input {
                         Value::Object(map) => Value::Object(map),
                         _ => Value::Object(serde_json::Map::new()),
-                    }
+                    };
+                    (input, false)
                 } else {
                     match serde_json::from_str::<Value>(&input_json) {
-                        Ok(value) => {
-                            self.produced_output = true;
-                            out.push(ResponseEvent::OutputItemDone(
-                                self.tool_call_item(id, &name, value),
-                            ));
-                            return;
-                        }
+                        Ok(value) => (value, true),
                         // The tool router reports malformed arguments to the model.
-                        Err(_) => Value::String(input_json),
+                        Err(_) => (Value::String(input_json), false),
                     }
                 };
                 self.held_tool_calls.push(HeldToolCall {
                     id,
                     name,
-                    input: held,
+                    input,
+                    complete,
                 });
                 if self.stop_reason.is_some() {
                     self.release_held_tool_calls(out);
@@ -476,20 +494,34 @@ impl AnthropicStreamTranslator {
         }
     }
 
-    /// Emits held tool calls, or drops them when the output was cut off.
+    /// Emits held tool calls in model order. A refused response runs none of them; a response
+    /// that was cut off (or ended without a stop reason) drops only calls that may be truncated.
     fn release_held_tool_calls(&mut self, out: &mut Vec<ResponseEvent>) {
         let held = std::mem::take(&mut self.held_tool_calls);
-        if matches!(self.stop_reason.as_deref(), Some("max_tokens" | "refusal")) {
+        let stop_reason = self.stop_reason.as_deref();
+        if stop_reason == Some("refusal") {
             if !held.is_empty() {
                 warn!(
                     dropped_tool_calls = held.len(),
-                    "dropping Anthropic tool calls cut off by max_tokens or refusal"
+                    "dropping Anthropic tool calls from a refused response"
                 );
             }
             return;
         }
+        let cut_off = matches!(
+            stop_reason,
+            None | Some("max_tokens" | "model_context_window_exceeded")
+        );
+        let (held, truncated): (Vec<_>, Vec<_>) =
+            held.into_iter().partition(|call| call.complete || !cut_off);
+        if !truncated.is_empty() {
+            warn!(
+                dropped_tool_calls = truncated.len(),
+                "dropping Anthropic tool calls whose input was cut off"
+            );
+        }
         for call in held {
-            self.produced_output = true;
+            self.emitted_tool_calls = true;
             out.push(ResponseEvent::OutputItemDone(
                 self.tool_call_item(call.id, &call.name, call.input),
             ));
@@ -557,7 +589,10 @@ impl AnthropicStreamTranslator {
             Some("tool_use") => None,
             Some("pause_turn") => Some(false),
             Some("max_tokens") => {
-                if !self.produced_output {
+                // Like an incomplete Responses API response: a truncated answer must not end the
+                // turn as if it were complete. Complete tool calls still run and the model
+                // continues after them.
+                if !self.emitted_tool_calls {
                     return Err(ApiError::ResponseIncomplete(Box::new(
                         ResponseIncompleteError {
                             reason: "max_tokens".to_string(),
@@ -566,7 +601,7 @@ impl AnthropicStreamTranslator {
                         },
                     )));
                 }
-                warn!("Anthropic response stopped at max_tokens; output may be truncated");
+                warn!("Anthropic response stopped at max_tokens after complete tool calls");
                 None
             }
             Some("model_context_window_exceeded") => return Err(ApiError::ContextWindowExceeded),

@@ -344,6 +344,18 @@ impl BridgeCore {
             .and_then(Value::as_str)
             .map(str::to_string);
         let mut state = self.lock();
+        // An answer Codex already supplied wins even if the next request exposes a different
+        // tool set (for example a compaction request with no tools): Claude Code sends serial
+        // calls only after earlier ones resolve, and Codex has already run this one.
+        if let Some(tool_use_id) = &tool_use_id
+            && let Some(position) = state
+                .prepared
+                .iter()
+                .position(|answer| &answer.call_id == tool_use_id)
+        {
+            let answer = state.prepared.remove(position);
+            return Some(result_response(id, answer.result));
+        }
         if !state.registry.targets.contains_key(mcp_name) {
             return Some(result_response(
                 id,
@@ -352,17 +364,12 @@ impl BridgeCore {
                 )),
             ));
         }
-        let prepared = match &tool_use_id {
-            Some(tool_use_id) => state
+        if tool_use_id.is_none()
+            && let Some(position) = state
                 .prepared
                 .iter()
-                .position(|answer| &answer.call_id == tool_use_id),
-            None => state
-                .prepared
-                .iter()
-                .position(|answer| answer.mcp_name == mcp_name),
-        };
-        if let Some(position) = prepared {
+                .position(|answer| answer.mcp_name == mcp_name)
+        {
             let answer = state.prepared.remove(position);
             return Some(result_response(id, answer.result));
         }

@@ -35,6 +35,8 @@ use crate::types::WindowsToml;
 use codex_features::FeaturesToml;
 use codex_model_provider_info::AMAZON_BEDROCK_PROVIDER_ID;
 use codex_model_provider_info::AMAZON_BEDROCK_RUNTIME_PROVIDER_ID;
+use codex_model_provider_info::ANTHROPIC_PROVIDER_ID;
+use codex_model_provider_info::CLAUDE_CODE_PROVIDER_ID;
 use codex_model_provider_info::CLAUDE_OAUTH_PROVIDER_ID;
 use codex_model_provider_info::LEGACY_OLLAMA_CHAT_PROVIDER_ID;
 use codex_model_provider_info::LMSTUDIO_OSS_PROVIDER_ID;
@@ -970,6 +972,15 @@ pub fn validate_model_providers(
             provider
                 .validate_claude_oauth_override()
                 .map_err(|message| format!("model_providers.{key} {message}"))?;
+        } else if matches!(
+            key.as_str(),
+            ANTHROPIC_PROVIDER_ID | CLAUDE_CODE_PROVIDER_ID
+        ) {
+            // Partial overrides of these built-ins do not need a `name`; the built-in supplies
+            // it when merged (see merge_configured_model_providers).
+            provider
+                .validate_claude_builtin_override(key)
+                .map_err(|message| format!("model_providers.{key} {message}"))?;
         } else {
             if provider.aws.is_some() {
                 return Err(format!(
@@ -1038,6 +1049,55 @@ mod tests {
         );
         assert_eq!(provider.request_max_retries, Some(2));
         assert_eq!(provider.stream_idle_timeout_ms, Some(5000));
+    }
+
+    #[test]
+    fn documented_anthropic_and_claude_code_partial_overrides_parse_without_a_name() {
+        let config: ConfigToml = toml::from_str(
+            r#"
+[model_providers.anthropic]
+base_url = "https://api.anthropic.com/v1"
+env_key = "MY_ANTHROPIC_KEY"
+http_headers = { "anthropic-beta" = "context-1m-2025-08-07" }
+request_max_retries = 4
+stream_idle_timeout_ms = 300000
+
+[model_providers.claude-code]
+request_max_retries = 2
+"#,
+        )
+        .expect("documented partial overrides of built-in Claude providers");
+        let anthropic = &config.model_providers[ANTHROPIC_PROVIDER_ID];
+        assert!(anthropic.name.is_empty());
+        assert_eq!(anthropic.env_key.as_deref(), Some("MY_ANTHROPIC_KEY"));
+        assert_eq!(
+            config.model_providers[CLAUDE_CODE_PROVIDER_ID].request_max_retries,
+            Some(2)
+        );
+    }
+
+    #[test]
+    fn pre_existing_custom_providers_named_like_claude_built_ins_are_rejected() {
+        for (key, entry) in [
+            (
+                ANTHROPIC_PROVIDER_ID,
+                "name = 'Anthropic via LiteLLM'\nbase_url = 'http://localhost:4000/v1'\nenv_key = 'LITELLM_KEY'\nwire_api = 'responses'",
+            ),
+            (ANTHROPIC_PROVIDER_ID, "wire_api = 'claude_code'"),
+            (
+                CLAUDE_CODE_PROVIDER_ID,
+                "base_url = 'https://proxy.invalid/v1'",
+            ),
+        ] {
+            let error = toml::from_str::<ConfigToml>(&format!("[model_providers.{key}]\n{entry}"))
+                .expect_err("redefining a built-in Claude provider must not be silently merged");
+            assert!(
+                error
+                    .to_string()
+                    .contains(&format!("model_providers.{key}")),
+                "{error}"
+            );
+        }
     }
 
     #[test]

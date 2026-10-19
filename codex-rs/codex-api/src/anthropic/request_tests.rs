@@ -396,3 +396,82 @@ fn thinking_display_follows_summary_preference() {
     );
     assert!(prepared.betas.is_empty());
 }
+
+#[test]
+fn only_the_most_recent_images_are_sent_when_a_request_would_carry_too_many() {
+    fn image(data: &str) -> ImageReference {
+        ImageReference::Inline {
+            image_url: format!("data:image/png;base64,{data}"),
+        }
+    }
+    fn image_data(block: &Value, out: &mut Vec<String>) {
+        match block["type"].as_str() {
+            Some("image") => out.push(block["source"]["data"].as_str().unwrap_or("").to_string()),
+            Some("tool_result") => {
+                for nested in block["content"].as_array().into_iter().flatten() {
+                    image_data(nested, out);
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut screens = user("screens");
+    if let ResponseItem::Message { content, .. } = &mut screens {
+        content.extend(
+            (0..MAX_REQUEST_IMAGES).map(|index| ContentItem::InputImage {
+                image: image(&format!("OLD{index}")),
+                detail: None,
+            }),
+        );
+    }
+    let screenshot = ResponseItem::FunctionCallOutput {
+        id: None,
+        call_id: Some("toolu_1".to_string()),
+        name: None,
+        namespace: None,
+        output: FunctionCallOutputPayload::from_content_items(vec![
+            FunctionCallOutputContentItem::InputImage {
+                image: image("NEW"),
+                detail: None,
+            },
+        ]),
+        internal_chat_message_metadata_passthrough: None,
+    };
+    let input = vec![
+        screens,
+        function_call("toolu_1", "view_image", "{}"),
+        screenshot,
+    ];
+    let tools = vec![json!({
+        "type": "function",
+        "name": "view_image",
+        "parameters": {"type": "object", "properties": {}}
+    })];
+
+    let prepared = build_anthropic_request("", &input, &tools, &options());
+    let body = serde_json::to_value(&prepared.request).expect("serialize request");
+
+    let mut sent = Vec::new();
+    for message in body["messages"].as_array().expect("messages") {
+        for block in message["content"].as_array().expect("content") {
+            image_data(block, &mut sent);
+        }
+    }
+    let mut expected: Vec<String> = (1..MAX_REQUEST_IMAGES)
+        .map(|index| format!("OLD{index}"))
+        .collect();
+    expected.push("NEW".to_string());
+    assert_eq!(sent, expected);
+    assert_eq!(
+        body["messages"][0]["content"][1],
+        json!({"type": "text", "text": OMITTED_IMAGE_TEXT})
+    );
+    assert!(
+        prepared
+            .notes
+            .iter()
+            .any(|note| note.starts_with("1 earlier image(s) were omitted")),
+        "{:?}",
+        prepared.notes
+    );
+}

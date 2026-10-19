@@ -216,6 +216,28 @@ async fn answers_given_before_the_call_arrives_are_delivered_on_arrival() {
 }
 
 #[tokio::test]
+async fn early_answers_survive_a_tool_set_change_before_the_call_arrives() {
+    let core = Arc::new(BridgeCore::default());
+    core.set_tools(shell_registry());
+    let mut client = Client::connect(&core);
+    client.initialize().await;
+    client
+        .send(json!({"jsonrpc": "2.0", "id": 1, "method": "ping"}))
+        .await;
+    client.recv().await;
+
+    // Codex ran both serial calls; the next request (for example compaction) has no tools.
+    core.answer("toolu_b", "shell", text_result("second"));
+    assert!(core.set_tools(ToolRegistry::default()));
+    assert_eq!(
+        client.recv().await,
+        json!({"jsonrpc": "2.0", "method": "notifications/tools/list_changed"})
+    );
+    client.send(call(9, "shell", Some("toolu_b"))).await;
+    assert_eq!(client.recv().await["result"], text_result("second"));
+}
+
+#[tokio::test]
 async fn calls_without_tool_use_ids_match_in_order() {
     let core = Arc::new(BridgeCore::default());
     core.set_tools(shell_registry());
