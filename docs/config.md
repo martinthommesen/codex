@@ -17,8 +17,9 @@ does not enable managed-hooks-only mode.
 ## Turning whole features off
 
 Run `/settings` in the TUI to switch entire features on or off. Each switch
-writes explicit values to your user `config.toml`. Running sessions keep the
-features they started with, so changes apply to new sessions (`/new`).
+writes explicit values to your user `config.toml`, or to the selected profile's
+config file when you run with `--profile`. Running sessions keep the features
+they started with, so changes apply to new sessions (`/new`).
 
 | Switch           | Keys written                                    |
 | ---------------- | ----------------------------------------------- |
@@ -42,9 +43,10 @@ Turning Subagents off also writes `features.multi_agent_v2 = false`, which
 otherwise overrides `agents.enabled`. Saving a switch also removes legacy
 aliases for the same feature (such as `features.connectors`) from your user
 `config.toml`. Values pinned in `requirements.toml` show as managed and are left
-unchanged. Another config layer, such as a profile, a trusted project's
-`.codex/config.toml`, or a legacy alias in a system config, can still override
-the user value; `/settings` then reports the save as overridden.
+unchanged. Another config layer, such as a command-line flag, a trusted
+project's `.codex/config.toml`, a legacy alias in your main `config.toml` while
+a profile is selected, or a managed config, can still override the saved value;
+`/settings` then reports the save as overridden and names that layer.
 
 A running session keeps the skills, hooks, AGENTS.md, and goals it started
 with, but the TUI's `/skills`, `$` mentions, `/hooks`, and `/init` follow the

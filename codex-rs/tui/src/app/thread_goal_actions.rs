@@ -155,6 +155,8 @@ impl App {
                 Err(err) => {
                     self.chat_widget
                         .add_error_message(thread_goal_error_message("read", &err));
+                    // A refused goal must not hold back input queued after it.
+                    self.chat_widget.maybe_send_next_queued_input();
                     return;
                 }
             }
@@ -173,6 +175,7 @@ impl App {
             Err(err) => {
                 if self.current_displayed_thread_id() == Some(thread_id) {
                     self.chat_widget.add_error_message(err.to_string());
+                    self.chat_widget.maybe_send_next_queued_input();
                 }
                 return;
             }
@@ -189,6 +192,7 @@ impl App {
                 }
                 self.chat_widget
                     .add_error_message(thread_goal_error_message("replace", &err));
+                self.chat_widget.maybe_send_next_queued_input();
                 return;
             }
         }
@@ -226,6 +230,7 @@ impl App {
                 let action = if replacing_goal { "replace" } else { "set" };
                 self.chat_widget
                     .add_error_message(thread_goal_error_message(action, &err));
+                self.chat_widget.maybe_send_next_queued_input();
             }
         }
     }
@@ -360,9 +365,9 @@ fn thread_goal_error_message(action: &str, err: &color_eyre::Report) -> String {
 }
 
 /// Each thread keeps the Goals setting it started with, so turning Goals on in `/settings` only
-/// reaches new sessions.
-const GOALS_OFF_FOR_THREAD_ERROR_MESSAGE: &str =
-    "Goals were off when this session started. Use /new to start a session with goals.";
+/// reaches new sessions. The server or project config can also have goals off, so `/new` is only
+/// suggested for the `/settings` case.
+const GOALS_OFF_FOR_THREAD_ERROR_MESSAGE: &str = "Goals are off for this session. If you turned Goals on in /settings after it started, use /new to start a session with goals.";
 
 fn is_goals_off_for_thread_error(err: &color_eyre::Report) -> bool {
     err.chain()

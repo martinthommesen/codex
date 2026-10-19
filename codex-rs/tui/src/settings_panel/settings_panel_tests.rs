@@ -433,6 +433,33 @@ async fn subagents_switch_also_turns_off_multi_agent_v2() {
 }
 
 #[tokio::test]
+async fn partial_subagents_turn_on_when_nothing_is_pinned() {
+    let (_codex_home, mut config) = test_config().await;
+    // The old way to turn subagents off leaves `agents.enabled` on, so the model catalog decides.
+    config
+        .features
+        .set_enabled(Feature::Collab, /*enabled*/ false)
+        .expect("not pinned");
+    let subagents = SettingsSwitch::Subagents;
+    assert_eq!(
+        statuses(&config)
+            .into_iter()
+            .find(|status| status.switch == subagents),
+        Some(SwitchStatus {
+            switch: subagents,
+            state: SwitchState::Partial,
+            target: Some(true),
+            managed: false,
+        })
+    );
+
+    subagents
+        .apply(&mut config, /*enabled*/ true)
+        .expect("nothing is pinned");
+    assert_eq!(subagents.state(&config), SwitchState::On);
+}
+
+#[tokio::test]
 async fn subagents_turn_off_and_on_while_multi_agent_is_pinned_on() {
     let (_codex_home, mut config) = test_config().await;
     let mut warnings = Vec::new();

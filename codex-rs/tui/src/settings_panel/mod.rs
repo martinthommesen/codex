@@ -150,6 +150,7 @@ impl SettingsSwitch {
     /// Turns the switch on or off in `config`. Keys that requirements pin to the other value keep
     /// it, as long as another key still changes; otherwise the switch is rejected as managed.
     pub(crate) fn apply(self, config: &mut Config, enabled: bool) -> Result<(), String> {
+        let before = self.state(config);
         let mut changed = false;
         let mut pinned = None;
         for feature in self.features() {
@@ -163,7 +164,6 @@ impl SettingsSwitch {
         }
         match self {
             Self::Subagents => {
-                let before = self.state(config);
                 config.agents_enabled = enabled;
                 if !enabled && let Err(err) = set_feature(config, Feature::MultiAgentV2, enabled) {
                     pinned = pinned.or(Some(err));

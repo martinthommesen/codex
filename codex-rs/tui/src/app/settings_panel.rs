@@ -52,10 +52,12 @@ impl App {
             .then(|| overridden_write_message(&response).to_string());
         // The server only checks user-level layers for overrides, so a trusted project, a profile,
         // this TUI's launch flags or a legacy alias in another layer can still win. Resolve what
-        // new sessions in this folder will actually get.
-        let cwd = self.chat_widget.config_ref().cwd.to_path_buf();
+        // new sessions will actually get.
+        let written = &response.file_path;
         let mut winning_layer = None;
         let resolved = if app_server.uses_remote_workspace() {
+            // New remote sessions start where /new starts them, not in the displayed thread's cwd.
+            let cwd = app_server.remote_cwd_override().unwrap_or(Path::new("."));
             match crate::config_update::read_effective_config(
                 app_server.request_handle(),
                 cwd.display().to_string(),
@@ -63,29 +65,32 @@ impl App {
             .await
             {
                 Ok(mut effective_config) => {
-                    // The server cannot see the flags this TUI sends with each new thread.
-                    let flagged = overlay_session_flag_features(
-                        &mut effective_config,
-                        session_flag_features(&self.config).as_ref(),
-                    );
+                    // The server cannot see the launch choices this TUI sends with each new thread.
+                    let launch_overrides =
+                        crate::app_server_session::config_request_overrides_from_config(
+                            &self.config,
+                            app_server.thread_params_mode(),
+                        );
+                    let flagged =
+                        overlay_launch_overrides(&mut effective_config, launch_overrides.as_ref());
                     adopt_effective_switch_state(&mut self.config, switch, &effective_config);
+                    let launch_origins = self.config.config_layer_stack.origins();
                     let flag_precedence =
                         codex_app_server_protocol::ConfigLayerSource::SessionFlags.precedence();
                     winning_layer = switch_override_layer(
                         switch,
+                        enabled,
+                        &serde_json::to_value(&effective_config.config).unwrap_or_default(),
                         effective_config
                             .origins
                             .iter()
                             .map(|(key, origin)| {
-                                let layer = OverrideLayer::from_api(&origin.name);
+                                let layer = OverrideLayer::from_api(&origin.name, written);
                                 (key.as_str(), origin.name.precedence(), layer)
                             })
                             .chain(flagged.iter().map(|key| {
-                                (
-                                    key.as_str(),
-                                    flag_precedence,
-                                    Some(OverrideLayer::CommandLine),
-                                )
+                                let layer = OverrideLayer::launch(launch_origins.get(key));
+                                (key.as_str(), flag_precedence, Some(layer))
                             })),
                     );
                     true
@@ -97,22 +102,22 @@ impl App {
             }
         } else {
             // The app server shares this machine's files, so build what /new will load.
+            let cwd = self.chat_widget.config_ref().cwd.to_path_buf();
             match self.rebuild_config_for_cwd(cwd).await {
                 Ok(rebuilt) => {
                     switch.adopt(&mut self.config, &rebuilt);
+                    let layers = &rebuilt.config_layer_stack;
                     winning_layer = switch_override_layer(
                         switch,
-                        rebuilt
-                            .config_layer_stack
-                            .origins()
-                            .iter()
-                            .map(|(key, origin)| {
-                                (
-                                    key.as_str(),
-                                    origin.name.precedence(),
-                                    OverrideLayer::from_config(&origin.name),
-                                )
-                            }),
+                        enabled,
+                        &serde_json::to_value(layers.effective_config()).unwrap_or_default(),
+                        layers.origins().iter().map(|(key, origin)| {
+                            (
+                                key.as_str(),
+                                origin.name.precedence(),
+                                OverrideLayer::from_config(&origin.name, written),
+                            )
+                        }),
                     );
                     true
                 }
@@ -167,42 +172,40 @@ impl App {
     }
 }
 
-/// The `[features]` session flags this TUI sends with every new thread.
-fn session_flag_features(config: &Config) -> Option<serde_json::Map<String, serde_json::Value>> {
-    let mut session_flags = toml::Value::Table(toml::Table::new());
-    for layer in config.config_layer_stack.layers_low_to_high() {
-        if matches!(layer.name, codex_config::ConfigLayerSource::SessionFlags) {
-            codex_config::merge_toml_values(&mut session_flags, &layer.config);
-        }
-    }
-    let features = serde_json::to_value(session_flags.get("features")?).ok()?;
-    features.as_object().cloned()
-}
-
-/// Applies this TUI's session flags on top of what a remote app server read, below the layers
-/// that outrank session flags. Returns the origin keys the flags now decide.
-fn overlay_session_flag_features(
+/// Applies the launch choices this TUI sends with every new thread on top of what a remote app
+/// server read, below the layers that outrank them. Returns the origin keys they now decide.
+fn overlay_launch_overrides(
     effective_config: &mut ConfigReadResponse,
-    session_flags: Option<&serde_json::Map<String, serde_json::Value>>,
-) -> std::collections::HashSet<String> {
-    let mut flagged = std::collections::HashSet::new();
-    let Some(session_flags) = session_flags else {
+    launch_overrides: Option<&HashMap<String, serde_json::Value>>,
+) -> HashSet<String> {
+    let mut flagged = HashSet::new();
+    let Some(launch_overrides) = launch_overrides else {
         return flagged;
     };
     let session_flags_precedence =
         codex_app_server_protocol::ConfigLayerSource::SessionFlags.precedence();
-    let outranked = |key: &str,
-                     origins: &std::collections::HashMap<
-        String,
-        codex_app_server_protocol::ConfigLayerMetadata,
-    >| {
-        origins.iter().any(|(origin_key, origin)| {
-            (origin_key == key || origin_key.starts_with(&format!("{key}.")))
-                && origin.name.precedence() > session_flags_precedence
-        })
+    let outranked =
+        |key: &str, origins: &HashMap<String, codex_app_server_protocol::ConfigLayerMetadata>| {
+            origins.iter().any(|(origin_key, origin)| {
+                (origin_key == key || origin_key.starts_with(&format!("{key}.")))
+                    && origin.name.precedence() > session_flags_precedence
+            })
+        };
+    if let Some(mode) = launch_overrides.get("web_search")
+        && !outranked("web_search", &effective_config.origins)
+        && let Ok(mode) = serde_json::from_value::<WebSearchMode>(mode.clone())
+    {
+        effective_config.config.web_search = Some(mode);
+        flagged.insert("web_search".to_string());
+    }
+    let Some(session_features) = launch_overrides
+        .get("features")
+        .and_then(serde_json::Value::as_object)
+    else {
+        return flagged;
     };
     let mut overlays = Vec::new();
-    for (name, value) in session_flags {
+    for (name, value) in session_features {
         let key = format!("features.{name}");
         if !outranked(&key, &effective_config.origins) {
             overlays.push((name.clone(), value.clone(), key));
@@ -217,16 +220,22 @@ fn overlay_session_flag_features(
         return flagged;
     };
     for (name, value, key) in overlays {
-        // Merge tables such as `[features.multi_agent_v2]` instead of replacing them.
+        // Merge tables such as `[features.multi_agent_v2]` instead of replacing them, and record
+        // their leaf keys the way config origins do.
         match (features.get_mut(&name), value) {
             (Some(serde_json::Value::Object(existing)), serde_json::Value::Object(value)) => {
+                flagged.extend(value.keys().map(|sub_key| format!("{key}.{sub_key}")));
                 existing.extend(value);
+            }
+            (_, serde_json::Value::Object(value)) => {
+                flagged.extend(value.keys().map(|sub_key| format!("{key}.{sub_key}")));
+                features.insert(name, serde_json::Value::Object(value));
             }
             (_, value) => {
                 features.insert(name, value);
+                flagged.insert(key);
             }
         }
-        flagged.insert(key);
     }
     flagged
 }
@@ -237,21 +246,27 @@ enum OverrideLayer {
     CommandLine,
     Project,
     Profile,
+    /// The main `config.toml` under a selected profile, whose file `/settings` writes instead.
+    BaseUser,
     Managed,
     Other,
 }
 
 impl OverrideLayer {
-    /// `None` for the user config that `/settings` writes.
-    fn from_config(source: &codex_config::ConfigLayerSource) -> Option<Self> {
+    /// `None` for the user config file `/settings` wrote.
+    fn from_config(
+        source: &codex_config::ConfigLayerSource,
+        written: &AbsolutePathBuf,
+    ) -> Option<Self> {
         use codex_config::ConfigLayerSource as Source;
         match source {
-            Source::User { profile: None, .. } => None,
-            Source::SessionFlags => Some(Self::CommandLine),
-            Source::Project { .. } => Some(Self::Project),
+            Source::User { file, .. } if file == written => None,
             Source::User {
                 profile: Some(_), ..
             } => Some(Self::Profile),
+            Source::User { profile: None, .. } => Some(Self::BaseUser),
+            Source::SessionFlags => Some(Self::CommandLine),
+            Source::Project { .. } => Some(Self::Project),
             Source::Mdm { .. }
             | Source::EnterpriseManaged { .. }
             | Source::LegacyManagedConfigTomlFromFile { .. }
@@ -260,21 +275,35 @@ impl OverrideLayer {
         }
     }
 
-    /// `None` for the user config that `/settings` writes.
-    fn from_api(source: &codex_app_server_protocol::ConfigLayerSource) -> Option<Self> {
+    /// `None` for the user config file `/settings` wrote.
+    fn from_api(
+        source: &codex_app_server_protocol::ConfigLayerSource,
+        written: &AbsolutePathBuf,
+    ) -> Option<Self> {
         use codex_app_server_protocol::ConfigLayerSource as Source;
         match source {
-            Source::User { profile: None, .. } => None,
-            Source::SessionFlags => Some(Self::CommandLine),
-            Source::Project { .. } => Some(Self::Project),
+            Source::User { file, .. } if file == written => None,
             Source::User {
                 profile: Some(_), ..
             } => Some(Self::Profile),
+            Source::User { profile: None, .. } => Some(Self::BaseUser),
+            Source::SessionFlags => Some(Self::CommandLine),
+            Source::Project { .. } => Some(Self::Project),
             Source::Mdm { .. }
             | Source::EnterpriseManaged { .. }
             | Source::LegacyManagedConfigTomlFromFile { .. }
             | Source::LegacyManagedConfigTomlFromMdm => Some(Self::Managed),
             Source::PackagedDefaults { .. } | Source::System { .. } => Some(Self::Other),
+        }
+    }
+
+    /// Where a launch choice this TUI forwards to a remote app server came from.
+    fn launch(origin: Option<&codex_config::ConfigLayerMetadata>) -> Self {
+        match origin.map(|origin| &origin.name) {
+            Some(codex_config::ConfigLayerSource::User {
+                profile: Some(_), ..
+            }) => Self::Profile,
+            _ => Self::CommandLine,
         }
     }
 
@@ -283,57 +312,84 @@ impl OverrideLayer {
             Self::CommandLine => "a command-line flag for this Codex session still sets it",
             Self::Project => "this project's .codex/config.toml still sets it",
             Self::Profile => "the selected profile still sets it",
+            Self::BaseUser => "your main config.toml still sets it",
             Self::Managed => "a managed config still sets it",
             Self::Other => "another config file still sets it",
         }
     }
 }
 
-/// The highest-precedence layer, other than the user config `/settings` writes, that sets one of
-/// the switch's keys.
+/// The highest-precedence layer, other than the file `/settings` wrote, whose resolved value still
+/// keeps the switch from reaching `enabled`.
 fn switch_override_layer<'a>(
     switch: SettingsSwitch,
+    enabled: bool,
+    values: &serde_json::Value,
     origins: impl Iterator<Item = (&'a str, i16, Option<OverrideLayer>)>,
 ) -> Option<OverrideLayer> {
-    let keys = switch_keys(switch);
     origins
-        .filter_map(|(origin_key, precedence, layer)| {
-            let matches = keys
-                .iter()
-                .any(|key| origin_key == key || origin_key.starts_with(&format!("{key}.")));
-            Some((precedence, layer?)).filter(|_| matches)
+        .filter(|(key, ..)| {
+            value_at(values, key).is_some_and(|value| opposes_save(switch, enabled, key, value))
         })
+        .filter_map(|(_, precedence, layer)| Some((precedence, layer?)))
         .max_by_key(|(precedence, _)| *precedence)
         .map(|(_, layer)| layer)
 }
 
-/// Config keys whose value can decide the switch, including legacy aliases.
-fn switch_keys(switch: SettingsSwitch) -> Vec<String> {
-    let mut keys = switch
-        .features()
-        .iter()
-        .flat_map(|feature| {
-            std::iter::once(feature.key()).chain(codex_features::legacy_keys_for_feature(*feature))
-        })
-        .map(|key| format!("features.{key}"))
-        .collect::<Vec<_>>();
+/// Whether `key` resolving to `value` keeps the switch from reaching `enabled`.
+fn opposes_save(
+    switch: SettingsSwitch,
+    enabled: bool,
+    key: &str,
+    value: &serde_json::Value,
+) -> bool {
+    let sets_feature = |feature: Feature| {
+        let Some(name) = key.strip_prefix("features.") else {
+            return false;
+        };
+        let name = name.strip_suffix(".enabled").unwrap_or(name);
+        std::iter::once(feature.key())
+            .chain(codex_features::legacy_keys_for_feature(feature))
+            .any(|feature_key| feature_key == name)
+    };
+    let pulls_away = value.as_bool().is_some_and(|value| value != enabled);
     match switch {
-        SettingsSwitch::Subagents => {
-            keys.extend([
-                "features.multi_agent_v2".to_string(),
-                "agents.enabled".to_string(),
-            ]);
+        SettingsSwitch::WebSearch => {
+            key == "web_search"
+                && value
+                    .as_str()
+                    .is_some_and(|mode| (mode == "disabled") == enabled)
         }
-        SettingsSwitch::WebSearch => keys.push("web_search".to_string()),
+        // Subagents need `agents.enabled` and `multi_agent` to turn on, and `agents.enabled` and
+        // `multi_agent_v2` off to turn off.
+        SettingsSwitch::Subagents => {
+            let deciding_feature = if enabled {
+                Feature::Collab
+            } else {
+                Feature::MultiAgentV2
+            };
+            pulls_away && (key == "agents.enabled" || sets_feature(deciding_feature))
+        }
         SettingsSwitch::PluginsAndApps
         | SettingsSwitch::Skills
         | SettingsSwitch::Hooks
         | SettingsSwitch::AgentsMd
         | SettingsSwitch::Memories
         | SettingsSwitch::ImageGeneration
-        | SettingsSwitch::Goals => {}
+        | SettingsSwitch::Goals => {
+            pulls_away
+                && switch
+                    .features()
+                    .iter()
+                    .any(|feature| sets_feature(*feature))
+        }
     }
-    keys
+}
+
+/// The value at a dotted config key such as `features.apps`.
+fn value_at<'a>(values: &'a serde_json::Value, key: &str) -> Option<&'a serde_json::Value> {
+    key.split('.')
+        .try_fold(values, |value, part| value.get(part))
 }
 
 /// Mirrors the effective values this folder resolves to after a save.

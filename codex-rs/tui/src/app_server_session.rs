@@ -1946,7 +1946,8 @@ fn approvals_reviewer_override_from_config(
     Some(config.approvals_reviewer.into())
 }
 
-fn config_request_overrides_from_config(
+/// The config overrides this TUI sends with every new thread.
+pub(crate) fn config_request_overrides_from_config(
     config: &Config,
     thread_params_mode: ThreadParamsMode,
 ) -> Option<HashMap<String, serde_json::Value>> {
