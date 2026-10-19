@@ -1575,8 +1575,9 @@ impl LocalAgentControl {
     }
 }
 
-/// A resumed child whose parent runs Claude, or that runs on another provider than its parent,
-/// keeps collaboration messages in plaintext exactly as it did when it was spawned.
+/// A resumed agent keeps collaboration messages in plaintext when `config` (its parent's, or the
+/// sender's for a reload by message) runs Claude or another provider than the agent. The tool plan
+/// also forces plaintext whenever a Claude provider is connected.
 fn mark_mixed_provider_resume(config: &mut Config, stored_model_provider: &str) {
     let parent_runs_claude = matches!(
         config.model_provider.wire_api,

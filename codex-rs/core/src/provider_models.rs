@@ -103,7 +103,10 @@ pub(crate) enum ProviderConnection {
     NotConnected { remedy: String },
 }
 
-/// Checks whether `provider` has usable credentials, without reading Claude Code secrets.
+/// Checks whether `provider` has credentials configured, or needs none. Only presence is checked;
+/// keys and tokens are not validated. For Claude Code this is the non-secret marker written by
+/// `codex login --provider claude-code`: Codex never reads Claude Code's sign-in, and a signed-out
+/// CLI fails its first turn with a `claude auth login` hint.
 pub(crate) fn provider_connection(
     provider_id: &str,
     provider: &ModelProviderInfo,

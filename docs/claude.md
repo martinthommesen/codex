@@ -160,7 +160,8 @@ stream_idle_timeout_ms = 300000
 ```
 
 Custom providers can use the new wire APIs as well: `wire_api = "anthropic_messages"` or
-`wire_api = "claude_code"`. The `claude-code` provider does not accept `base_url` or `env_key`,
+`wire_api = "claude_code"`. An `anthropic_messages` provider without `base_url` uses
+`https://api.anthropic.com/v1`. The `claude-code` provider does not accept `base_url` or `env_key`,
 because the Claude Code CLI makes every request itself.
 
 ## Delegating across providers
@@ -236,7 +237,10 @@ same way ordinary tool arguments do.
   With `claude-code`, the main agent uses whatever sign-in the `claude` CLI has. If it is signed
   out, the turn fails with Claude Code's message plus a hint to run `claude auth login` and
   `codex login --provider claude-code`. The connection marker controls only whether sub-agents may
-  be spawned on `claude-code`.
+  be spawned on `claude-code`. `claude auth logout` leaves the marker in place, so a `claude-code`
+  sub-agent spawned afterwards fails on its first turn with the same hint.
+- **Realtime conversations:** realtime voice sessions use OpenAI's realtime API and are refused
+  while the thread runs on a Claude provider.
 - **Switching providers mid-thread:** a thread stays on one provider. When a history moves between
   providers, as with forks and resumes, Codex drops reasoning that the other provider cannot verify
   (OpenAI encrypted reasoning, Claude thinking signatures) and keeps everything else.
@@ -252,5 +256,6 @@ same way ordinary tool arguments do.
 
 Automated tests use local mock servers and a fake `claude` executable. They cover request and
 stream translation, tool round trips, credential isolation, and parent/child provider
-combinations. No live Anthropic API call or real Claude Code subscription session was made while
-building this integration, so validate your own setup with a short session before relying on it.
+combinations. The opt-in live test (`codex-rs/claude-code/tests/live.rs`) was run once against a
+signed-in Claude Code CLI and completed a bridged tool round trip. No live Anthropic API call was
+made, so validate your own setup with a short session before relying on it.

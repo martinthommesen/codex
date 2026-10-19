@@ -515,7 +515,10 @@ other non-default provider fields are not supported"
 
     /// Builds an API provider with managed residency taking precedence over configured headers.
     pub fn to_api_provider(&self, auth_mode: Option<AuthMode>) -> CodexResult<ApiProvider> {
-        let default_base_url = if matches!(
+        // An Anthropic credential must never fall back to an OpenAI origin.
+        let default_base_url = if self.is_anthropic() {
+            ANTHROPIC_DEFAULT_BASE_URL
+        } else if matches!(
             auth_mode,
             Some(
                 AuthMode::Chatgpt

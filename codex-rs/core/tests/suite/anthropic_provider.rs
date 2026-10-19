@@ -20,8 +20,13 @@ use codex_model_provider_info::ANTHROPIC_PROVIDER_ID;
 use codex_model_provider_info::CLAUDE_CODE_PROVIDER_ID;
 use codex_model_provider_info::OPENAI_PROVIDER_ID;
 use codex_protocol::protocol::AskForApproval;
+use codex_protocol::protocol::CodexResponseHandoffMode;
+use codex_protocol::protocol::ConversationStartParams;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::Op;
+use codex_protocol::protocol::RealtimeConversationRealtimeEvent;
+use codex_protocol::protocol::RealtimeEvent;
+use codex_protocol::protocol::RealtimeOutputModality;
 use codex_protocol::protocol::ReviewDecision;
 use codex_protocol::protocol::SandboxPolicy;
 use codex_protocol::protocol::ThreadSettingsOverrides;
@@ -695,6 +700,63 @@ async fn anthropic_key_is_not_sent_across_a_redirect() -> Result<()> {
             .unwrap_or_default()
             .is_empty(),
         "the request, and with it x-api-key, must not reach the redirect target"
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn realtime_is_refused_on_a_claude_provider() -> Result<()> {
+    skip_if_no_network!(Ok(()));
+    let server = start_mock_server().await;
+    let test = build(&server, ANTHROPIC_PROVIDER_ID, CLAUDE_PARENT_MODEL).await?;
+
+    test.codex
+        .submit(Op::RealtimeConversationStart(ConversationStartParams {
+            client_managed_handoffs: false,
+            delegation_ack_filler: None,
+            flush_transcript_tail_on_session_end: false,
+            codex_responses_as_items: false,
+            codex_response_item_prefix: None,
+            codex_response_handoff_mode: CodexResponseHandoffMode::Thinking,
+            backend_reasoning_status: false,
+            codex_response_handoff_channel_prefixes: None,
+            model: None,
+            output_modality: RealtimeOutputModality::Audio,
+            include_startup_context: false,
+            initial_items: Vec::new(),
+            realtime_start_instructions: None,
+            realtime_end_instructions: None,
+            prompt: None,
+            realtime_session_id: None,
+            voice_session_id: None,
+            transport: None,
+            version: None,
+            voice: None,
+        }))
+        .await?;
+    let error = wait_for_event_match(&test.codex, |event| match event {
+        EventMsg::RealtimeConversationRealtime(RealtimeConversationRealtimeEvent {
+            payload: RealtimeEvent::Error(message),
+        }) => Some(message.clone()),
+        EventMsg::Error(error) => Some(error.message.clone()),
+        EventMsg::RealtimeConversationStarted(_) => Some("started".to_string()),
+        _ => None,
+    })
+    .await;
+
+    assert!(
+        error.contains("not available with Claude providers"),
+        "unexpected realtime outcome: {error}"
+    );
+    // The OpenAI key must not be offered to the Claude provider's endpoint.
+    assert!(
+        server
+            .received_requests()
+            .await
+            .unwrap_or_default()
+            .iter()
+            .all(|request| !request.url.path().contains("realtime")),
+        "realtime must not contact the Claude provider's endpoint"
     );
     Ok(())
 }

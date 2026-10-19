@@ -882,3 +882,40 @@ model_catalog_url = "https://gateway.example/codex/catalog?token=catalog-secret"
         "https://gateway.example/v1"
     );
 }
+
+#[test]
+fn anthropic_provider_without_base_url_targets_the_anthropic_api() {
+    let custom = ModelProviderInfo {
+        name: "Custom Claude".to_string(),
+        wire_api: WireApi::AnthropicMessages,
+        ..ModelProviderInfo::default()
+    };
+    for auth_mode in [None, Some(AuthMode::ApiKey), Some(AuthMode::Chatgpt)] {
+        let api_provider = custom.to_api_provider(auth_mode).expect("api provider");
+        assert_eq!(api_provider.base_url, ANTHROPIC_DEFAULT_BASE_URL);
+    }
+
+    let gateway = ModelProviderInfo {
+        base_url: Some("https://gateway.example/v1".to_string()),
+        ..custom
+    };
+    assert_eq!(
+        gateway
+            .to_api_provider(/*auth_mode*/ None)
+            .expect("api provider")
+            .base_url,
+        "https://gateway.example/v1"
+    );
+
+    let responses = ModelProviderInfo {
+        name: "Custom".to_string(),
+        ..ModelProviderInfo::default()
+    };
+    assert_eq!(
+        responses
+            .to_api_provider(/*auth_mode*/ None)
+            .expect("api provider")
+            .base_url,
+        "https://api.openai.com/v1"
+    );
+}
