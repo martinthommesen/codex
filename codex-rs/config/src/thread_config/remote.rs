@@ -162,6 +162,7 @@ fn model_provider_from_proto(
         Ok(proto::WireApi::Responses) => WireApi::Responses,
         Ok(proto::WireApi::AnthropicMessages) => WireApi::AnthropicMessages,
         Ok(proto::WireApi::ClaudeCode) => WireApi::ClaudeCode,
+        Ok(proto::WireApi::ClaudeOAuth) => WireApi::ClaudeOAuth,
         Ok(proto::WireApi::Unspecified) => {
             return Err(parse_error("remote thread config omitted wire_api"));
         }
@@ -318,6 +319,7 @@ fn proto_wire_api(wire_api: WireApi) -> proto::WireApi {
         WireApi::Responses => proto::WireApi::Responses,
         WireApi::AnthropicMessages => proto::WireApi::AnthropicMessages,
         WireApi::ClaudeCode => proto::WireApi::ClaudeCode,
+        WireApi::ClaudeOAuth => proto::WireApi::ClaudeOAuth,
     }
 }
 
@@ -590,6 +592,16 @@ mod tests {
             capabilities: None,
             include_internal_metadata: false,
         }
+    }
+
+    #[test]
+    fn claude_oauth_wire_api_round_trips_remote_thread_configuration() {
+        let provider = ModelProviderInfo::create_claude_oauth_provider();
+        let encoded = model_provider_to_proto("claude-oauth".to_string(), provider.clone());
+        assert_eq!(encoded.wire_api, proto::WireApi::ClaudeOAuth as i32);
+        let (id, decoded) = model_provider_from_proto(encoded).expect("OAuth remote config");
+        assert_eq!(id, "claude-oauth");
+        assert_eq!(decoded, provider);
     }
 
     fn workspace_dir() -> AbsolutePathBuf {

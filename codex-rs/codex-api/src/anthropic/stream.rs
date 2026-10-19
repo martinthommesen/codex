@@ -5,6 +5,7 @@
 //! stream-json --include-partial-messages`.
 
 use super::error::anthropic_stream_error;
+use super::oauth_response::map_claude_oauth_transport_error;
 use super::request::ANTHROPIC_REDACTED_THINKING_PREFIX;
 use super::request::ANTHROPIC_THINKING_PREFIX;
 use super::tools::AnthropicToolKind;
@@ -21,6 +22,7 @@ use codex_protocol::models::ContentItem;
 use codex_protocol::models::MessagePhase;
 use codex_protocol::models::ReasoningItemReasoningSummary;
 use codex_protocol::models::ResponseItem;
+use codex_protocol::protocol::RateLimitSnapshot;
 use codex_protocol::protocol::TokenUsage;
 use eventsource_stream::Eventsource;
 use futures::StreamExt;
@@ -404,7 +406,7 @@ impl AnthropicStreamTranslator {
                 }
             }
             (_, "citations_delta") => {}
-            (_, other) => trace!("ignoring Anthropic delta `{other}` for block {index}"),
+            (_, _) => trace!("ignoring unsupported Anthropic delta for block {index}"),
         }
     }
 
@@ -478,10 +480,10 @@ impl AnthropicStreamTranslator {
     fn release_held_tool_calls(&mut self, out: &mut Vec<ResponseEvent>) {
         let held = std::mem::take(&mut self.held_tool_calls);
         if matches!(self.stop_reason.as_deref(), Some("max_tokens" | "refusal")) {
-            for call in held {
+            if !held.is_empty() {
                 warn!(
-                    "dropping Anthropic tool call {} cut off by stop_reason {:?}",
-                    call.id, self.stop_reason
+                    dropped_tool_calls = held.len(),
+                    "dropping Anthropic tool calls cut off by max_tokens or refusal"
                 );
             }
             return;
@@ -594,8 +596,8 @@ impl AnthropicStreamTranslator {
                     _ => ApiError::InvalidRequest { message },
                 });
             }
-            Some(other) => {
-                debug!("unrecognized Anthropic stop_reason `{other}`");
+            Some(_) => {
+                debug!("unrecognized Anthropic stop_reason");
                 None
             }
             None => None,
@@ -651,6 +653,41 @@ pub fn spawn_anthropic_stream(
     tool_names: AnthropicToolNameMap,
     telemetry: Option<Arc<dyn SseTelemetry>>,
 ) -> ResponseStream {
+    spawn_messages_stream(
+        stream_response,
+        idle_timeout,
+        tool_names,
+        telemetry,
+        Vec::new(),
+        false,
+    )
+}
+
+pub(super) fn spawn_claude_oauth_stream(
+    stream_response: StreamResponse,
+    idle_timeout: Duration,
+    tool_names: AnthropicToolNameMap,
+    telemetry: Option<Arc<dyn SseTelemetry>>,
+    rate_limits: Vec<RateLimitSnapshot>,
+) -> ResponseStream {
+    spawn_messages_stream(
+        stream_response,
+        idle_timeout,
+        tool_names,
+        telemetry,
+        rate_limits,
+        true,
+    )
+}
+
+fn spawn_messages_stream(
+    stream_response: StreamResponse,
+    idle_timeout: Duration,
+    tool_names: AnthropicToolNameMap,
+    telemetry: Option<Arc<dyn SseTelemetry>>,
+    rate_limits: Vec<RateLimitSnapshot>,
+    oauth: bool,
+) -> ResponseStream {
     let upstream_request_id = stream_response
         .headers
         .get(REQUEST_ID_HEADER)
@@ -663,6 +700,8 @@ pub fn spawn_anthropic_stream(
         idle_timeout,
         AnthropicStreamTranslator::new(tool_names),
         telemetry,
+        rate_limits,
+        oauth,
     ));
     ResponseStream {
         rx_event,
@@ -677,7 +716,18 @@ async fn process_anthropic_sse(
     idle_timeout: Duration,
     mut translator: AnthropicStreamTranslator,
     telemetry: Option<Arc<dyn SseTelemetry>>,
+    rate_limits: Vec<RateLimitSnapshot>,
+    oauth: bool,
 ) {
+    for snapshot in rate_limits {
+        if tx_event
+            .send(Ok(ResponseEvent::RateLimits(snapshot)))
+            .await
+            .is_err()
+        {
+            return;
+        }
+    }
     let mut stream = stream.eventsource();
     loop {
         let start = Instant::now();
@@ -687,7 +737,11 @@ async fn process_anthropic_sse(
             response = timeout(idle_timeout, stream.next()) => response,
         };
         if let Some(t) = telemetry.as_ref() {
-            t.on_sse_poll(&response, start.elapsed());
+            if oauth {
+                record_oauth_sse_poll(t.as_ref(), &response, start.elapsed());
+            } else {
+                t.on_sse_poll(&response, start.elapsed());
+            }
         }
         let sse = match response {
             Ok(Some(Ok(sse))) => sse,
@@ -696,6 +750,9 @@ async fn process_anthropic_sse(
                     eventsource_stream::EventStreamError::Transport(
                         error @ codex_client::TransportError::Policy(_),
                     ) => ApiError::Transport(error),
+                    _ if oauth => map_claude_oauth_transport_error(ApiError::Stream(
+                        "Claude OAuth stream transport or framing failed".to_string(),
+                    )),
                     error => ApiError::Stream(error.to_string()),
                 };
                 let _ = tx_event.send(Err(error)).await;
@@ -723,7 +780,7 @@ async fn process_anthropic_sse(
         if sse.data.trim().is_empty() {
             continue;
         }
-        let event: AnthropicStreamEvent = match serde_json::from_str(&sse.data) {
+        let mut event: AnthropicStreamEvent = match serde_json::from_str(&sse.data) {
             Ok(event) => event,
             Err(err) => {
                 debug!(
@@ -735,6 +792,34 @@ async fn process_anthropic_sse(
                 continue;
             }
         };
+        if oauth {
+            // Classify the raw error before discarding its text, retaining context-limit and
+            // thinking-signature semantics without echoing tokens or authorization codes.
+            if let AnthropicStreamEvent::Error { error } = &event {
+                let error = map_claude_oauth_transport_error(anthropic_stream_error(
+                    &error.kind,
+                    &error.message,
+                ));
+                let _ = tx_event.send(Err(error)).await;
+                return;
+            }
+            if let AnthropicStreamEvent::MessageDelta { delta, .. } = &mut event
+                && delta.stop_reason.as_deref() == Some("refusal")
+            {
+                // Refusal details are server-supplied diagnostic strings, rather than model
+                // output. Keep the policy category while withholding opaque explanations.
+                let category = delta
+                    .stop_details
+                    .as_ref()
+                    .and_then(|details| details["category"].as_str());
+                let category = match category {
+                    Some("bio") => "bio",
+                    Some("cyber") => "cyber",
+                    _ => "unspecified",
+                };
+                delta.stop_details = Some(serde_json::json!({"category":category}));
+            }
+        }
         match translator.handle(event) {
             Ok(events) => {
                 for event in events {
@@ -747,11 +832,65 @@ async fn process_anthropic_sse(
                 }
             }
             Err(err) => {
+                let err = if oauth {
+                    map_claude_oauth_transport_error(err)
+                } else {
+                    err
+                };
                 let _ = tx_event.send(Err(err)).await;
                 return;
             }
         }
     }
+}
+
+type SsePollResult = Result<
+    Option<
+        Result<
+            eventsource_stream::Event,
+            eventsource_stream::EventStreamError<codex_client::TransportError>,
+        >,
+    >,
+    tokio::time::error::Elapsed,
+>;
+
+fn record_oauth_sse_poll(
+    telemetry: &dyn SseTelemetry,
+    response: &SsePollResult,
+    duration: Duration,
+) {
+    // Telemetry can format parser/transport failures and special SSE error event payloads.
+    // Report the same poll timing and success state with bounded protocol-only metadata.
+    let safe_response = match response {
+        Ok(Some(Ok(event))) => {
+            let kind = match event.event.as_str() {
+                "message_start" => "message_start",
+                "content_block_start" => "content_block_start",
+                "content_block_delta" => "content_block_delta",
+                "content_block_stop" => "content_block_stop",
+                "message_delta" => "message_delta",
+                "message_stop" => "message_stop",
+                "ping" => "ping",
+                "error" => "error",
+                _ => "unknown",
+            };
+            Ok(Some(Ok(eventsource_stream::Event {
+                event: kind.to_string(),
+                data: "{}".to_string(),
+                ..Default::default()
+            })))
+        }
+        Ok(Some(Err(_))) => Ok(Some(Err(eventsource_stream::EventStreamError::Transport(
+            codex_client::TransportError::Network(
+                "Claude OAuth stream transport or framing failed".to_string(),
+            ),
+        )))),
+        _ => {
+            telemetry.on_sse_poll(response, duration);
+            return;
+        }
+    };
+    telemetry.on_sse_poll(&safe_response, duration);
 }
 
 #[cfg(test)]

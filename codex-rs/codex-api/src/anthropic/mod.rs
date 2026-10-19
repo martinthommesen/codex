@@ -7,6 +7,8 @@
 mod client;
 mod error;
 mod model_traits;
+pub mod oauth;
+mod oauth_response;
 mod request;
 mod stream;
 mod tools;
@@ -22,6 +24,8 @@ pub use model_traits::ClaudeModelTraits;
 pub use model_traits::ClaudeThinkingStyle;
 pub use model_traits::ResolvedClaudeReasoning;
 pub use model_traits::resolve_claude_reasoning;
+pub use oauth_response::ClaudeOAuthResponseMetadata;
+pub use oauth_response::map_claude_oauth_transport_error;
 pub use request::ANTHROPIC_REDACTED_THINKING_PREFIX;
 pub use request::ANTHROPIC_THINKING_PREFIX;
 pub use request::AnthropicMessage;
@@ -50,3 +54,6 @@ pub use tools::anthropic_tool_use_id;
 pub use tools::anthropic_wire_tool_name;
 pub use tools::anthropic_wire_tool_name_with_limit;
 pub use tools::translate_tools;
+
+#[cfg(test)]
+mod oauth_client_tests;

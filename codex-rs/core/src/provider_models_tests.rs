@@ -160,3 +160,106 @@ async fn registry_routes_each_provider_to_its_own_catalog() {
             .any(|preset| preset.model.starts_with("gpt-"))
     );
 }
+
+#[tokio::test]
+async fn oauth_connection_never_inherits_other_provider_credentials_or_connection_markers() {
+    let home = TempDir::new().expect("home");
+    let config = config_in(&home, OPENAI_PROVIDER_ID).await;
+    let manager = AuthManager::from_auth_for_testing_with_home(
+        codex_login::CodexAuth::from_api_key("openai-test"),
+        home.path().to_path_buf(),
+    );
+    manager
+        .anthropic_auth_config()
+        .save_api_key("anthropic-test")
+        .expect("store key");
+    mark_claude_code_connected(&home);
+    let provider = &config.model_providers[CLAUDE_OAUTH_PROVIDER_ID];
+    assert!(
+        matches!(provider_connection(provider, Some(manager.as_ref()), home.path()), ProviderConnection::NotConnected { remedy } if remedy.contains("login --provider claude-oauth"))
+    );
+    let options = spawn_provider_options(&config, Some(manager.as_ref()), &[]);
+    assert!(
+        options
+            .iter()
+            .any(|option| option.id == ANTHROPIC_PROVIDER_ID)
+    );
+    assert!(
+        options
+            .iter()
+            .any(|option| option.id == CLAUDE_CODE_PROVIDER_ID)
+    );
+    assert!(
+        !options
+            .iter()
+            .any(|option| option.id == CLAUDE_OAUTH_PROVIDER_ID)
+    );
+
+    // Invalid generic auth cannot make OAuth appear connected through the early key path.
+    let custom = ModelProviderInfo {
+        experimental_bearer_token: Some("other-account".into()),
+        ..provider.clone()
+    };
+    assert!(matches!(
+        provider_connection(&custom, Some(manager.as_ref()), home.path()),
+        ProviderConnection::NotConnected { .. }
+    ));
+}
+
+#[tokio::test]
+async fn oauth_parent_lists_connected_other_providers_and_keeps_collaboration_readable() {
+    let home = TempDir::new().expect("home");
+    let config = config_in(&home, CLAUDE_OAUTH_PROVIDER_ID).await;
+    let manager = AuthManager::from_auth_for_testing_with_home(
+        codex_login::CodexAuth::from_api_key("openai-test"),
+        home.path().to_path_buf(),
+    );
+    manager
+        .anthropic_auth_config()
+        .save_api_key("anthropic-test")
+        .expect("store key");
+    mark_claude_code_connected(&home);
+    let options = spawn_provider_options(&config, Some(manager.as_ref()), &[]);
+    assert_eq!(options[0].id, CLAUDE_OAUTH_PROVIDER_ID);
+    assert!(options[0].is_current);
+    assert!(options[0].description.contains("experimental"));
+    for id in [
+        OPENAI_PROVIDER_ID,
+        ANTHROPIC_PROVIDER_ID,
+        CLAUDE_CODE_PROVIDER_ID,
+    ] {
+        assert!(options.iter().any(|option| option.id == id), "{id}");
+    }
+    assert!(collaboration_messages_require_plaintext(&options));
+}
+
+#[tokio::test]
+async fn oauth_models_use_own_catalog_on_provider_switch_and_repeat_lookup() {
+    let home = TempDir::new().expect("home");
+    let openai = config_in(&home, OPENAI_PROVIDER_ID).await;
+    let root = create_model_provider(openai.model_provider.clone(), None)
+        .models_manager_without_cache(None);
+    let registry =
+        ProviderModelsRegistry::new(OPENAI_PROVIDER_ID.to_string(), Arc::clone(&root), None);
+    let oauth = config_in(&home, CLAUDE_OAUTH_PROVIDER_ID).await;
+    let catalog = registry.for_config(&oauth);
+    assert!(!Arc::ptr_eq(&catalog, &root));
+    assert!(Arc::ptr_eq(&catalog, &registry.for_config(&oauth)));
+    let models = catalog
+        .list_models(
+            codex_models_manager::manager::RefreshStrategy::Offline,
+            oauth.http_client_factory(),
+        )
+        .await;
+    assert!(models.iter().any(|model| model.model == "claude-opus-5-5"));
+    assert!(models.iter().all(|model| !model.model.starts_with("gpt-")));
+    let selected = catalog
+        .get_default_model(
+            &Some("claude-opus-5-5".to_string()),
+            true,
+            codex_models_manager::manager::RefreshStrategy::Offline,
+            oauth.http_client_factory(),
+        )
+        .await;
+    assert_eq!(selected, "claude-opus-5-5");
+}

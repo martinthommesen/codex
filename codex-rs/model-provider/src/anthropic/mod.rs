@@ -4,10 +4,14 @@
 //! Codex stores separately from ChatGPT credentials (falling back to `ANTHROPIC_API_KEY`).
 //! [`ClaudeCodeModelProvider`] drives the user's installed Claude Code CLI, which signs in on its
 //! own; Codex never sees those credentials, so this provider attaches no HTTP auth at all.
-//! Neither provider ever uses the ChatGPT [`AuthManager`] for requests, so ChatGPT refreshes and
-//! logouts cannot affect Claude, and a Claude 401 never triggers ChatGPT recovery.
+//! [`ClaudeOAuthModelProvider`] uses its own experimental, encrypted OAuth credential store
+//! and a direct Anthropic HTTP transport. Its credentials never fall back to an API key or CLI.
+//! None of these providers uses the ChatGPT [`AuthManager`] for requests, so ChatGPT refreshes
+//! and logouts cannot affect Claude, and a Claude 401 never triggers ChatGPT recovery.
 
 mod catalog;
+mod oauth;
+pub(crate) use oauth::ClaudeOAuthModelProvider;
 
 pub use catalog::CLAUDE_BACKGROUND_MODEL;
 pub use catalog::DEFAULT_CLAUDE_MODEL;
@@ -48,7 +52,7 @@ ChatGPT login) with `printenv ANTHROPIC_API_KEY | codex login --provider anthrop
 or export ANTHROPIC_API_KEY. To use a Claude subscription instead, run \
 `codex login --provider claude-code` and select the `claude-code` provider.";
 
-/// Capabilities shared by both Claude providers.
+/// Capabilities shared by all Claude providers.
 fn claude_capabilities() -> ProviderCapabilities {
     ProviderCapabilities {
         // OpenAI-hosted tools have no Anthropic equivalent wired up yet.

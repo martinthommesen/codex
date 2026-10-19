@@ -1,6 +1,10 @@
 use std::collections::BTreeMap;
 use std::fs;
 use std::io::Write;
+#[cfg(unix)]
+use std::os::unix::fs::DirBuilderExt;
+#[cfg(unix)]
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -43,6 +47,7 @@ const CODEX_AUTH_SECRETS_FILENAME: &str = "codex_auth.age";
 const MCP_OAUTH_SECRETS_FILENAME: &str = "mcp_oauth.age";
 const GATEWAY_OAUTH_SECRETS_FILENAME: &str = "gateway_oauth.age";
 const ANTHROPIC_AUTH_SECRETS_FILENAME: &str = "anthropic_auth.age";
+const CLAUDE_OAUTH_SECRETS_FILENAME: &str = "claude_oauth.age";
 static MCP_OAUTH_CACHE: Mutex<Option<CachedSecrets>> = Mutex::new(None);
 
 /// Selects the local encrypted file used by a `LocalSecretsBackend`.
@@ -59,6 +64,8 @@ pub enum LocalSecretsNamespace {
     GatewayOAuth,
     /// Anthropic API credentials, isolated from primary auth in file and encryption key.
     AnthropicAuth,
+    /// Experimental Claude subscription OAuth credentials and their independent encryption key.
+    ClaudeOAuth,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -176,6 +183,7 @@ impl LocalSecretsBackend {
             LocalSecretsNamespace::McpOAuth => MCP_OAUTH_SECRETS_FILENAME,
             LocalSecretsNamespace::GatewayOAuth => GATEWAY_OAUTH_SECRETS_FILENAME,
             LocalSecretsNamespace::AnthropicAuth => ANTHROPIC_AUTH_SECRETS_FILENAME,
+            LocalSecretsNamespace::ClaudeOAuth => CLAUDE_OAUTH_SECRETS_FILENAME,
         };
         self.secrets_dir().join(filename)
     }
@@ -188,7 +196,8 @@ impl LocalSecretsBackend {
             LocalSecretsNamespace::GatewayOAuth => Some(&self.gateway_cache),
             LocalSecretsNamespace::ManagedSecrets
             | LocalSecretsNamespace::CodexAuth
-            | LocalSecretsNamespace::AnthropicAuth => None,
+            | LocalSecretsNamespace::AnthropicAuth
+            | LocalSecretsNamespace::ClaudeOAuth => None,
         }
     }
 
@@ -245,7 +254,12 @@ impl LocalSecretsBackend {
 
     fn save_file(&self, file: &SecretsFile) -> Result<()> {
         let dir = self.secrets_dir();
-        fs::create_dir_all(&dir)
+        let mut directory = fs::DirBuilder::new();
+        directory.recursive(true);
+        #[cfg(unix)]
+        directory.mode(0o700);
+        directory
+            .create(&dir)
             .with_context(|| format!("failed to create secrets dir {}", dir.display()))?;
 
         let passphrase = self.load_or_create_passphrase()?;
@@ -327,16 +341,16 @@ fn write_file_atomically(path: &Path, contents: &[u8]) -> Result<()> {
     ));
 
     {
-        let mut tmp_file = fs::OpenOptions::new()
-            .create_new(true)
-            .write(true)
-            .open(&tmp_path)
-            .with_context(|| {
-                format!(
-                    "failed to create temp secrets file at {}",
-                    tmp_path.display()
-                )
-            })?;
+        let mut options = fs::OpenOptions::new();
+        options.create_new(true).write(true);
+        #[cfg(unix)]
+        options.mode(0o600);
+        let mut tmp_file = options.open(&tmp_path).with_context(|| {
+            format!(
+                "failed to create temp secrets file at {}",
+                tmp_path.display()
+            )
+        })?;
         tmp_file.write_all(contents).with_context(|| {
             format!(
                 "failed to write temp secrets file at {}",
@@ -559,6 +573,11 @@ mod tests {
             keyring.clone(),
             LocalSecretsNamespace::AnthropicAuth,
         );
+        let claude_oauth_backend = LocalSecretsBackend::new_with_namespace(
+            codex_home.path().to_path_buf(),
+            keyring.clone(),
+            LocalSecretsNamespace::ClaudeOAuth,
+        );
         let scope = SecretScope::Global;
         let name = SecretName::new("TEST_SECRET")?;
 
@@ -566,6 +585,7 @@ mod tests {
         mcp_backend.set(&scope, &name, "mcp-value")?;
         gateway_backend.set(&scope, &name, "gateway-value")?;
         anthropic_backend.set(&scope, &name, "anthropic-value")?;
+        claude_oauth_backend.set(&scope, &name, "claude-oauth-value")?;
 
         assert_eq!(
             codex_auth_backend.get(&scope, &name)?,
@@ -613,6 +633,11 @@ mod tests {
             anthropic_backend.get(&scope, &name)?,
             Some("anthropic-value".to_string())
         );
+        assert!(codex_home.path().join("secrets/claude_oauth.age").is_file());
+        assert_eq!(
+            claude_oauth_backend.get(&scope, &name)?,
+            Some("claude-oauth-value".to_string())
+        );
         // Primary-auth key removal must not make the independent gateway or Anthropic files
         // unreadable.
         keyring
@@ -628,6 +653,10 @@ mod tests {
         assert_eq!(
             anthropic_backend.get(&scope, &name)?,
             Some("anthropic-value".to_string())
+        );
+        assert_eq!(
+            claude_oauth_backend.get(&scope, &name)?,
+            Some("claude-oauth-value".to_string())
         );
         Ok(())
     }

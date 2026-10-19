@@ -15,6 +15,7 @@ use codex_login::AuthManager;
 use codex_login::default_client::set_default_client_residency_requirement;
 use codex_model_provider_info::AMAZON_BEDROCK_PROVIDER_ID;
 use codex_model_provider_info::AMAZON_BEDROCK_RUNTIME_PROVIDER_ID;
+use codex_model_provider_info::CLAUDE_OAUTH_PROVIDER_ID;
 use codex_model_provider_info::built_in_model_providers;
 use codex_model_provider_info::merge_configured_model_providers;
 use codex_utils_absolute_path::AbsolutePathBuf;
@@ -311,10 +312,12 @@ impl ConfigManager {
             Some(provider)
                 if matches!(
                     current.model_provider_id.as_str(),
-                    AMAZON_BEDROCK_PROVIDER_ID | AMAZON_BEDROCK_RUNTIME_PROVIDER_ID
+                    AMAZON_BEDROCK_PROVIDER_ID
+                        | AMAZON_BEDROCK_RUNTIME_PROVIDER_ID
+                        | CLAUDE_OAUTH_PROVIDER_ID
                 ) =>
             {
-                // Bedrock requirements contain overrides of the built-in provider.
+                // These requirements contain restricted overrides of a built-in provider.
                 merge_configured_model_providers(
                     built_in_model_providers(/*openai_base_url*/ None),
                     HashMap::from([(current.model_provider_id.clone(), provider)]),

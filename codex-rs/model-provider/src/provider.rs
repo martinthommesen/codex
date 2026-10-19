@@ -30,6 +30,7 @@ use crate::ResolvedResponsesProvider;
 use crate::amazon_bedrock::AmazonBedrockModelProvider;
 use crate::anthropic::AnthropicModelProvider;
 use crate::anthropic::ClaudeCodeModelProvider;
+use crate::anthropic::ClaudeOAuthModelProvider;
 use crate::auth::ProviderAuthScope;
 use crate::auth::ResolvedProviderAuth;
 use crate::auth::auth_manager_for_provider;
@@ -356,6 +357,9 @@ pub fn create_model_provider(
             return Arc::new(AnthropicModelProvider::new(provider_info, auth_manager));
         }
         WireApi::ClaudeCode => return Arc::new(ClaudeCodeModelProvider::new(provider_info)),
+        WireApi::ClaudeOAuth => {
+            return Arc::new(ClaudeOAuthModelProvider::new(provider_info, auth_manager));
+        }
         WireApi::Responses => {}
     }
     let gateway_auth_manager = provider_info.gateway_oauth.as_ref().map(|config| {

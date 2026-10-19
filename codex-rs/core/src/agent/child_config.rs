@@ -14,6 +14,7 @@ use crate::session::turn_context::TurnContext;
 use codex_features::Feature;
 use codex_model_provider_info::ANTHROPIC_PROVIDER_ID;
 use codex_model_provider_info::CLAUDE_CODE_PROVIDER_ID;
+use codex_model_provider_info::CLAUDE_OAUTH_PROVIDER_ID;
 use codex_model_provider_info::OPENAI_PROVIDER_ID;
 use codex_model_provider_info::WireApi;
 use codex_models_manager::manager::RefreshStrategy;
@@ -82,7 +83,7 @@ pub(crate) async fn prepare_agent_spawn_config(
     let mixed_provider_tree = provider_changed
         || matches!(
             turn.config.model_provider.wire_api,
-            WireApi::AnthropicMessages | WireApi::ClaudeCode
+            WireApi::AnthropicMessages | WireApi::ClaudeCode | WireApi::ClaudeOAuth
         );
     if mixed_provider_tree {
         config.plaintext_collaboration_messages = true;
@@ -482,15 +483,17 @@ async fn apply_spawn_agent_role(
 fn with_provider_hint(error: String, requested_model: &str, provider_id: &str) -> String {
     let claude_model = codex_model_provider::is_known_claude_model(requested_model);
     match (claude_model, provider_id) {
-        (true, ANTHROPIC_PROVIDER_ID | CLAUDE_CODE_PROVIDER_ID) => error,
+        (true, ANTHROPIC_PROVIDER_ID | CLAUDE_CODE_PROVIDER_ID | CLAUDE_OAUTH_PROVIDER_ID) => error,
         (true, _) => format!(
             "{error}. `{requested_model}` is a Claude model: pass model_provider \"{ANTHROPIC_PROVIDER_ID}\" \
-(Anthropic API key) or \"{CLAUDE_CODE_PROVIDER_ID}\" (Claude Code sign-in)."
+(Anthropic API key), \"{CLAUDE_CODE_PROVIDER_ID}\" (Claude Code sign-in), or \"{CLAUDE_OAUTH_PROVIDER_ID}\" (experimental native OAuth)."
         ),
-        (false, ANTHROPIC_PROVIDER_ID | CLAUDE_CODE_PROVIDER_ID) => format!(
-            "{error}. Provider `{provider_id}` only serves Claude models; pass model_provider \
+        (false, ANTHROPIC_PROVIDER_ID | CLAUDE_CODE_PROVIDER_ID | CLAUDE_OAUTH_PROVIDER_ID) => {
+            format!(
+                "{error}. Provider `{provider_id}` only serves Claude models; pass model_provider \
 \"{OPENAI_PROVIDER_ID}\" for OpenAI models."
-        ),
+            )
+        }
         (false, _) => error,
     }
 }

@@ -6963,6 +6963,13 @@
             "claude_code"
           ],
           "type": "string"
+        },
+        {
+          "description": "Experimental direct Anthropic Messages transport using separately stored Claude OAuth credentials. Undocumented compatibility does not establish Anthropic authorization or subscription-quota treatment.",
+          "enum": [
+            "claude_oauth"
+          ],
+          "type": "string"
         }
       ]
     },

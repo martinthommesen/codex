@@ -459,7 +459,8 @@ pub async fn run_login_anthropic(
     if !with_api_key {
         eprintln!(
             "Anthropic login reads the API key from stdin, e.g. `printenv ANTHROPIC_API_KEY | codex login --provider anthropic --with-api-key`.\n\
-To use a Claude subscription, run `codex login --provider claude-code` instead."
+To use a Claude subscription, use `codex login --provider claude-code`, or explicitly opt into \
+experimental native OAuth with `codex login --provider claude-oauth`."
         );
         std::process::exit(1);
     }
@@ -496,6 +497,12 @@ pub async fn run_login_claude_code(cli_config_overrides: CliConfigOverrides) -> 
     }
 }
 
+/// Explicitly opts into native experimental Claude OAuth without changing other credentials.
+pub async fn run_login_claude_oauth(cli_config_overrides: CliConfigOverrides) -> ! {
+    let config = load_config_or_exit(cli_config_overrides).await;
+    exit_with(crate::claude_oauth_login::login(&config).await);
+}
+
 pub async fn run_login_status(
     cli_config_overrides: CliConfigOverrides,
     provider: Option<LoginProvider>,
@@ -512,13 +519,19 @@ pub async fn run_login_status(
             eprintln!("{message}");
             std::process::exit(if connected { 0 } else { 1 });
         }
+        Some(LoginProvider::ClaudeOauth) => {
+            let (connected, message) = crate::claude_oauth_login::status(&config);
+            eprintln!("{message}");
+            std::process::exit(if connected { 0 } else { 1 });
+        }
         Some(LoginProvider::All) => {
             let (openai_ok, openai) = openai_login_status(&config).await;
             let (anthropic_ok, anthropic) = crate::claude_login::anthropic_status(&config);
             let (claude_code_ok, claude_code) =
                 crate::claude_login::claude_code_status(&config).await;
-            eprintln!("OpenAI: {openai}\n{anthropic}\n{claude_code}");
-            let any = openai_ok || anthropic_ok || claude_code_ok;
+            let (claude_oauth_ok, claude_oauth) = crate::claude_oauth_login::status(&config);
+            eprintln!("OpenAI: {openai}\n{anthropic}\n{claude_code}\n{claude_oauth}");
+            let any = openai_ok || anthropic_ok || claude_code_ok || claude_oauth_ok;
             std::process::exit(if any { 0 } else { 1 });
         }
         Some(LoginProvider::Openai) | None => {}
@@ -531,6 +544,10 @@ pub async fn run_login_status(
     let (anthropic_ok, anthropic) = crate::claude_login::anthropic_status(&config);
     if anthropic_ok {
         eprintln!("{anthropic}");
+    }
+    let (claude_oauth_ok, claude_oauth) = crate::claude_oauth_login::status(&config);
+    if claude_oauth_ok {
+        eprintln!("{claude_oauth}");
     }
     if config
         .codex_home
@@ -602,10 +619,14 @@ pub async fn run_logout(
         Some(LoginProvider::ClaudeCode) => {
             exit_with(crate::claude_login::logout_claude_code(&config));
         }
+        Some(LoginProvider::ClaudeOauth) => {
+            exit_with(crate::claude_oauth_login::logout(&config));
+        }
         Some(LoginProvider::All) => {
             for result in [
                 crate::claude_login::logout_anthropic(&config),
                 crate::claude_login::logout_claude_code(&config),
+                crate::claude_oauth_login::logout(&config),
             ] {
                 match result {
                     Ok(message) => eprintln!("{message}"),

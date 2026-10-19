@@ -1588,7 +1588,7 @@ impl LocalAgentControl {
 fn mark_mixed_provider_resume(config: &mut Config, stored_model_provider: &str) {
     let parent_runs_claude = matches!(
         config.model_provider.wire_api,
-        WireApi::AnthropicMessages | WireApi::ClaudeCode
+        WireApi::AnthropicMessages | WireApi::ClaudeCode | WireApi::ClaudeOAuth
     );
     if parent_runs_claude || config.model_provider_id != stored_model_provider {
         config.plaintext_collaboration_messages = true;

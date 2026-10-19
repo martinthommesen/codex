@@ -231,6 +231,8 @@ struct ModelClientState {
     last_inference_tools: StdMutex<Option<Arc<[ToolSpec]>>>,
     /// Warnings about unsupported settings already shown for Claude providers.
     claude_warnings_emitted: anthropic_messages::ClaudeWarningsEmitted,
+    /// Successfully completed OAuth responses for this account and Codex conversation only.
+    claude_oauth_continuity: anthropic_messages::ClaudeOAuthContinuityState,
     /// Claude Code CLI process bridge, created on first use by the `claude-code` provider.
     claude_code_session: OnceLock<Arc<codex_claude_code::ClaudeCodeSession>>,
 }
@@ -613,6 +615,7 @@ impl ModelClient {
                 cached_websocket_session: StdMutex::new(WebsocketSession::default()),
                 last_inference_tools: StdMutex::new(None),
                 claude_warnings_emitted: StdMutex::new(HashSet::new()),
+                claude_oauth_continuity: anthropic_messages::ClaudeOAuthContinuityState::default(),
                 claude_code_session: OnceLock::new(),
             }),
             agent_identity_policy,
@@ -2438,7 +2441,7 @@ impl ModelClientSession {
                     )
                     .await
             }
-            WireApi::AnthropicMessages => {
+            WireApi::AnthropicMessages | WireApi::ClaudeOAuth => {
                 self.stream_anthropic_messages(
                     prompt,
                     model_info,

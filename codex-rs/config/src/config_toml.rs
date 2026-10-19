@@ -35,6 +35,7 @@ use crate::types::WindowsToml;
 use codex_features::FeaturesToml;
 use codex_model_provider_info::AMAZON_BEDROCK_PROVIDER_ID;
 use codex_model_provider_info::AMAZON_BEDROCK_RUNTIME_PROVIDER_ID;
+use codex_model_provider_info::CLAUDE_OAUTH_PROVIDER_ID;
 use codex_model_provider_info::LEGACY_OLLAMA_CHAT_PROVIDER_ID;
 use codex_model_provider_info::LMSTUDIO_OSS_PROVIDER_ID;
 use codex_model_provider_info::ModelProviderInfo;
@@ -963,6 +964,12 @@ pub fn validate_model_providers(
             provider
                 .validate_bedrock_override()
                 .map_err(|message| format!("model_providers.{key} {message}"))?;
+        } else if key == CLAUDE_OAUTH_PROVIDER_ID {
+            // This is a restricted partial built-in override, not a custom provider. Validate
+            // its allowed fields before merging the built-in name, wire API and fixed origin.
+            provider
+                .validate_claude_oauth_override()
+                .map_err(|message| format!("model_providers.{key} {message}"))?;
         } else {
             if provider.aws.is_some() {
                 return Err(format!(
@@ -1018,6 +1025,48 @@ pub fn validate_oss_provider(provider: &str) -> std::io::Result<()> {
 mod tests {
     use super::*;
     use pretty_assertions::assert_eq;
+
+    #[test]
+    fn claude_oauth_partial_override_does_not_require_a_custom_provider_name() {
+        let config: ConfigToml = toml::from_str(
+            "[model_providers.claude-oauth]\nrequest_max_retries = 2\nstream_idle_timeout_ms = 5000",
+        ).expect("restricted built-in override");
+        let provider = &config.model_providers[CLAUDE_OAUTH_PROVIDER_ID];
+        assert!(
+            provider.name.is_empty(),
+            "the name is supplied when the built-in is merged"
+        );
+        assert_eq!(provider.request_max_retries, Some(2));
+        assert_eq!(provider.stream_idle_timeout_ms, Some(5000));
+    }
+
+    #[test]
+    fn claude_oauth_partial_override_still_rejects_endpoint_and_credential_changes() {
+        for unsupported in [
+            "base_url = 'https://proxy.invalid/v1'",
+            "env_key = 'ANTHROPIC_API_KEY'",
+            "experimental_bearer_token = 'other-credential'",
+            "http_headers = { authorization = 'other-credential' }",
+        ] {
+            let error = toml::from_str::<ConfigToml>(&format!(
+                "[model_providers.claude-oauth]\n{unsupported}",
+            ))
+            .expect_err("OAuth transport settings cannot be redirected or replaced");
+            assert!(
+                error
+                    .to_string()
+                    .contains("Claude OAuth credentials and endpoint cannot be overridden")
+            );
+        }
+        let error =
+            toml::from_str::<ConfigToml>("[model_providers.custom]\nrequest_max_retries = 2")
+                .expect_err("custom providers still require a name");
+        assert!(
+            error
+                .to_string()
+                .contains("provider name must not be empty")
+        );
+    }
 
     const WORKSPACE_ID_A: &str = "123e4567-e89b-42d3-a456-426614174000";
     const WORKSPACE_ID_B: &str = "123e4567-e89b-42d3-a456-426614174001";

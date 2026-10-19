@@ -919,3 +919,136 @@ fn anthropic_provider_without_base_url_targets_the_anthropic_api() {
         "https://api.openai.com/v1"
     );
 }
+
+#[test]
+fn claude_oauth_is_explicit_experimental_and_origin_pinned() {
+    let providers = built_in_model_providers(None);
+    let provider = &providers[CLAUDE_OAUTH_PROVIDER_ID];
+    assert!(provider.is_claude_oauth());
+    assert!(provider.wire_api.is_claude());
+    assert!(provider.name.contains("experimental"));
+    assert!(!provider.requires_openai_auth);
+    assert!(!provider.supports_websockets);
+    assert!(provider.validate().is_ok());
+    assert_eq!(WireApi::ClaudeOAuth.to_string(), "claude_oauth");
+    let parsed: ModelProviderInfo =
+        toml::from_str("wire_api = \"claude_oauth\"").expect("wire API");
+    assert_eq!(parsed.wire_api, WireApi::ClaudeOAuth);
+    for auth in [None, Some(AuthMode::ApiKey), Some(AuthMode::Chatgpt)] {
+        assert_eq!(
+            provider.to_api_provider(auth).expect("provider").base_url,
+            ANTHROPIC_DEFAULT_BASE_URL
+        );
+        let without_base_url = ModelProviderInfo {
+            base_url: None,
+            ..provider.clone()
+        };
+        assert_eq!(
+            without_base_url
+                .to_api_provider(auth)
+                .expect("provider")
+                .base_url,
+            ANTHROPIC_DEFAULT_BASE_URL
+        );
+    }
+    for base_url in [
+        "http://api.anthropic.com/v1",
+        "https://proxy.example/v1",
+        "https://api.anthropic.com.evil/v1",
+        "https://api.anthropic.com/v1?key=secret",
+    ] {
+        let custom = ModelProviderInfo {
+            base_url: Some(base_url.to_string()),
+            ..provider.clone()
+        };
+        assert!(
+            custom
+                .validate()
+                .expect_err("unsafe origin")
+                .contains("base_url")
+        );
+    }
+}
+
+#[test]
+fn claude_oauth_rejects_other_provider_credentials_and_header_overrides() {
+    let provider = ModelProviderInfo::create_claude_oauth_provider();
+    let credentials = [
+        ModelProviderInfo {
+            env_key: Some("ANTHROPIC_API_KEY".to_string()),
+            ..provider.clone()
+        },
+        ModelProviderInfo {
+            experimental_bearer_token: Some("key".into()),
+            ..provider.clone()
+        },
+        ModelProviderInfo {
+            http_headers: Some(HashMap::from([("x-api-key".to_string(), "key".into())])),
+            ..provider.clone()
+        },
+        ModelProviderInfo {
+            env_http_headers: Some(HashMap::from([(
+                "authorization".to_string(),
+                "TOKEN".to_string(),
+            )])),
+            ..provider.clone()
+        },
+        ModelProviderInfo {
+            requires_openai_auth: true,
+            ..provider.clone()
+        },
+        ModelProviderInfo {
+            query_params: Some(HashMap::from([("redirect".to_string(), "evil".into())])),
+            ..provider
+        },
+    ];
+    for custom in credentials {
+        assert!(custom.validate().is_err());
+    }
+}
+
+#[test]
+fn claude_oauth_builtin_override_accepts_only_retry_and_timeout_tuning() {
+    let base = built_in_model_providers(None);
+    let override_provider = ModelProviderInfo {
+        request_max_retries: Some(2),
+        stream_max_retries: Some(3),
+        stream_idle_timeout_ms: Some(5000),
+        ..ModelProviderInfo::default()
+    };
+    let merged = merge_configured_model_providers(
+        base.clone(),
+        HashMap::from([(CLAUDE_OAUTH_PROVIDER_ID.to_string(), override_provider)]),
+    )
+    .expect("safe override");
+    let provider = &merged[CLAUDE_OAUTH_PROVIDER_ID];
+    assert!(provider.is_claude_oauth());
+    assert_eq!(
+        provider.base_url.as_deref(),
+        Some(ANTHROPIC_DEFAULT_BASE_URL)
+    );
+    assert_eq!(provider.request_max_retries, Some(2));
+    assert_eq!(provider.stream_max_retries, Some(3));
+    assert_eq!(provider.stream_idle_timeout_ms, Some(5000));
+    for custom in [
+        ModelProviderInfo {
+            base_url: Some("https://proxy.example/v1".to_string()),
+            ..ModelProviderInfo::default()
+        },
+        ModelProviderInfo {
+            env_key: Some("TOKEN".to_string()),
+            ..ModelProviderInfo::default()
+        },
+        ModelProviderInfo {
+            http_headers: Some(HashMap::from([("x-api-key".to_string(), "key".into())])),
+            ..ModelProviderInfo::default()
+        },
+    ] {
+        let error = merge_configured_model_providers(
+            base.clone(),
+            HashMap::from([(CLAUDE_OAUTH_PROVIDER_ID.to_string(), custom)]),
+        )
+        .expect_err("unsafe override");
+        assert!(error.contains("Claude OAuth credentials and endpoint cannot be overridden"));
+    }
+}

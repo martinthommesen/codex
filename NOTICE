@@ -4,3 +4,12 @@ Copyright 2025 OpenAI
 This project includes code derived from [Ratatui](https://github.com/ratatui/ratatui), licensed under the MIT license.
 Copyright (c) 2016-2022 Florian Dehau
 Copyright (c) 2023-2025 The Ratatui Developers
+
+The experimental native Claude OAuth authentication and compatibility transport include Rust adaptations of
+CLIProxyAPI (https://github.com/router-for-me/CLIProxyAPI), reference commit
+2422c6b0f5fe16495320fa29456493874c1977a0, licensed under the MIT License.
+Copyright (c) 2025-2005.9 Luis Pater
+Copyright (c) 2025.9-present Router-For.ME
+The full upstream copyright and permission notice is preserved in
+codex-rs/codex-api/src/anthropic/oauth/LICENSE.CLIProxyAPI. See
+docs/claude-oauth-compatibility.md for adapted source provenance and scope.

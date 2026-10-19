@@ -14,6 +14,7 @@ use codex_model_provider::claude_model_catalog;
 use codex_model_provider::create_model_provider;
 use codex_model_provider_info::ANTHROPIC_PROVIDER_ID;
 use codex_model_provider_info::CLAUDE_CODE_PROVIDER_ID;
+use codex_model_provider_info::CLAUDE_OAUTH_PROVIDER_ID;
 use codex_model_provider_info::ModelProviderInfo;
 use codex_model_provider_info::OPENAI_PROVIDER_ID;
 use codex_model_provider_info::WireApi;
@@ -108,6 +109,26 @@ pub(crate) fn provider_connection(
     auth_manager: Option<&AuthManager>,
     codex_home: &std::path::Path,
 ) -> ProviderConnection {
+    // OAuth never inherits generic API-key, command, or bearer settings, even if an invalid
+    // programmatic configuration reaches this read-only discovery path.
+    if provider.is_claude_oauth() {
+        let connected = provider.validate().is_ok()
+            && auth_manager.is_some_and(|manager| {
+                manager
+                    .claude_oauth_auth_config()
+                    .load_stored_credential()
+                    .ok()
+                    .flatten()
+                    .is_some()
+            });
+        return if connected {
+            ProviderConnection::Connected
+        } else {
+            ProviderConnection::NotConnected {
+                remedy: "sign in explicitly with `codex login --provider claude-oauth` (experimental native OAuth)".to_string(),
+            }
+        };
+    }
     // A configured `env_key` is the only key the provider will send, so it alone decides.
     if let Some(var) = provider.env_key.as_deref() {
         let present = std::env::var(var)
@@ -156,6 +177,7 @@ uses the official claude CLI and its own sign-in)"
                 }
             }
         }
+        WireApi::ClaudeOAuth => unreachable!("Claude OAuth connection checked before generic auth"),
         WireApi::Responses => {
             if !provider.requires_openai_auth
                 || auth_manager.is_some_and(|manager| manager.auth_cached().is_some())
@@ -184,7 +206,7 @@ pub(crate) struct SpawnProviderOption {
 const MAX_MODELS_PER_PROVIDER: usize = 5;
 
 /// Lists the providers an agent may delegate to: the current one plus every other built-in
-/// provider (OpenAI, Anthropic API, Claude Code) that is currently connected.
+/// provider (OpenAI, Anthropic API, Claude Code, experimental Claude OAuth) that is currently connected.
 pub(crate) fn spawn_provider_options(
     config: &Config,
     auth_manager: Option<&AuthManager>,
@@ -202,6 +224,7 @@ pub(crate) fn spawn_provider_options(
         OPENAI_PROVIDER_ID,
         ANTHROPIC_PROVIDER_ID,
         CLAUDE_CODE_PROVIDER_ID,
+        CLAUDE_OAUTH_PROVIDER_ID,
     ] {
         if candidate == current_id {
             continue;
@@ -215,7 +238,7 @@ pub(crate) fn spawn_provider_options(
             continue;
         }
         let models = match provider.wire_api {
-            WireApi::AnthropicMessages | WireApi::ClaudeCode => {
+            WireApi::AnthropicMessages | WireApi::ClaudeCode | WireApi::ClaudeOAuth => {
                 let catalog = claude_model_catalog();
                 let mut models = catalog.models;
                 models.sort_by_key(|model| model.priority);
@@ -262,6 +285,11 @@ fn provider_description(provider_id: &str, provider: &ModelProviderInfo) -> Stri
         WireApi::AnthropicMessages => format!("{provider_id}: Claude models via the Anthropic API"),
         WireApi::ClaudeCode => {
             format!("{provider_id}: Claude models via the Claude Code CLI and its own sign-in")
+        }
+        WireApi::ClaudeOAuth => {
+            format!(
+                "{provider_id}: Claude models via experimental native OAuth; quota treatment unverified"
+            )
         }
         WireApi::Responses => format!("{provider_id}: {}", provider.name),
     }

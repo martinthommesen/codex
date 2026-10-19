@@ -1,4 +1,4 @@
-//! Static Claude model catalog shared by the Anthropic API and Claude Code providers.
+//! Static Claude model catalog shared by the Anthropic API, Claude Code and Claude OAuth providers.
 
 use codex_api::anthropic::ClaudeModelTraits;
 use codex_models_manager::model_info::BASE_INSTRUCTIONS;

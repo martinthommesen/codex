@@ -136,6 +136,10 @@ async fn claude_providers_serve_the_claude_catalog() {
         Box::new(ClaudeCodeModelProvider::new(
             ModelProviderInfo::create_claude_code_provider(),
         )),
+        Box::new(ClaudeOAuthModelProvider::new(
+            ModelProviderInfo::create_claude_oauth_provider(),
+            None,
+        )),
     ];
     for provider in &providers {
         for config_model_catalog in [None, Some(openai_catalog.clone())] {

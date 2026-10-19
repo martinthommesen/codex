@@ -1,8 +1,8 @@
 //! `codex login` / `codex logout` / `codex login status` support for Claude providers.
 //!
 //! Claude credentials are kept apart from ChatGPT credentials: the Anthropic API key lives in its
-//! own Codex store, and Claude Code (subscription) sign-in stays inside the official `claude`
-//! CLI. Nothing here reads, writes, or invalidates ChatGPT/OpenAI credentials.
+//! own Codex store, Claude OAuth has its own encrypted store, and Claude Code sign-in stays
+//! inside the official `claude` CLI. Nothing here invalidates another provider's credentials.
 
 use std::path::Path;
 use std::path::PathBuf;
@@ -30,7 +30,9 @@ pub enum LoginProvider {
     Anthropic,
     /// The official Claude Code CLI with its own sign-in (for example a Claude subscription).
     ClaudeCode,
-    /// Every provider (logout only).
+    /// Experimental native Claude subscription OAuth; unofficial, quota treatment unverified.
+    ClaudeOauth,
+    /// Every provider (status and logout only).
     All,
 }
 

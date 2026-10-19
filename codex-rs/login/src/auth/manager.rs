@@ -2977,6 +2977,16 @@ impl AuthManager {
         )
     }
 
+    /// Returns the isolated experimental Claude OAuth store with this manager's storage settings.
+    /// OpenAI and API-key login, refresh, and logout never modify these credentials.
+    pub fn claude_oauth_auth_config(&self) -> super::claude_oauth::ClaudeOAuthAuthConfig {
+        super::claude_oauth::ClaudeOAuthAuthConfig::new(
+            self.codex_home.clone(),
+            self.auth_credentials_store_mode,
+            self.keyring_backend_kind,
+        )
+    }
+
     /// Log out by deleting credentials from the selected storage backend and the
     /// ephemeral store. Returns `Ok(true)` if credentials were removed, `Ok(false)`
     /// if none were present. On success, reloads the in-memory auth cache so

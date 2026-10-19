@@ -199,6 +199,7 @@ pub fn compute_keyring_account(codex_home: &Path, namespace: LocalSecretsNamespa
     match namespace {
         LocalSecretsNamespace::GatewayOAuth => format!("{home_account}|gateway-oauth"),
         LocalSecretsNamespace::AnthropicAuth => format!("{home_account}|anthropic-auth"),
+        LocalSecretsNamespace::ClaudeOAuth => format!("{home_account}|claude-oauth"),
         LocalSecretsNamespace::ManagedSecrets
         | LocalSecretsNamespace::CodexAuth
         | LocalSecretsNamespace::McpOAuth => home_account,
@@ -242,6 +243,7 @@ mod tests {
             LocalSecretsNamespace::McpOAuth,
             LocalSecretsNamespace::GatewayOAuth,
             LocalSecretsNamespace::AnthropicAuth,
+            LocalSecretsNamespace::ClaudeOAuth,
         ]
         .map(|namespace| compute_keyring_account(&codex_home, namespace));
 
@@ -254,6 +256,7 @@ mod tests {
                 home_account.clone(),
                 format!("{home_account}|gateway-oauth"),
                 format!("{home_account}|anthropic-auth"),
+                format!("{home_account}|claude-oauth"),
             ]
         );
     }

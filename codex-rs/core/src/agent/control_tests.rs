@@ -6119,3 +6119,115 @@ async fn resume_agent_from_rollout_skips_descendants_when_parent_resume_fails() 
         .await
         .expect("tree shutdown after partial subtree resume should succeed");
 }
+
+#[test_case::test_case("openai", "claude-oauth"; "OpenAI sender resumes OAuth child")]
+#[test_case::test_case("anthropic", "claude-oauth"; "API key sender resumes OAuth child")]
+#[test_case::test_case("claude-code", "claude-oauth"; "CLI sender resumes OAuth child")]
+#[test_case::test_case("claude-oauth", "openai"; "OAuth sender resumes OpenAI child")]
+#[test_case::test_case("claude-oauth", "anthropic"; "OAuth sender resumes API key child")]
+#[test_case::test_case("claude-oauth", "claude-code"; "OAuth sender resumes CLI child")]
+fn mixed_oauth_resume_preserves_stored_provider_model_and_codex_permissions(
+    sender_provider: &'static str,
+    stored_provider: &'static str,
+) -> anyhow::Result<()> {
+    // Session construction and cold resume carry large futures in debug builds. Use the
+    // existing integration-test stack harness for this complete persistence lifecycle.
+    core_test_support::test_codex::run_test_with_large_stack(
+        "mixed_oauth_resume",
+        move || async move {
+            let (home, mut config) = test_config().await;
+            config.model_provider_id = stored_provider.to_string();
+            config.model_provider = config.model_providers[stored_provider].clone();
+            let stored_model = if config.model_provider.wire_api.is_claude() {
+                "claude-opus-5-5"
+            } else {
+                "gpt-5.5"
+            };
+            config.model = Some(stored_model.to_string());
+            let harness = AgentControlHarness::new_with_config(home, config).await;
+            let (thread_id, thread) = harness.start_thread().await;
+            // No inference occurs: write a durable history marker directly through the ordinary store.
+            const HISTORY_MARKER: &str = "history before a mixed-provider resume";
+            persist_thread_for_tree_resume(&thread, HISTORY_MARKER).await;
+            // Recording assigns a real item ID before persistence. Compare the resumed item to
+            // that recorded snapshot, rather than to the id-less input passed to injection.
+            let persisted_marker = thread
+                .session
+                .clone_history()
+                .await
+                .raw_items()
+                .find(|item| {
+                    matches!(item, ResponseItem::Message { role, content, .. }
+                    if role == "user"
+                        && matches!(content.as_slice(), [ContentItem::InputText { text }]
+                            if text == HISTORY_MARKER))
+                })
+                .cloned()
+                .expect("injected history marker was recorded");
+            assert!(
+                persisted_marker.id().is_some(),
+                "history recording assigns an item ID"
+            );
+            harness
+                .control
+                .shutdown_live_agent(thread_id)
+                .await
+                .expect("unload stored session");
+            let mut sender = harness.config.clone();
+            sender.model_provider_id = sender_provider.to_string();
+            sender.model_provider = sender.model_providers[sender_provider].clone();
+            sender.model = Some(if sender.model_provider.wire_api.is_claude() {
+                "claude-sonnet-5-5".to_string()
+            } else {
+                "gpt-5.6-luna".to_string()
+            });
+            let approval_policy = sender.permissions.approval_policy.value();
+            let permission_profile = sender.permissions.permission_profile().clone();
+            harness
+                .control
+                .resume_agent_from_rollout(sender, thread_id, SessionSource::Exec)
+                .await
+                .expect("resume using original provider");
+            let resumed = harness
+                .manager
+                .get_thread(thread_id)
+                .await
+                .expect("resumed thread");
+            let snapshot = resumed.config_snapshot().await;
+            assert_eq!(snapshot.model_provider_id, stored_provider);
+            assert_eq!(snapshot.model, stored_model);
+            let turn = resumed.session.new_default_turn().await;
+            assert_eq!(turn.provider.info(), &harness.config.model_provider);
+            assert!(turn.config.plaintext_collaboration_messages);
+            assert_eq!(
+                turn.config.permissions.approval_policy.value(),
+                approval_policy
+            );
+            assert_eq!(
+                turn.config.permissions.permission_profile(),
+                &permission_profile
+            );
+            if stored_provider == "claude-oauth" {
+                assert!(
+                    turn.provider.auth_manager().is_none(),
+                    "OAuth must not inherit sender authentication"
+                );
+            }
+            assert!(
+                resumed
+                    .session
+                    .clone_history()
+                    .await
+                    .raw_items()
+                    .any(|item| item == &persisted_marker),
+                "resuming must preserve the complete recorded user item, including its assigned ID"
+            );
+            harness
+                .control
+                .shutdown_live_agent(thread_id)
+                .await
+                .expect("close resumed session");
+            Ok(())
+        },
+    )
+}

@@ -388,3 +388,197 @@ async fn spawned_stream_reports_early_close() {
     }
     assert!(matches!(last, Some(Err(ApiError::Stream(_)))));
 }
+
+#[derive(Default)]
+struct RecordingSseTelemetry {
+    polls: std::sync::Mutex<Vec<String>>,
+}
+
+impl SseTelemetry for RecordingSseTelemetry {
+    fn on_sse_poll(&self, result: &SsePollResult, _duration: Duration) {
+        self.polls
+            .lock()
+            .expect("telemetry lock")
+            .push(format!("{result:?}"));
+    }
+}
+
+fn oauth_stream(bytes: ByteStream, telemetry: Option<Arc<dyn SseTelemetry>>) -> ResponseStream {
+    spawn_claude_oauth_stream(
+        StreamResponse {
+            status: http::StatusCode::OK,
+            headers: http::HeaderMap::new(),
+            bytes,
+        },
+        Duration::from_secs(5),
+        AnthropicToolNameMap::default(),
+        telemetry,
+        Vec::new(),
+    )
+}
+
+#[tokio::test]
+async fn oauth_stream_transport_errors_are_redacted_before_telemetry_and_user_output() {
+    let telemetry = Arc::new(RecordingSseTelemetry::default());
+    let bytes: ByteStream = Box::pin(stream::iter(vec![Err(
+        codex_client::TransportError::Network(
+            "Authorization: Bearer secret-access-token; code=secret-authorization-code".into(),
+        ),
+    )]));
+    let mut response = oauth_stream(bytes, Some(telemetry.clone()));
+    let error = response
+        .next()
+        .await
+        .expect("stream error")
+        .expect_err("transport failed");
+    assert!(!error.to_string().contains("secret-"));
+    assert!(!format!("{error:?}").contains("secret-"));
+    let polls = telemetry.polls.lock().expect("telemetry lock");
+    assert_eq!(polls.len(), 1);
+    assert!(!polls[0].contains("secret-"));
+    assert!(polls[0].contains("Err"));
+}
+
+#[test]
+fn oauth_telemetry_never_receives_raw_event_names_ids_or_payloads() {
+    let telemetry = RecordingSseTelemetry::default();
+    for event_name in ["response.failed", "secret-access-token", "message_start"] {
+        let poll = Ok(Some(Ok(eventsource_stream::Event {
+            event: event_name.to_string(),
+            data: "secret-authorization-code".to_string(),
+            id: "secret-refresh-token".to_string(),
+            retry: None,
+        })));
+        record_oauth_sse_poll(&telemetry, &poll, Duration::from_millis(1));
+    }
+    let polls = telemetry.polls.lock().expect("telemetry lock");
+    assert_eq!(polls.len(), 3);
+    assert!(polls.iter().all(|poll| !poll.contains("secret-")));
+    assert!(polls[0].contains("unknown"));
+    assert!(polls[2].contains("message_start"));
+}
+
+#[tokio::test]
+async fn oauth_telemetry_redaction_preserves_streamed_model_text() {
+    let body = [
+        json!({"type":"message_start","message":{"id":"msg_1"}}),
+        json!({"type":"content_block_start","index":0,"content_block":{"type":"text","text":"model output stays intact"}}),
+        json!({"type":"content_block_stop","index":0}),
+        json!({"type":"message_delta","delta":{"stop_reason":"end_turn"}}),
+        json!({"type":"message_stop"}),
+    ]
+    .into_iter()
+    .map(|event| format!("data: {event}\n\n"))
+    .collect::<String>();
+    let telemetry = Arc::new(RecordingSseTelemetry::default());
+    let bytes: ByteStream = Box::pin(stream::iter(vec![Ok(Bytes::from(body))]));
+    let mut response = oauth_stream(bytes, Some(telemetry.clone()));
+    let mut text = String::new();
+    let mut completed = false;
+    while let Some(event) = response.next().await {
+        match event.expect("valid response") {
+            ResponseEvent::OutputTextDelta(delta) => text.push_str(&delta),
+            ResponseEvent::Completed { .. } => completed = true,
+            _ => {}
+        }
+    }
+    assert_eq!(text, "model output stays intact");
+    assert!(completed);
+    assert!(
+        telemetry
+            .polls
+            .lock()
+            .expect("telemetry lock")
+            .iter()
+            .all(|poll| !poll.contains(&text))
+    );
+}
+
+#[tokio::test]
+async fn oauth_stream_redaction_preserves_thinking_context_and_rate_limit_errors() {
+    for (kind, message) in [
+        (
+            "invalid_request_error",
+            "Invalid thinking block signature: secret-access-token",
+        ),
+        (
+            "invalid_request_error",
+            "prompt is too long: secret-access-token",
+        ),
+        ("rate_limit_error", "secret-access-token"),
+        ("billing_error", "secret-access-token"),
+        ("secret-kind", "secret-access-token"),
+    ] {
+        let body = format!(
+            "event: error\ndata: {}\n\n",
+            json!({"type":"error","error":{"type":kind,"message":message}})
+        );
+        let telemetry = Arc::new(RecordingSseTelemetry::default());
+        let bytes: ByteStream = Box::pin(stream::iter(vec![Ok(Bytes::from(body))]));
+        let mut response = oauth_stream(bytes, Some(telemetry.clone()));
+        let error = response
+            .next()
+            .await
+            .expect("stream error")
+            .expect_err("upstream error");
+        assert!(!error.to_string().contains("secret-"));
+        assert!(!format!("{error:?}").contains("secret-"));
+        if message.starts_with("Invalid thinking") {
+            assert!(crate::anthropic::is_thinking_replay_rejection(&error));
+        } else if message.starts_with("prompt is too long") {
+            assert!(matches!(error, ApiError::ContextWindowExceeded));
+        } else if kind == "rate_limit_error" {
+            assert!(matches!(error, ApiError::RateLimitExceeded { .. }));
+        } else if kind == "billing_error" {
+            assert!(error.to_string().contains("billing or entitlement"));
+        }
+        assert!(
+            telemetry
+                .polls
+                .lock()
+                .expect("telemetry lock")
+                .iter()
+                .all(|poll| !poll.contains("secret-"))
+        );
+    }
+}
+
+#[tokio::test]
+async fn oauth_stream_redaction_keeps_network_policy_errors_structured() {
+    let bytes: ByteStream = Box::pin(stream::iter(vec![Err(
+        codex_client::TransportError::Policy(codex_http_client::NetworkPolicyDenied::Revoked),
+    )]));
+    let mut response = oauth_stream(bytes, None);
+    assert!(matches!(
+        response.next().await,
+        Some(Err(ApiError::Transport(
+            codex_client::TransportError::Policy(codex_http_client::NetworkPolicyDenied::Revoked)
+        )))
+    ));
+}
+
+#[tokio::test]
+async fn oauth_refusal_diagnostics_withhold_opaque_explanations() {
+    for category in ["bio", "cyber", "secret-category"] {
+        let body = [
+            json!({"type":"message_delta","delta":{"stop_reason":"refusal","stop_details":{"category":category,"explanation":"secret-access-token"}}}),
+            json!({"type":"message_stop"}),
+        ]
+        .into_iter()
+        .map(|event| format!("data: {event}\n\n"))
+        .collect::<String>();
+        let bytes: ByteStream = Box::pin(stream::iter(vec![Ok(Bytes::from(body))]));
+        let mut response = oauth_stream(bytes, None);
+        let error = response
+            .next()
+            .await
+            .expect("refusal")
+            .expect_err("refused");
+        assert!(!error.to_string().contains("secret-"));
+        if category == "bio" {
+            assert!(matches!(error, ApiError::BioPolicy { .. }));
+        } else if category == "cyber" {
+            assert!(matches!(error, ApiError::CyberPolicy { .. }));
+        }
+    }
+}
