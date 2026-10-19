@@ -324,11 +324,13 @@ fn push_tool(
     description: String,
     input_schema: Value,
 ) {
-    let wire = translated.names.register(namespace, name, kind);
+    let wire = anthropic_wire_tool_name(namespace, name);
     if !seen.insert(wire.clone()) {
-        // Duplicate declarations (for example from history-supplied tools) keep the first.
+        // Duplicate or colliding declarations (for example `a__b` and namespace `a` with `b`)
+        // keep the first declaration for both the advertised schema and the routing target.
         return;
     }
+    translated.names.register(namespace, name, kind);
     translated.tools.push(AnthropicTool {
         name: wire,
         description,

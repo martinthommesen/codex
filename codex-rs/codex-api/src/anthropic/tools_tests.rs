@@ -182,3 +182,47 @@ fn top_level_schema_composition_is_flattened_and_reported() {
     assert_eq!(translated.unsupported.len(), 1);
     assert!(translated.unsupported[0].contains("`fetch`"));
 }
+
+#[test]
+fn colliding_declarations_keep_the_first_schema_and_target() {
+    let top_level = json!({
+        "type": "function",
+        "name": "alpha__beta",
+        "description": "top level",
+        "parameters": {"type": "object", "properties": {"first": {"type": "string"}}}
+    });
+    let namespaced = json!({
+        "type": "namespace",
+        "name": "alpha",
+        "description": "",
+        "tools": [{
+            "type": "function",
+            "name": "beta",
+            "description": "namespaced",
+            "parameters": {"type": "object", "properties": {"second": {"type": "string"}}}
+        }]
+    });
+
+    for (declarations, property, namespace, name) in [
+        (
+            vec![top_level.clone(), namespaced.clone()],
+            "first",
+            None,
+            "alpha__beta",
+        ),
+        (vec![namespaced, top_level], "second", Some("alpha"), "beta"),
+    ] {
+        let translated = translate_tools(&declarations);
+        assert_eq!(translated.tools.len(), 1);
+        assert_eq!(translated.tools[0].name, "alpha__beta");
+        assert!(translated.tools[0].input_schema["properties"][property].is_object());
+        assert_eq!(
+            translated.names.resolve("alpha__beta"),
+            AnthropicToolTarget {
+                name: name.to_string(),
+                namespace: namespace.map(str::to_string),
+                kind: AnthropicToolKind::Function,
+            }
+        );
+    }
+}

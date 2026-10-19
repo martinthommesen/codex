@@ -13,6 +13,7 @@ use codex_uds::UnixListener;
 use serde_json::Value;
 use serde_json::json;
 use std::collections::BTreeMap;
+use std::io::ErrorKind;
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -526,13 +527,27 @@ fn private_socket_dir() -> PathBuf {
     candidate
 }
 
+/// Access control is the private socket directory (0700, or a user-only DACL on Windows). There
+/// is deliberately no `ensure_non_elevated_peer` check: it rejects every peer when Codex runs
+/// elevated, and a connection can only park calls, never make Codex run a tool.
 async fn accept_loop(mut listener: UnixListener, core: Arc<BridgeCore>) {
     loop {
         match listener.accept().await {
             Ok(stream) => core.spawn_connection(stream),
+            // The bridge serves every Claude Code process of the session, so keep accepting.
+            Err(err)
+                if matches!(
+                    err.kind(),
+                    ErrorKind::ConnectionAborted
+                        | ErrorKind::ConnectionReset
+                        | ErrorKind::Interrupted
+                ) =>
+            {
+                debug!(error = %err, "recoverable Codex tool bridge accept error");
+            }
             Err(err) => {
-                warn!(error = %err, "Codex tool bridge stopped accepting connections");
-                return;
+                warn!(error = %err, "Codex tool bridge accept error");
+                tokio::time::sleep(Duration::from_secs(1)).await;
             }
         }
     }
