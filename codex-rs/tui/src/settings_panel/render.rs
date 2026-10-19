@@ -38,7 +38,7 @@ fn value_label(status: SwitchStatus) -> String {
         SwitchState::Off => "[ ] Off",
         SwitchState::Partial => "[-] Partial",
     };
-    if status.managed() {
+    if status.managed {
         format!("{label} · managed")
     } else {
         label.to_string()

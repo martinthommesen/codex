@@ -3097,6 +3097,89 @@ async fn disabled_extension_registers_no_skill_tools_or_cloud_discovery() -> Tes
     Ok(())
 }
 
+#[tokio::test]
+async fn disabled_extension_warns_when_a_skill_is_selected() -> TestResult {
+    let (event_tx, event_rx) = std::sync::mpsc::channel();
+    let mut builder =
+        ExtensionRegistryBuilder::with_event_sink(Arc::new(ChannelEventSink(event_tx)));
+    install_with_providers(
+        &mut builder,
+        SkillProviders::new(),
+        |config: &TestConfig| SkillsExtensionConfig {
+            enabled: false,
+            ..skills_extension_config(config)
+        },
+    );
+    let registry = builder.build();
+    let session_store = ExtensionData::new("session");
+    let thread_store = ExtensionData::new("thread");
+    registry.thread_lifecycle_contributors()[0]
+        .on_thread_start(ThreadStartInput {
+            config: &default_config(),
+            session_source: &SessionSource::Cli,
+            persistent_thread_state_available: true,
+            environments: &[],
+            mcp_resource_client: None,
+            extension_metrics: None,
+            session_store: &session_store,
+            thread_store: &thread_store,
+        })
+        .await;
+
+    for (user_input, expect_warning) in [
+        (
+            UserInput::Text {
+                text: "$lint-fix".to_string(),
+                text_elements: Vec::new(),
+            },
+            false,
+        ),
+        (
+            UserInput::Skill {
+                name: "lint-fix".to_string(),
+                path: PathBuf::from("/skills/lint-fix/SKILL.md"),
+            },
+            true,
+        ),
+    ] {
+        let turn_store = ExtensionData::new("turn-1");
+        let fragments = registry.turn_input_contributors()[0]
+            .contribute(
+                TurnInputContext {
+                    turn_id: "turn-1".to_string(),
+                    user_input: vec![user_input],
+                    environments: Vec::new(),
+                },
+                /*extension_metrics*/ None,
+                &session_store,
+                &thread_store,
+                &turn_store,
+            )
+            .await;
+        assert!(fragments.is_empty());
+        let warnings = event_rx
+            .try_iter()
+            .map(CapturedExtensionEvent::into_warning)
+            .map(|warning| {
+                (
+                    warning.turn_id,
+                    warning.message.contains("Skills are turned off"),
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            warnings,
+            if expect_warning {
+                vec![(Some("turn-1".to_string()), true)]
+            } else {
+                Vec::new()
+            }
+        );
+    }
+
+    Ok(())
+}
+
 #[derive(Clone)]
 struct StaticSkillProvider {
     catalog: SkillCatalog,

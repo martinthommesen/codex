@@ -244,6 +244,9 @@ impl McpManager {
         let mut selected_plugin_connector_sources = Vec::new();
         let mut selected_plugin_registrations = Vec::new();
         let mut selected_plugins = Vec::new();
+        // A plugin that only bundles skills offers nothing usable while skills are off.
+        let skills_enabled = config.features.enabled(Feature::Skills);
+        let mut selected_plugin_capabilities = false;
         let mut disabled_plugin_roots = Vec::new();
         let mut overlays = Vec::new();
         // A contributor can emit multiple ordered actions, so order each action globally rather
@@ -275,6 +278,11 @@ impl McpManager {
                     });
                 }
                 let contribution = mcp.await;
+                if !disabled && config.features.enabled(Feature::Plugins) {
+                    selected_plugin_capabilities |= skills_enabled
+                        || !contribution.servers.is_empty()
+                        || !contribution.connector_ids.is_empty();
+                }
                 if !disabled {
                     for (name, server) in contribution.servers {
                         selected_plugin_registrations.push(
@@ -353,6 +361,8 @@ impl McpManager {
                     } => {
                         if config.features.enabled(Feature::Plugins) {
                             if !disabled_plugin_ids.contains(&plugin_id) {
+                                selected_plugin_capabilities |=
+                                    skills_enabled || !connector_ids.is_empty();
                                 selected_plugins.push(SelectedPluginIdentity {
                                     selected_root_id: None,
                                     plugin_id: plugin_id.clone(),
@@ -398,9 +408,7 @@ impl McpManager {
             Default::default()
         };
         let loaded_plugins = loaded_plugins.without_plugins(disabled_plugin_ids);
-        // A plugin that only bundles skills offers nothing usable while skills are off.
-        let skills_enabled = config.features.enabled(Feature::Skills);
-        let plugins_available = !selected_plugins.is_empty()
+        let plugins_available = selected_plugin_capabilities
             || loaded_plugins.capability_summaries().iter().any(|summary| {
                 (skills_enabled && summary.has_skills)
                     || !summary.mcp_server_names.is_empty()

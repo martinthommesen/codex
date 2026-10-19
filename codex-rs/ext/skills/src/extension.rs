@@ -34,6 +34,7 @@ use codex_extension_api::WorldStateSectionContribution;
 use codex_mcp::McpResourceClient;
 use codex_otel::MetricsClient;
 use codex_protocol::openai_models::ModelInfo;
+use codex_protocol::user_input::UserInput;
 
 use crate::SkillsExtensionConfig;
 use crate::catalog::SkillCatalog;
@@ -78,6 +79,8 @@ use crate::world_state_catalogs::CatalogStatus;
 
 #[path = "cloud_skill.rs"]
 mod cloud_skill;
+
+const SKILLS_OFF_WARNING: &str = "Skills are turned off for this session, so the selected skill was not used. Turn skills on in /settings and start a new session to use them.";
 
 struct SkillsExtension<C> {
     providers: SkillProviders,
@@ -380,6 +383,18 @@ where
 
             let config = thread_state.config();
             if !config.enabled {
+                // A client can still send a selected skill, so say why it is not used.
+                if input
+                    .user_input
+                    .iter()
+                    .any(|item| matches!(item, UserInput::Skill { .. }))
+                {
+                    self.emit_warning(
+                        thread_store.level_id(),
+                        Some(&input.turn_id),
+                        SKILLS_OFF_WARNING.to_string(),
+                    );
+                }
                 return Vec::new();
             }
             let mcp_resources = session_store

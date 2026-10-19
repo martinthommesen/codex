@@ -128,7 +128,7 @@ fn pick_tooltip<R: Rng + ?Sized>(
 }
 
 /// Tips name commands as `**/name**`; skip ones whose feature is turned off.
-fn mentions_hidden_command(tip: &str, feature_commands: FeatureCommandFlags) -> bool {
+pub(crate) fn mentions_hidden_command(tip: &str, feature_commands: FeatureCommandFlags) -> bool {
     feature_commands
         .hidden_commands()
         .any(|cmd| tip.contains(&format!("**/{}**", cmd.command())))
@@ -417,6 +417,12 @@ mod tests {
             tips.iter()
                 .all(|tip| !mentions_hidden_command(tip, FeatureCommandFlags::ALL))
         );
+        for seed in 0..500 {
+            let mut rng = StdRng::seed_from_u64(seed);
+            let tip =
+                pick_tooltip(&mut rng, &TuiKeymap::default(), all_off).expect("other tips remain");
+            assert!(!mentions_hidden_command(&tip, all_off), "picked {tip:?}");
+        }
     }
 
     #[test]

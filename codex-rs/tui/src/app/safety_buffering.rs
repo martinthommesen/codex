@@ -194,7 +194,7 @@ impl App {
         );
         let retry_display = ChatWidget::user_message_display_from_inputs(items);
 
-        self.adopt_widget_config(retry_config.clone());
+        self.config = retry_config.clone();
         let selected_profile = self.selected_server_profile(thread_id);
         let started = app_server
             .fork_thread_at(

@@ -478,7 +478,7 @@ impl App {
                 }
                 return Err(err);
             }
-            self.adopt_widget_config(self.chat_widget.config_ref().clone());
+            self.config = self.chat_widget.config_ref().clone();
             self.refresh_pending_thread_approvals().await;
             if self.thread_unavailable(id) && !self.chat_widget.is_external_writer_view() {
                 self.agent_navigation.mark_stopped(id);

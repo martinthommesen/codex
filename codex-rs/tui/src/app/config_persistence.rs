@@ -1432,7 +1432,19 @@ fn memories_from_effective_config(effective_config: &ConfigReadResponse) -> Opti
 }
 
 fn features_toml_from_json(value: &serde_json::Value) -> Option<FeaturesToml> {
-    serde_json::from_value(value.clone()).ok()
+    if let Ok(features) = serde_json::from_value(value.clone()) {
+        return Some(features);
+    }
+    // Keep every entry that parses on its own, so one malformed entry does not reset the rest.
+    let entries = value
+        .as_object()?
+        .iter()
+        .filter(|(key, entry)| {
+            serde_json::from_value::<FeaturesToml>(serde_json::json!({ *key: *entry })).is_ok()
+        })
+        .map(|(key, entry)| (key.clone(), entry.clone()))
+        .collect::<serde_json::Map<_, _>>();
+    serde_json::from_value(serde_json::Value::Object(entries)).ok()
 }
 
 #[cfg(test)]
@@ -2154,6 +2166,7 @@ theme = "dracula"
             "config": {
                 "features": {
                     "apps": true,
+                    "code_mode": "not a feature value",
                     "connectors": false,
                     "multi_agent_v2": { "enabled": true },
                 },
@@ -2162,7 +2175,8 @@ theme = "dracula"
         }))
         .expect("valid config read response");
 
-        // `connectors` is the legacy alias for apps and sorts after it, so it wins on load.
+        // `connectors` is the legacy alias for apps and sorts after it, so it wins on load. The
+        // malformed `code_mode` entry is skipped without hiding the others.
         assert!(!feature_enabled_from_effective_config(
             &response,
             Feature::Apps

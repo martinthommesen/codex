@@ -162,14 +162,8 @@ impl ChatWidget {
             self.refresh_skills_for_current_cwd(/*force_reload*/ true);
         }
         if feature == Feature::Goals {
+            // A goal the server still reports for this thread stays visible and controllable.
             self.sync_goal_command_enabled();
-            if !enabled {
-                self.current_goal_status_indicator = None;
-                self.current_goal_status = None;
-                self.turn_lifecycle.goal_status_active_turn_started_at = None;
-                self.turn_lifecycle.budget_limited_turn_ids.clear();
-                self.update_collaboration_mode_indicator();
-            }
         }
         if feature == Feature::MentionsV2 {
             self.sync_mentions_v2_enabled();
@@ -377,9 +371,15 @@ impl ChatWidget {
             .set_feature_commands(self.feature_command_flags());
     }
 
+    /// Goals gate each thread on its own config, so a goal the server reports stays controllable
+    /// after Goals is turned off for new sessions.
+    pub(super) fn goal_controls_available(&self) -> bool {
+        self.config.features.enabled(Feature::Goals) || self.current_goal_status.is_some()
+    }
+
     pub(super) fn sync_goal_command_enabled(&mut self) {
         self.bottom_pane
-            .set_goal_command_enabled(self.config.features.enabled(Feature::Goals));
+            .set_goal_command_enabled(self.goal_controls_available());
     }
 
     pub(super) fn sync_mentions_v2_enabled(&mut self) {
@@ -691,9 +691,6 @@ impl ChatWidget {
     }
 
     fn goal_status_indicator(&self, now: Instant) -> Option<GoalStatusIndicator> {
-        if !self.config.features.enabled(Feature::Goals) {
-            return None;
-        }
         self.current_goal_status.as_ref().and_then(|state| {
             state.indicator(now, self.turn_lifecycle.goal_status_active_turn_started_at)
         })
@@ -705,18 +702,15 @@ impl ChatWidget {
         {
             return;
         }
-        if !self.config.features.enabled(Feature::Goals) {
-            self.current_goal_status_indicator = None;
-            self.current_goal_status = None;
-            self.update_collaboration_mode_indicator();
-            return;
-        }
+        // The server sends goal updates only for threads that have goals, so trust them even when
+        // Goals is turned off for new sessions.
         if goal.status == AppThreadGoalStatus::BudgetLimited
             && let Some(turn_id) = turn_id
         {
             self.turn_lifecycle.mark_budget_limited(turn_id);
         }
         self.current_goal_status = Some(GoalStatusState::new(goal, Instant::now()));
+        self.sync_goal_command_enabled();
         self.update_collaboration_mode_indicator();
     }
 

@@ -3028,36 +3028,32 @@ async fn slash_settings_asks_the_app_for_saved_values() {
 }
 
 #[tokio::test]
-async fn saved_goals_switch_keeps_running_session_goal_controls() {
-    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
-    let mut saved = chat.config_ref().clone();
-    crate::settings_panel::SettingsSwitch::Goals
-        .apply(&mut saved, /*enabled*/ false)
-        .expect("goals is not pinned");
-
-    chat.apply_settings_switch(crate::settings_panel::SettingsSwitch::Goals, &saved);
-
-    assert!(chat.config_ref().features.enabled(Feature::Goals));
-    assert!(chat.builtin_command_flags().goal_command_enabled);
-}
-
-#[tokio::test]
-async fn saved_skills_switch_leaves_the_running_session_surfaces() {
+async fn saved_skills_switch_hides_command_and_refreshes_skill_list() {
     let (mut chat, _rx, mut op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
     let mut saved = chat.config_ref().clone();
     crate::settings_panel::SettingsSwitch::Skills
         .apply(&mut saved, /*enabled*/ false)
         .expect("skills is not pinned");
+    chat.bottom_pane
+        .set_composer_text("/sk".to_string(), Vec::new(), Vec::new());
+    assert!(render_bottom_popup(&chat, /*width*/ 80).contains("/skills"));
 
     chat.apply_settings_switch(crate::settings_panel::SettingsSwitch::Skills, &saved);
 
-    // The running session still has skills, so /skills stays and nothing is re-listed.
-    assert!(chat.config_ref().features.enabled(Feature::Skills));
+    assert!(!chat.config_ref().features.enabled(Feature::Skills));
     chat.bottom_pane
         .set_composer_text("/sk".to_string(), Vec::new(), Vec::new());
     let popup = render_bottom_popup(&chat, /*width*/ 80);
-    assert!(popup.contains("/skills"), "got {popup:?}");
-    assert!(op_rx.try_recv().is_err(), "expected no skills refresh");
+    assert!(!popup.contains("/skills"), "got {popup:?}");
+    let expected_cwd = chat.config_ref().cwd.to_path_buf();
+    assert_matches!(
+        op_rx.try_recv(),
+        Ok(Op::ListSkills { cwds, force_reload: true }) if cwds == vec![expected_cwd]
+    );
+    assert!(
+        op_rx.try_recv().is_err(),
+        "expected a single skills refresh"
+    );
 }
 
 #[tokio::test]

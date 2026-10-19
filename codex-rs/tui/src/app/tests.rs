@@ -3865,25 +3865,13 @@ async fn save_settings_switch_writes_explicit_values_and_updates_live_state() ->
     )
     .await;
 
-    for feature in [Feature::Plugins, Feature::Apps] {
+    for feature in [Feature::Plugins, Feature::Apps, Feature::Skills] {
         assert!(!app.config.features.enabled(feature), "{feature:?}");
         assert!(
             !app.chat_widget.config_ref().features.enabled(feature),
             "{feature:?}"
         );
     }
-    // The running session reads skills only at startup, so only the saved config changes, and
-    // taking the widget's config back (as reconnects do) keeps the saved value.
-    assert!(!app.config.features.enabled(Feature::Skills));
-    assert!(
-        app.chat_widget
-            .config_ref()
-            .features
-            .enabled(Feature::Skills)
-    );
-    app.adopt_widget_config(app.chat_widget.config_ref().clone());
-    assert!(!app.config.features.enabled(Feature::Skills));
-    assert!(!app.config.features.enabled(Feature::Apps));
     assert_eq!(
         app.chat_widget.config_ref().web_search_mode.value(),
         codex_protocol::config_types::WebSearchMode::Disabled

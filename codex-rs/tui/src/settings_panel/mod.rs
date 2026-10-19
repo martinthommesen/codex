@@ -1,10 +1,10 @@
 //! Catalog of whole-feature kill switches shown by `/settings`.
 //!
 //! Each switch maps to server-owned config keys, so saves go through the app server instead of the
-//! local TUI preferences used by `/config`. Running sessions keep the features they started with,
-//! and saved switches reach new sessions. Switches the running session reads only at startup
-//! (`session_static`) also leave its TUI surfaces alone, so `/skills`, `$` skills, `/hooks`,
-//! `/init` and goal controls keep matching what that session can do.
+//! local TUI preferences used by `/config`. The model context of a running session keeps the
+//! features it started with, and saved switches reach new sessions. The TUI's own commands and
+//! mentions follow the saved values right away, as the app server's lists do; goal controls follow
+//! the goal state the server reports for each thread.
 
 mod input;
 mod render;
@@ -109,19 +109,6 @@ impl SettingsSwitch {
         }
     }
 
-    /// Whether the running session reads this switch only when it starts. Saves for these leave the
-    /// running session's TUI surfaces unchanged until `/new`.
-    pub(crate) fn session_static(self) -> bool {
-        match self {
-            Self::Skills | Self::Hooks | Self::AgentsMd | Self::Goals => true,
-            Self::PluginsAndApps
-            | Self::Memories
-            | Self::Subagents
-            | Self::WebSearch
-            | Self::ImageGeneration => false,
-        }
-    }
-
     /// Feature flags this switch writes.
     pub(crate) fn features(self) -> &'static [Feature] {
         match self {
@@ -139,29 +126,25 @@ impl SettingsSwitch {
 
     /// Effective state of every key this switch writes.
     pub(crate) fn state(self, config: &Config) -> SwitchState {
-        let mut values = self
-            .features()
-            .iter()
-            .map(|feature| config.features.enabled(*feature))
-            .collect::<Vec<_>>();
         match self {
-            // `features.multi_agent_v2` overrides `agents.enabled = false`, so either one keeps
-            // subagent tools available.
-            Self::Subagents => {
-                values.push(config.agents_enabled || config.features.enabled(Feature::MultiAgentV2))
-            }
-            Self::WebSearch => {
-                values.push(config.web_search_mode.value() != WebSearchMode::Disabled)
-            }
+            Self::Subagents => SwitchState::from_values(&[subagents_available(config)]),
+            Self::WebSearch => SwitchState::from_values(&[
+                config.web_search_mode.value() != WebSearchMode::Disabled
+            ]),
             Self::PluginsAndApps
             | Self::Skills
             | Self::Hooks
             | Self::AgentsMd
             | Self::Memories
             | Self::ImageGeneration
-            | Self::Goals => {}
+            | Self::Goals => SwitchState::from_values(
+                &self
+                    .features()
+                    .iter()
+                    .map(|feature| config.features.enabled(*feature))
+                    .collect::<Vec<_>>(),
+            ),
         }
-        SwitchState::from_values(&values)
     }
 
     /// Turns the switch on or off in `config`. Keys that requirements pin to the other value keep
@@ -178,17 +161,19 @@ impl SettingsSwitch {
                 Err(err) => pinned = pinned.or(Some(err)),
             }
         }
-        if let Some(err) = pinned
-            && !changed
-        {
-            return Err(err);
-        }
         match self {
             Self::Subagents => {
                 config.agents_enabled = enabled;
-                if !enabled {
-                    set_feature(config, Feature::MultiAgentV2, /*enabled*/ false)?;
+                if !enabled && let Err(err) = set_feature(config, Feature::MultiAgentV2, enabled) {
+                    pinned = pinned.or(Some(err));
                 }
+                // Subagents follow the combined keys, so a pin only matters if it decides them.
+                if subagents_available(config) != enabled {
+                    return Err(pinned.unwrap_or_else(|| {
+                        "requirements decide whether subagents are available".to_string()
+                    }));
+                }
+                return Ok(());
             }
             Self::WebSearch => {
                 let mode = if enabled {
@@ -209,6 +194,11 @@ impl SettingsSwitch {
             | Self::Memories
             | Self::ImageGeneration
             | Self::Goals => {}
+        }
+        if let Some(err) = pinned
+            && !changed
+        {
+            return Err(err);
         }
         Ok(())
     }
@@ -292,6 +282,13 @@ impl SettingsSwitch {
     }
 }
 
+/// Mirrors core: `features.multi_agent_v2` turns subagents on regardless of `agents.enabled`, which
+/// in turn overrides `features.multi_agent`.
+fn subagents_available(config: &Config) -> bool {
+    config.features.enabled(Feature::MultiAgentV2)
+        || (config.agents_enabled && config.features.enabled(Feature::Collab))
+}
+
 fn feature_edit(feature: Feature, enabled: bool) -> ConfigEdit {
     replace_config_value(
         format!("features.{}", feature.key()),
@@ -323,15 +320,6 @@ pub(crate) fn enabled_web_search_mode(config: &Config) -> Option<WebSearchMode> 
     ]
     .into_iter()
     .find(|mode| config.web_search_mode.can_set(mode).is_ok())
-}
-
-/// Copies the session-static switches from `source`, leaving every other setting in `target`.
-pub(crate) fn adopt_session_static(target: &mut Config, source: &Config) {
-    for switch in SettingsSwitch::ALL {
-        if switch.session_static() {
-            switch.adopt(target, source);
-        }
-    }
 }
 
 /// Combined state of the keys behind one switch.
@@ -367,16 +355,13 @@ pub(crate) struct SwitchStatus {
     pub(crate) state: SwitchState,
     /// Value activating the row requests, or `None` when requirements pin every direction.
     pub(crate) target: Option<bool>,
+    /// Requirements pin at least one key, or block the usual toggle direction.
+    pub(crate) managed: bool,
 }
 
 impl SwitchStatus {
     fn locked(self) -> bool {
         self.target.is_none()
-    }
-
-    /// Requirements block the usual toggle direction.
-    fn managed(self) -> bool {
-        self.target != Some(self.state.toggled())
     }
 }
 
@@ -395,22 +380,32 @@ pub(crate) fn statuses(config: &Config) -> Vec<SwitchStatus> {
             } else {
                 None
             };
+            let pinned_key = switch.features().iter().any(|feature| {
+                let flipped = !config.features.enabled(*feature);
+                set_feature(&mut config.clone(), *feature, flipped).is_err()
+            });
             SwitchStatus {
                 switch,
                 state,
                 target,
+                managed: pinned_key || target != Some(preferred),
             }
         })
         .collect()
 }
 
-/// Notice shown after a switch saves without being overridden.
-pub(crate) fn saved_notice(switch: SettingsSwitch, enabled: bool) -> String {
-    format!(
-        "{} turned {} for new sessions · use /new to start one",
-        switch.label(),
-        if enabled { "on" } else { "off" }
-    )
+/// Notice shown after a switch saves without being overridden. `state` is the saved result, which
+/// stays partial when requirements pin one of the switch's keys.
+pub(crate) fn saved_notice(switch: SettingsSwitch, enabled: bool, state: SwitchState) -> String {
+    let label = switch.label();
+    let action = if enabled { "on" } else { "off" };
+    if state == SwitchState::Partial {
+        format!(
+            "{label} turned {action} for new sessions where your administrator allows it · use /new to start one"
+        )
+    } else {
+        format!("{label} turned {action} for new sessions · use /new to start one")
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

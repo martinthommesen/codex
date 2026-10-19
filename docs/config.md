@@ -46,6 +46,7 @@ unchanged. Another config layer, such as a profile, a trusted project's
 `.codex/config.toml`, or a legacy alias in a system config, can still override
 the user value; `/settings` then reports the save as overridden.
 
-Skills, hooks, AGENTS.md, and goals are read when a session starts, so the
-running session keeps its `/skills`, `$` skill mentions, `/hooks`, `/init`, and
-goal controls until you start a new one.
+A running session keeps the skills, hooks, AGENTS.md, and goals it started
+with, but the TUI's `/skills`, `$` mentions, `/hooks`, and `/init` follow the
+saved setting right away. A goal that is already running stays visible and can
+still be paused or cleared after you turn Goals off.

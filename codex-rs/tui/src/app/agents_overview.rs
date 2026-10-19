@@ -810,7 +810,7 @@ impl App {
                     .permissions
                     .set_workspace_roots(self.config.permissions.workspace_roots().to_vec());
             }
-            self.adopt_widget_config(destination_config);
+            self.config = destination_config;
             if is_new_session {
                 self.remember_launch_permissions();
             }

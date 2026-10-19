@@ -26,6 +26,7 @@ fn status(switch: SettingsSwitch, state: SwitchState) -> SwitchStatus {
         switch,
         state,
         target: Some(state.toggled()),
+        managed: false,
     }
 }
 
@@ -38,6 +39,7 @@ fn mixed_statuses() -> Vec<SwitchStatus> {
             SettingsSwitch::Hooks | SettingsSwitch::Memories => status(switch, SwitchState::Off),
             SettingsSwitch::WebSearch => SwitchStatus {
                 target: None,
+                managed: true,
                 ..status(switch, SwitchState::On)
             },
             _ => status(switch, SwitchState::On),
@@ -128,7 +130,11 @@ fn enter_requests_the_opposite_state_once_until_refreshed() {
     assert!(panel.update_settings_panel(&SettingsPanelUpdate {
         statuses,
         keymap: RuntimeKeymap::defaults().list,
-        notice: Some(saved_notice(SettingsSwitch::Skills, /*enabled*/ false)),
+        notice: Some(saved_notice(
+            SettingsSwitch::Skills,
+            /*enabled*/ false,
+            SwitchState::Off,
+        )),
     }));
     assert!(!panel.saving);
     insta::assert_snapshot!("settings_saved_notice", render(&panel, /*width*/ 130));
@@ -316,9 +322,9 @@ async fn pinned_features_lock_only_the_blocked_direction() {
             switch: plugins,
             state: SwitchState::Partial,
             target: Some(false),
+            managed: true,
         }
     );
-    assert!(status_of(&config, plugins).managed());
     plugins
         .apply(&mut config, /*enabled*/ false)
         .expect("plugins can turn off");
@@ -328,6 +334,7 @@ async fn pinned_features_lock_only_the_blocked_direction() {
             switch: plugins,
             state: SwitchState::Off,
             target: Some(true),
+            managed: true,
         }
     );
     assert!(
@@ -347,7 +354,12 @@ async fn pinned_features_lock_only_the_blocked_direction() {
             switch: plugins,
             state: SwitchState::Partial,
             target: Some(false),
+            managed: true,
         }
+    );
+    assert_eq!(
+        saved_notice(plugins, /*enabled*/ true, SwitchState::Partial),
+        "Plugins & apps turned on for new sessions where your administrator allows it · use /new to start one"
     );
 
     // A switch whose only key is pinned cannot change in either direction.
@@ -357,39 +369,13 @@ async fn pinned_features_lock_only_the_blocked_direction() {
             switch: SettingsSwitch::Skills,
             state: SwitchState::On,
             target: None,
+            managed: true,
         }
     );
     assert!(
         SettingsSwitch::Skills
             .apply(&mut config, /*enabled*/ false)
             .is_err()
-    );
-}
-
-#[tokio::test]
-async fn adopt_session_static_copies_only_switches_read_at_session_start() {
-    let (_codex_home, mut running) = test_config().await;
-    let mut saved = running.clone();
-    for switch in SettingsSwitch::ALL {
-        switch
-            .apply(&mut saved, /*enabled*/ false)
-            .expect("no switch is pinned");
-    }
-    let before = SettingsSwitch::ALL.map(|switch| switch.state(&running));
-
-    adopt_session_static(&mut running, &saved);
-
-    assert_eq!(
-        SettingsSwitch::ALL.map(|switch| (switch, switch.state(&running))),
-        std::array::from_fn(|index| {
-            let switch = SettingsSwitch::ALL[index];
-            let state = if switch.session_static() {
-                SwitchState::Off
-            } else {
-                before[index]
-            };
-            (switch, state)
-        })
     );
 }
 
@@ -430,11 +416,8 @@ async fn subagents_switch_also_turns_off_multi_agent_v2() {
         .features
         .set_enabled(Feature::Collab, /*enabled*/ false)
         .expect("not pinned");
-    // V2 overrides `agents.enabled = false`, so subagents are still partly on.
-    assert_eq!(
-        SettingsSwitch::Subagents.state(&config),
-        SwitchState::Partial
-    );
+    // V2 overrides `agents.enabled = false`, so subagents are still on.
+    assert_eq!(SettingsSwitch::Subagents.state(&config), SwitchState::On);
     assert!(
         SettingsSwitch::Subagents
             .edits(/*enabled*/ false, &config)
@@ -447,4 +430,47 @@ async fn subagents_switch_also_turns_off_multi_agent_v2() {
         .expect("not pinned");
     assert_eq!(SettingsSwitch::Subagents.state(&config), SwitchState::Off);
     assert!(!config.features.enabled(Feature::MultiAgentV2));
+}
+
+#[tokio::test]
+async fn subagents_turn_off_and_on_while_multi_agent_is_pinned_on() {
+    let (_codex_home, mut config) = test_config().await;
+    let mut warnings = Vec::new();
+    config.features = ManagedFeatures::from_configured_with_warnings(
+        config.features.get().clone(),
+        Some(Sourced {
+            value: FeatureRequirementsToml {
+                entries: [("multi_agent".to_string(), true)].into_iter().collect(),
+            },
+            source: RequirementSource::Unknown,
+        }),
+        &mut warnings,
+    )
+    .expect("pins are valid");
+    let subagents = SettingsSwitch::Subagents;
+
+    // `agents.enabled = false` still turns subagents off, so the pin does not lock the switch.
+    subagents
+        .apply(&mut config, /*enabled*/ false)
+        .expect("agents.enabled can turn subagents off");
+    assert_eq!(subagents.state(&config), SwitchState::Off);
+    assert!(config.features.enabled(Feature::Collab));
+    assert!(
+        !subagents
+            .edits(/*enabled*/ false, &config)
+            .into_iter()
+            .any(|edit| edit.key_path == "features.multi_agent"),
+        "the pinned key is not written"
+    );
+    assert_eq!(
+        statuses(&config)
+            .into_iter()
+            .find(|status| status.switch == subagents)
+            .map(|status| status.target),
+        Some(Some(true))
+    );
+    subagents
+        .apply(&mut config, /*enabled*/ true)
+        .expect("agents.enabled can turn subagents back on");
+    assert_eq!(subagents.state(&config), SwitchState::On);
 }

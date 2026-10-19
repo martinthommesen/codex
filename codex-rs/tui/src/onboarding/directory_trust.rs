@@ -110,6 +110,7 @@ pub(crate) async fn check_directory_trust(
                 cwd: project.cwd,
                 trust_target: project.trust_target,
                 show_windows_create_sandbox_hint: false,
+                skills_enabled: config.features.enabled(codex_features::Feature::Skills),
                 should_quit: false,
                 selection: None,
                 highlighted: TrustDirectorySelection::Trust,

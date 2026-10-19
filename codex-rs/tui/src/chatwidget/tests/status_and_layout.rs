@@ -2354,6 +2354,48 @@ fn start_active_goal_turn(chat: &mut ChatWidget) -> ThreadId {
     thread_id
 }
 
+#[tokio::test]
+async fn saved_goals_switch_keeps_the_goal_the_server_still_reports() {
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+    let thread_id = ThreadId::new();
+    chat.thread_id = Some(thread_id);
+    let mut saved = chat.config_ref().clone();
+    crate::settings_panel::SettingsSwitch::Goals
+        .apply(&mut saved, /*enabled*/ false)
+        .expect("goals is not pinned");
+
+    chat.apply_settings_switch(crate::settings_panel::SettingsSwitch::Goals, &saved);
+    assert!(!chat.builtin_command_flags().goal_command_enabled);
+
+    // This thread started with goals, so the server still reports its goal.
+    update_thread_goal(&mut chat, thread_id, AppThreadGoalStatus::Active);
+    assert!(chat.builtin_command_flags().goal_command_enabled);
+    while rx.try_recv().is_ok() {}
+    let drain = chat.submit_queued_slash_prompt(UserMessage::from("/goal pause").into());
+    assert_matches!(drain, QueueDrain::Continue | QueueDrain::Stop);
+    let events = std::iter::from_fn(|| rx.try_recv().ok()).collect::<Vec<_>>();
+    assert!(
+        events.iter().any(|event| matches!(
+            event,
+            AppEvent::SetThreadGoalStatus {
+                status: AppThreadGoalStatus::Paused,
+                ..
+            }
+        )),
+        "got {events:?}"
+    );
+
+    // New goals follow the saved setting.
+    chat.submit_queued_slash_prompt(UserMessage::from("/goal ship the release").into());
+    let events = std::iter::from_fn(|| rx.try_recv().ok()).collect::<Vec<_>>();
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event, AppEvent::SetThreadGoalDraft { .. })),
+        "got {events:?}"
+    );
+}
+
 fn update_thread_goal(chat: &mut ChatWidget, thread_id: ThreadId, status: AppThreadGoalStatus) {
     let mut goal = test_thread_goal(
         status,

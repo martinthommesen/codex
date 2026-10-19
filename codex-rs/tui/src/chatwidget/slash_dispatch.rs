@@ -398,7 +398,8 @@ impl ChatWidget {
                 self.apply_plan_slash_command();
             }
             SlashCommand::Goal => {
-                if !self.config.features.enabled(Feature::Goals) {
+                if !self.goal_controls_available() {
+                    self.report_goals_off();
                     return;
                 }
                 if let Some(thread_id) = self.thread_id {
@@ -1027,7 +1028,8 @@ impl ChatWidget {
                 }
             }
             SlashCommand::Goal if !trimmed.is_empty() => {
-                if !self.config.features.enabled(Feature::Goals) {
+                if !self.goal_controls_available() {
+                    self.report_goals_off();
                     if source == SlashCommandDispatchSource::Live {
                         self.clear_live_goal_submission();
                     }
@@ -1076,6 +1078,14 @@ impl ChatWidget {
                         }
                     }
                     self.append_message_history_entry(format!("/goal {trimmed}"));
+                    if source == SlashCommandDispatchSource::Live {
+                        self.clear_live_goal_submission();
+                    }
+                    return;
+                }
+                // An existing goal stays controllable, but new goals follow the saved setting.
+                if !self.config.features.enabled(Feature::Goals) {
+                    self.report_goals_off();
                     if source == SlashCommandDispatchSource::Live {
                         self.clear_live_goal_submission();
                     }
@@ -1304,7 +1314,7 @@ impl ChatWidget {
             connectors_enabled: self.connectors_enabled(),
             plugins_command_enabled: self.config.features.enabled(Feature::Plugins),
             token_activity_command_enabled: self.has_codex_backend_auth,
-            goal_command_enabled: self.config.features.enabled(Feature::Goals),
+            goal_command_enabled: self.goal_controls_available(),
             service_tier_commands_enabled: !self.current_model_service_tier_commands().is_empty(),
             daybreak_command_description: self.daybreak_command_description(),
             voice_command_enabled: self.realtime_conversation_available_for_thread,
@@ -1321,6 +1331,11 @@ impl ChatWidget {
         }
         self.add_error_message(USAGE_CHATGPT_LOGIN_REQUIRED.to_string());
         false
+    }
+
+    fn report_goals_off(&mut self) {
+        let hint = self.turn_back_on_hint(SettingsSwitch::Goals, "Turn them back on in /settings.");
+        self.add_info_message("Goals are turned off.".to_string(), Some(hint));
     }
 
     fn queued_command_drain_result(&self, cmd: SlashCommand) -> QueueDrain {
@@ -1367,6 +1382,7 @@ impl ChatWidget {
             SlashCommand::Init if !self.feature_command_flags().init => QueueDrain::Continue,
             SlashCommand::Skills if !self.feature_command_flags().skills => QueueDrain::Continue,
             SlashCommand::Hooks if !self.feature_command_flags().hooks => QueueDrain::Continue,
+            SlashCommand::Goal if !self.goal_controls_available() => QueueDrain::Continue,
             SlashCommand::Feedback
             | SlashCommand::Warnings
             | SlashCommand::Export

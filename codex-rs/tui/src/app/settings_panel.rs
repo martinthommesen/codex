@@ -53,8 +53,10 @@ impl App {
         // The server only checks user-level layers for overrides, so a trusted project, a profile
         // or a legacy alias in another layer can still win. Read back what this cwd resolves to.
         let cwd = self.chat_widget.config_ref().cwd.display().to_string();
+        let session_flags = session_flag_features(&self.config);
         match crate::config_update::read_effective_config(app_server.request_handle(), cwd).await {
-            Ok(effective_config) => {
+            Ok(mut effective_config) => {
+                overlay_session_flag_features(&mut effective_config, session_flags.as_ref());
                 adopt_effective_switch_state(&mut self.config, switch, &effective_config);
             }
             Err(err) => {
@@ -66,12 +68,24 @@ impl App {
         }
         let (notice, outcome) = if switch.state(&self.config) == switch.state(&next_config) {
             (
-                crate::settings_panel::saved_notice(switch, enabled),
+                crate::settings_panel::saved_notice(switch, enabled, switch.state(&self.config)),
                 SaveOutcome::Saved,
             )
         } else {
-            let reason = overridden
-                .unwrap_or_else(|| "another config file still sets it for this folder".to_string());
+            let flagged = session_flags.as_ref().is_some_and(|flags| {
+                switch.features().iter().any(|feature| {
+                    std::iter::once(feature.key())
+                        .chain(codex_features::legacy_keys_for_feature(*feature))
+                        .any(|key| flags.contains_key(key))
+                })
+            });
+            let reason = overridden.unwrap_or_else(|| {
+                if flagged {
+                    "a command-line flag for this Codex session still sets it".to_string()
+                } else {
+                    "another config file still sets it for this folder".to_string()
+                }
+            });
             tracing::warn!(
                 reason,
                 switch = label,
@@ -84,13 +98,6 @@ impl App {
         };
         self.chat_widget.apply_settings_switch(switch, &self.config);
         self.report_settings_save(notice, outcome);
-    }
-
-    /// Takes a chat widget's config while keeping the session-static switches `/settings` saved
-    /// for new sessions, which the running widget deliberately does not adopt.
-    pub(super) fn adopt_widget_config(&mut self, config: Config) {
-        let saved = std::mem::replace(&mut self.config, config);
-        crate::settings_panel::adopt_session_static(&mut self.config, &saved);
     }
 
     /// Shows the notice in the panel, or in the transcript when the panel was already closed.
@@ -106,6 +113,37 @@ impl App {
             SaveOutcome::Saved => self.chat_widget.add_info_message(notice, /*hint*/ None),
             SaveOutcome::Failed => self.chat_widget.add_error_message(notice),
         }
+    }
+}
+
+/// The `[features]` session flags this TUI sends with every new thread.
+fn session_flag_features(config: &Config) -> Option<serde_json::Map<String, serde_json::Value>> {
+    let mut session_flags = toml::Value::Table(toml::Table::new());
+    for layer in config.config_layer_stack.layers_low_to_high() {
+        if matches!(layer.name, codex_config::ConfigLayerSource::SessionFlags) {
+            codex_config::merge_toml_values(&mut session_flags, &layer.config);
+        }
+    }
+    let features = serde_json::to_value(session_flags.get("features")?).ok()?;
+    features.as_object().cloned()
+}
+
+/// New threads also get this TUI's session flags, which `config/read` cannot see when the app
+/// server runs separately, so apply them on top of what the server read.
+fn overlay_session_flag_features(
+    effective_config: &mut ConfigReadResponse,
+    session_flags: Option<&serde_json::Map<String, serde_json::Value>>,
+) {
+    let Some(session_flags) = session_flags else {
+        return;
+    };
+    let features = effective_config
+        .config
+        .additional
+        .entry("features".to_string())
+        .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
+    if let Some(features) = features.as_object_mut() {
+        features.extend(session_flags.clone());
     }
 }
 
@@ -161,3 +199,7 @@ fn adopt_effective_switch_state(
         | SettingsSwitch::Goals => {}
     }
 }
+
+#[cfg(test)]
+#[path = "settings_panel_tests.rs"]
+mod tests;
