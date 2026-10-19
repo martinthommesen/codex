@@ -7,6 +7,7 @@ use crate::agent::role::DEFAULT_ROLE_NAME;
 use crate::agent::role::apply_role_to_config;
 use crate::config::Config;
 use crate::provider_models::ProviderConnection;
+use crate::provider_models::check_required_model_provider;
 use crate::provider_models::provider_connection;
 use crate::session::session::Session;
 use crate::session::step_context::StepContext;
@@ -252,6 +253,7 @@ fn apply_requested_spawn_agent_provider(
     if provider_id == config.model_provider_id {
         return Ok(false);
     }
+    check_required_model_provider(config, provider_id)?;
     if let ProviderConnection::NotConnected { remedy } = provider_connection(
         &provider,
         Some(session.services.auth_manager.as_ref()),

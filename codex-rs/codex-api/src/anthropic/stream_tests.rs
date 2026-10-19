@@ -267,10 +267,12 @@ fn stop_reasons_map_to_errors() {
 }
 
 #[test]
-fn truncated_tool_input_is_dropped_at_max_tokens() {
+fn truncated_tool_input_is_dropped_and_a_truncated_answer_is_incomplete_at_max_tokens() {
     // The API closes every block before `message_delta` reports the stop reason.
     for partial_json in ["{\"command\": [\"l", ""] {
-        let events = run(vec![
+        let mut translator = AnthropicStreamTranslator::new(tool_names());
+        let mut events = Vec::new();
+        for value in [
             message_start(),
             json!({"type": "content_block_start", "index": 0, "content_block": {"type": "text", "text": "partial"}}),
             json!({"type": "content_block_stop", "index": 0}),
@@ -278,9 +280,9 @@ fn truncated_tool_input_is_dropped_at_max_tokens() {
             json!({"type": "content_block_delta", "index": 1, "delta": {"type": "input_json_delta", "partial_json": partial_json}}),
             json!({"type": "content_block_stop", "index": 1}),
             json!({"type": "message_delta", "delta": {"stop_reason": "max_tokens"}}),
-            json!({"type": "message_stop"}),
-        ])
-        .expect("partial output is kept");
+        ] {
+            events.extend(translator.handle(event(value)).expect("event"));
+        }
         assert!(
             !events.iter().any(|event| matches!(
                 event,
@@ -288,38 +290,101 @@ fn truncated_tool_input_is_dropped_at_max_tokens() {
             )),
             "{partial_json:?}"
         );
+        // The partial text is kept, but the turn does not end as if it were complete.
+        assert!(events.iter().any(|event| matches!(
+            event,
+            ResponseEvent::OutputItemDone(ResponseItem::Message { .. })
+        )));
         assert!(matches!(
-            events.last(),
-            Some(ResponseEvent::Completed { end_turn: None, .. })
+            translator.handle(event(json!({"type": "message_stop"}))),
+            Err(ApiError::ResponseIncomplete(_))
         ));
     }
 }
 
 #[test]
-fn complete_tool_calls_dispatch_early_and_argumentless_calls_wait_for_the_stop_reason() {
+fn complete_tool_calls_still_run_after_a_max_tokens_stop() {
+    let events = run(vec![
+        message_start(),
+        json!({"type": "content_block_start", "index": 0, "content_block": {"type": "tool_use", "id": "toolu_a", "name": "shell", "input": {}}}),
+        json!({"type": "content_block_delta", "index": 0, "delta": {"type": "input_json_delta", "partial_json": "{\"command\": [\"ls\"]}"}}),
+        json!({"type": "content_block_stop", "index": 0}),
+        json!({"type": "content_block_start", "index": 1, "content_block": {"type": "tool_use", "id": "toolu_b", "name": "shell", "input": {}}}),
+        json!({"type": "content_block_delta", "index": 1, "delta": {"type": "input_json_delta", "partial_json": "{\"comm"}}),
+        json!({"type": "content_block_stop", "index": 1}),
+        json!({"type": "message_delta", "delta": {"stop_reason": "max_tokens"}}),
+        json!({"type": "message_stop"}),
+    ])
+    .expect("complete tool calls continue the turn");
+    let call_ids = events
+        .iter()
+        .filter_map(|event| match event {
+            ResponseEvent::OutputItemDone(ResponseItem::FunctionCall { call_id, .. }) => {
+                Some(call_id.as_str())
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(call_ids, vec!["toolu_a"]);
+    assert!(matches!(
+        events.last(),
+        Some(ResponseEvent::Completed { end_turn: None, .. })
+    ));
+}
+
+#[test]
+fn tool_calls_wait_for_the_stop_reason_and_keep_model_order() {
     let mut translator = AnthropicStreamTranslator::new(tool_names());
     let mut feed = |value: Value| translator.handle(event(value)).expect("event");
     feed(message_start());
     feed(
         json!({"type": "content_block_start", "index": 0, "content_block": {"type": "tool_use", "id": "toolu_a", "name": "shell", "input": {}}}),
     );
-    feed(
-        json!({"type": "content_block_delta", "index": 0, "delta": {"type": "input_json_delta", "partial_json": "{\"command\": [\"ls\"]}"}}),
-    );
-    let complete = feed(json!({"type": "content_block_stop", "index": 0}));
-    assert!(matches!(
-        complete.as_slice(),
-        [ResponseEvent::OutputItemDone(ResponseItem::FunctionCall { call_id, .. })] if call_id == "toolu_a"
-    ));
+    assert!(feed(json!({"type": "content_block_stop", "index": 0})).is_empty());
     feed(
         json!({"type": "content_block_start", "index": 1, "content_block": {"type": "tool_use", "id": "toolu_b", "name": "shell", "input": {}}}),
     );
+    feed(
+        json!({"type": "content_block_delta", "index": 1, "delta": {"type": "input_json_delta", "partial_json": "{\"command\": [\"ls\"]}"}}),
+    );
     assert!(feed(json!({"type": "content_block_stop", "index": 1})).is_empty());
     let released = feed(json!({"type": "message_delta", "delta": {"stop_reason": "tool_use"}}));
+    let call_ids = released
+        .iter()
+        .filter_map(|event| match event {
+            ResponseEvent::OutputItemDone(ResponseItem::FunctionCall { call_id, .. }) => {
+                Some(call_id.as_str())
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(call_ids, vec!["toolu_a", "toolu_b"]);
+}
+
+#[test]
+fn refused_responses_run_no_tool_calls_and_record_no_answer() {
+    let mut translator = AnthropicStreamTranslator::new(tool_names());
+    let mut events = Vec::new();
+    for value in [
+        message_start(),
+        json!({"type": "content_block_start", "index": 0, "content_block": {"type": "tool_use", "id": "toolu_a", "name": "shell", "input": {}}}),
+        json!({"type": "content_block_delta", "index": 0, "delta": {"type": "input_json_delta", "partial_json": "{\"command\": [\"ls\"]}"}}),
+        json!({"type": "content_block_stop", "index": 0}),
+        json!({"type": "content_block_start", "index": 1, "content_block": {"type": "text", "text": ""}}),
+        json!({"type": "content_block_delta", "index": 1, "delta": {"type": "text_delta", "text": "partial"}}),
+        json!({"type": "content_block_stop", "index": 1}),
+        json!({"type": "message_delta", "delta": {"stop_reason": "refusal", "stop_details": {"category": "cyber"}}}),
+    ] {
+        events.extend(translator.handle(event(value)).expect("event"));
+    }
+    assert!(!events.iter().any(|event| matches!(
+        event,
+        ResponseEvent::OutputItemDone(ResponseItem::FunctionCall { .. })
+            | ResponseEvent::OutputItemDone(ResponseItem::Message { .. })
+    )));
     assert!(matches!(
-        released.as_slice(),
-        [ResponseEvent::OutputItemDone(ResponseItem::FunctionCall { call_id, arguments, .. })]
-            if call_id == "toolu_b" && arguments == "{}"
+        translator.handle(event(json!({"type": "message_stop"}))),
+        Err(ApiError::CyberPolicy { .. })
     ));
 }
 

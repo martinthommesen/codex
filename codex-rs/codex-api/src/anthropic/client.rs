@@ -1,8 +1,10 @@
 //! HTTP client for the Anthropic Messages API (`POST /v1/messages`).
 
 use super::error::map_anthropic_transport_error;
-use super::oauth::{OAuthRequestContext, prepare_oauth_request};
-use super::oauth_response::{ClaudeOAuthResponseMetadata, map_claude_oauth_transport_error};
+use super::oauth::OAuthRequestContext;
+use super::oauth::prepare_oauth_request;
+use super::oauth_response::ClaudeOAuthResponseMetadata;
+use super::oauth_response::map_claude_oauth_transport_error;
 use super::request::PreparedAnthropicRequest;
 use super::stream::spawn_anthropic_stream;
 use super::stream::spawn_claude_oauth_stream;
@@ -109,10 +111,28 @@ impl<T: HttpTransport> AnthropicMessagesClient<T> {
             HeaderName::from_static(ANTHROPIC_VERSION_HEADER),
             HeaderValue::from_static(ANTHROPIC_VERSION),
         );
-        if !prepared.betas.is_empty()
-            && let Ok(value) = HeaderValue::from_str(&prepared.betas.join(","))
-        {
-            headers.insert(HeaderName::from_static(ANTHROPIC_BETA_HEADER), value);
+        if !prepared.betas.is_empty() {
+            // Request headers replace same-named provider headers, so betas configured through
+            // the provider's `http_headers` must be merged in here or they would be dropped.
+            let configured = self
+                .session
+                .provider()
+                .headers
+                .get_all(ANTHROPIC_BETA_HEADER)
+                .iter()
+                .chain(headers.get_all(ANTHROPIC_BETA_HEADER).iter())
+                .filter_map(|value| value.to_str().ok())
+                .flat_map(|value| value.split(','))
+                .map(str::trim);
+            let mut betas: Vec<&str> = Vec::new();
+            for beta in configured.chain(prepared.betas.iter().copied()) {
+                if !beta.is_empty() && !betas.contains(&beta) {
+                    betas.push(beta);
+                }
+            }
+            if let Ok(value) = HeaderValue::from_str(&betas.join(",")) {
+                headers.insert(HeaderName::from_static(ANTHROPIC_BETA_HEADER), value);
+            }
         }
         headers.insert(
             http::header::ACCEPT,
@@ -255,3 +275,7 @@ impl RequestTelemetry for OAuthRequestTelemetry {
             .on_request(attempt, status, redacted.as_ref(), duration);
     }
 }
+
+#[cfg(test)]
+#[path = "client_tests.rs"]
+mod tests;

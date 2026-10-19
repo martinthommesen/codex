@@ -129,6 +129,7 @@ pub fn build_anthropic_request(
         // tool_use/tool_result blocks, so the transcript is rendered as text instead.
         flatten_tool_blocks(&mut history.messages);
     }
+    limit_request_images(&mut history.messages, &mut notes);
 
     let mut system = Vec::new();
     if !base_instructions.trim().is_empty() {
@@ -727,6 +728,48 @@ fn repair_turns(messages: &mut Vec<AnthropicMessage>, notes: &mut Vec<String>) {
             content: vec![text_block("Continue.")],
         });
         notes.push("history ended with an assistant turn; a continuation request was added".into());
+    }
+}
+
+/// With more than this many images in one request, the Messages API rejects every image larger
+/// than 2000 px per side, and every earlier image is resent on each request. Codex prepares
+/// images up to 2048 px, so older images beyond this count are replaced by a note.
+const MAX_REQUEST_IMAGES: usize = 20;
+const OMITTED_IMAGE_TEXT: &str =
+    "[earlier image omitted: too many images in this conversation to send them all]";
+
+/// Keeps the most recent [`MAX_REQUEST_IMAGES`] images (including those inside tool results).
+fn limit_request_images(messages: &mut [AnthropicMessage], notes: &mut Vec<String>) {
+    let mut kept = 0;
+    let mut omitted = 0;
+    for message in messages.iter_mut().rev() {
+        for block in message.content.iter_mut().rev() {
+            limit_block_images(block, &mut kept, &mut omitted);
+        }
+    }
+    if omitted > 0 {
+        notes.push(format!(
+            "{omitted} earlier image(s) were omitted because a Claude request can carry at most \
+{MAX_REQUEST_IMAGES} images at full size"
+        ));
+    }
+}
+
+fn limit_block_images(block: &mut Value, kept: &mut usize, omitted: &mut usize) {
+    match block_type(block) {
+        "image" if *kept < MAX_REQUEST_IMAGES => *kept += 1,
+        "image" => {
+            *omitted += 1;
+            *block = text_block(OMITTED_IMAGE_TEXT);
+        }
+        "tool_result" => {
+            if let Some(Value::Array(content)) = block.get_mut("content") {
+                for nested in content.iter_mut().rev() {
+                    limit_block_images(nested, kept, omitted);
+                }
+            }
+        }
+        _ => {}
     }
 }
 

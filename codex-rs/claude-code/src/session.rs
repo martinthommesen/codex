@@ -65,6 +65,8 @@ const EVENT_CHANNEL_CAPACITY: usize = 1600;
 const INTERRUPTED_MESSAGE: &str = "The turn was interrupted before Codex ran this tool.";
 const RESTARTED_MESSAGE: &str = "Claude Code was restarted before Codex returned this result.";
 const MISSING_OUTPUT_MESSAGE: &str = "Codex did not return a result for this tool call.";
+const HANDED_OFF_MESSAGE: &str =
+    "Codex ended this turn early; this tool call's result, if it ran, comes with the next message.";
 /// How long Claude Code may be silent before the driver looks for stuck tool calls.
 const UNEXPECTED_CALL_CHECK_INTERVAL: Duration = Duration::from_secs(5);
 /// A bridged call Codex never saw (for example from a message Claude Code did not stream) is
@@ -273,7 +275,15 @@ are {}",
                 mcp_config: &mcp_config,
                 session,
             };
-            inner.process = Some(ClaudeProcess::spawn(&spec, key.clone())?);
+            match ClaudeProcess::spawn(&spec, key.clone()) {
+                Ok(process) => inner.process = Some(process),
+                Err(err) => {
+                    // Nothing reached Claude Code; without this, the next request would match
+                    // the empty synced prefix and seed the session without the transcript.
+                    forget_unstarted_session(&mut inner);
+                    return Err(err);
+                }
+            }
         }
 
         let payload = if prefix_matches {
@@ -715,7 +725,7 @@ impl Driver {
             };
             let step = match wake {
                 Wake::ConsumerGone => {
-                    self.cancel().await;
+                    self.cancel(&mut segment).await;
                     Step::Done
                 }
                 Wake::Abort => {
@@ -763,6 +773,7 @@ impl Driver {
             "system" if is_init(&value) => {
                 if let Err(err) = check_bridge_status(&value) {
                     self.stop_process().await;
+                    forget_unstarted_session(&mut self.inner);
                     self.fail(err).await;
                     return Step::Done;
                 }
@@ -829,6 +840,16 @@ impl Driver {
         let events = match translator.handle(event) {
             Ok(events) => events,
             Err(err) => {
+                if is_message_stop && !segment.message_calls.is_empty() {
+                    // Codex already received these calls and runs them, and Claude Code runs
+                    // every complete tool_use block too, so its query now waits on their
+                    // bridged results and no `result` can arrive. Hand them back as on a
+                    // tool_use stop, so the next request answers them, and report the error now.
+                    self.inner.outstanding = std::mem::take(&mut segment.message_calls);
+                    self.persist().await;
+                    self.fail(err).await;
+                    return Step::Done;
+                }
                 if is_message_stop {
                     // Refusals, context overflow and empty max_tokens stops: reported when the
                     // turn's result arrives, unless Claude Code continues with another message.
@@ -849,7 +870,7 @@ impl Driver {
                     }
                     segment.created_sent = true;
                     if !self.forward(event, segment).await {
-                        return self.consumer_gone().await;
+                        return self.consumer_gone(segment).await;
                     }
                 }
                 ResponseEvent::OutputItemDone(item) => {
@@ -877,7 +898,7 @@ impl Driver {
                         .forward(ResponseEvent::OutputItemDone(item), segment)
                         .await
                     {
-                        return self.consumer_gone().await;
+                        return self.consumer_gone(segment).await;
                     }
                 }
                 ResponseEvent::Completed { .. } => {
@@ -887,7 +908,7 @@ impl Driver {
                     if !segment.message_calls.is_empty() {
                         self.inner.outstanding = std::mem::take(&mut segment.message_calls);
                         if !self.forward(event, segment).await {
-                            return self.consumer_gone().await;
+                            return self.consumer_gone(segment).await;
                         }
                         self.persist().await;
                         return Step::Done;
@@ -900,7 +921,7 @@ impl Driver {
                 }
                 other => {
                     if !self.forward(other, segment).await {
-                        return self.consumer_gone().await;
+                        return self.consumer_gone(segment).await;
                     }
                 }
             }
@@ -1001,6 +1022,7 @@ impl Driver {
         match ClaudeProcess::spawn(&spec, fallback.key.clone()) {
             Ok(process) => self.inner.process = Some(process),
             Err(err) => {
+                forget_unstarted_session(&mut self.inner);
                 self.fail(err).await;
                 return Step::Done;
             }
@@ -1017,13 +1039,26 @@ impl Driver {
     }
 
     /// The consumer dropped the stream: interrupt the turn and release parked calls.
-    async fn cancel(&mut self) {
+    async fn cancel(&mut self, segment: &mut Segment) {
+        // Codex already received these calls and still settles them (a steer runs in-flight
+        // tools before the next request), so their outputs come with that request; telling
+        // Claude Code the turn ended before they ran would contradict it.
+        let forwarded = std::mem::take(&mut segment.message_calls)
+            .into_iter()
+            .chain(std::mem::take(&mut self.inner.outstanding));
+        for call in forwarded {
+            self.core.answer(
+                &call.call_id,
+                &call.mcp_name,
+                error_tool_result(HANDED_OFF_MESSAGE),
+            );
+        }
         settle_query(&mut self.inner, &self.core).await;
         self.persist().await;
     }
 
-    async fn consumer_gone(&mut self) -> Step {
-        self.cancel().await;
+    async fn consumer_gone(&mut self, segment: &mut Segment) -> Step {
+        self.cancel(segment).await;
         Step::Done
     }
 

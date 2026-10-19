@@ -25,6 +25,7 @@ use crate::context::MultiAgentRoleInstructions;
 use crate::context::MultiAgentUsageHint;
 use crate::context::world_state::IncrementalToolsHint;
 use crate::context::world_state::PersistentModeState;
+use crate::provider_models::check_required_model_provider;
 use crate::session::multi_agents::resolve_usage_hints;
 use crate::tasks::InterruptedTurnHistoryMarker;
 use crate::thread_manager::ForkSnapshot;
@@ -473,6 +474,8 @@ impl LocalAgentControl {
         }
         mark_mixed_provider_resume(&mut config, &stored_model_provider);
         if config.model_provider_id != stored_model_provider {
+            check_required_model_provider(&config, &stored_model_provider)
+                .map_err(CodexErr::InvalidRequest)?;
             config.model_provider = config
                 .model_providers
                 .get(&stored_model_provider)
@@ -483,6 +486,10 @@ impl LocalAgentControl {
                     ))
                 })?;
             config.model_provider_id = stored_model_provider;
+            // The sender's provider-specific tuning does not carry over, as on spawn.
+            config.model_verbosity = None;
+            config.model_context_window = None;
+            config.model_auto_compact_token_limit = None;
             config.agent_default_subagent_model = None;
             config.agent_default_subagent_reasoning_effort = None;
         }
@@ -1457,6 +1464,8 @@ impl LocalAgentControl {
         {
             // A child spawned on another provider resumes there; the parent's model and tuning
             // belong to the parent's provider.
+            check_required_model_provider(&config, &stored_thread.model_provider)
+                .map_err(CodexErr::InvalidRequest)?;
             config.model_provider = config
                 .model_providers
                 .get(&stored_thread.model_provider)

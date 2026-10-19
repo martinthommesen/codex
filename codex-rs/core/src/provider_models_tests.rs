@@ -111,6 +111,41 @@ async fn spawn_options_list_only_connected_providers() {
 }
 
 #[tokio::test]
+async fn managed_provider_requirement_limits_spawn_providers() {
+    let codex_home = TempDir::new().expect("tempdir");
+    let mut config = config_in(&codex_home, OPENAI_PROVIDER_ID).await;
+    mark_claude_code_connected(&codex_home);
+    config.config_layer_stack = codex_config::ConfigLayerStack::new(
+        config
+            .config_layer_stack
+            .all_layers_low_to_high()
+            .cloned()
+            .collect(),
+        config.config_layer_stack.requirements().clone(),
+        codex_config::ConfigRequirementsToml {
+            model_provider: Some(OPENAI_PROVIDER_ID.to_string()),
+            ..Default::default()
+        },
+    )
+    .expect("config layer stack");
+
+    assert_eq!(
+        check_required_model_provider(&config, OPENAI_PROVIDER_ID),
+        Ok(())
+    );
+    assert!(check_required_model_provider(&config, CLAUDE_CODE_PROVIDER_ID).is_err());
+    // claude-code is connected, but the requirement keeps the whole agent tree on OpenAI.
+    let options = spawn_provider_options(&config, /*auth_manager*/ None, &[]);
+    assert_eq!(
+        options
+            .iter()
+            .map(|option| option.id.as_str())
+            .collect::<Vec<_>>(),
+        vec![OPENAI_PROVIDER_ID]
+    );
+}
+
+#[tokio::test]
 async fn claude_parent_always_uses_plaintext_and_can_list_openai() {
     let codex_home = TempDir::new().expect("tempdir");
     let config = config_in(&codex_home, CLAUDE_CODE_PROVIDER_ID).await;

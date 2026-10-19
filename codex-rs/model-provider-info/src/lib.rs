@@ -367,6 +367,39 @@ other non-default provider fields are not supported"
         Ok(())
     }
 
+    /// Validates a configured `anthropic` or `claude-code` entry, which partially overrides the
+    /// built-in provider of the same id. Returns `Ok(())` for any other id.
+    ///
+    /// Before these ids became built-in, `[model_providers.anthropic]` was an ordinary custom
+    /// provider, and custom providers always carry a `name`. A `name` (or `wire_api`) that
+    /// differs from the built-in therefore identifies such a pre-existing provider; it is
+    /// rejected instead of being silently converted to the built-in wire protocol.
+    pub fn validate_claude_builtin_override(&self, key: &str) -> Result<(), String> {
+        let (built_in_name, built_in_wire_api) = match key {
+            ANTHROPIC_PROVIDER_ID => (ANTHROPIC_PROVIDER_NAME, WireApi::AnthropicMessages),
+            CLAUDE_CODE_PROVIDER_ID => (CLAUDE_CODE_PROVIDER_NAME, WireApi::ClaudeCode),
+            _ => return Ok(()),
+        };
+        let name = self.name.trim();
+        let redefines_wire_api =
+            self.wire_api != WireApi::default() && self.wire_api != built_in_wire_api;
+        if (!name.is_empty() && name != built_in_name) || redefines_wire_api {
+            return Err(format!(
+                "is the built-in `{built_in_name}` provider and cannot be redefined with a \
+different `name` or `wire_api`; rename your custom provider (for example `{key}-custom`), or \
+remove `name` and `wire_api` to override only the supported fields of the built-in"
+            ));
+        }
+        self.validate_claude_override()?;
+        if key == CLAUDE_CODE_PROVIDER_ID && (self.base_url.is_some() || self.env_key.is_some()) {
+            return Err(
+                "does not support `base_url` or `env_key`; Claude Code uses its own sign-in"
+                    .to_string(),
+            );
+        }
+        Ok(())
+    }
+
     /// OAuth identity and credentials are fixed to Anthropic's HTTPS endpoint. Only retry and
     /// timeout tuning may override the explicitly selected experimental built-in provider.
     pub fn validate_claude_oauth_override(&self) -> Result<(), String> {
@@ -976,17 +1009,9 @@ pub fn merge_configured_model_providers(
             ANTHROPIC_PROVIDER_ID | CLAUDE_CODE_PROVIDER_ID
         ) {
             provider
-                .validate_claude_override()
+                .validate_claude_builtin_override(&key)
                 .map_err(|message| format!("model_providers.{key} {message}"))?;
             if let Some(built_in_provider) = model_providers.get_mut(&key) {
-                if key == CLAUDE_CODE_PROVIDER_ID
-                    && (provider.base_url.is_some() || provider.env_key.is_some())
-                {
-                    return Err(format!(
-                        "model_providers.{key} does not support `base_url` or `env_key`; \
-Claude Code uses its own sign-in"
-                    ));
-                }
                 if let Some(base_url) = provider.base_url.take() {
                     built_in_provider.base_url = Some(base_url);
                 }
