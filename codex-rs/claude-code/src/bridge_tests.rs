@@ -447,6 +447,29 @@ async fn overlong_messages_close_only_that_connection() {
 }
 
 #[tokio::test]
+async fn a_message_of_exactly_the_limit_is_accepted() {
+    let core = Arc::new(BridgeCore::default());
+    core.set_tools(shell_registry());
+    let (client, server) = tokio::io::duplex(64 * 1024);
+    core.spawn_connection(server);
+    let (read, mut writer) = tokio::io::split(client);
+    let mut lines = BufReader::new(read).lines();
+    let mut message = br#"{"jsonrpc":"2.0","id":1,"method":"ping""#.to_vec();
+    message.resize(MAX_MESSAGE_BYTES - 1, b' ');
+    message.extend_from_slice(b"}\n");
+    tokio::spawn(async move {
+        let _ = writer.write_all(&message).await;
+    });
+    let response = tokio::time::timeout(Duration::from_secs(10), lines.next_line())
+        .await
+        .expect("the bridge answers")
+        .expect("read")
+        .expect("the connection stays open");
+    let response: Value = serde_json::from_str(&response).expect("json response");
+    assert_eq!(response["id"], json!(1));
+}
+
+#[tokio::test]
 async fn parked_calls_per_connection_are_bounded() {
     let core = Arc::new(BridgeCore::default());
     core.set_tools(shell_registry());

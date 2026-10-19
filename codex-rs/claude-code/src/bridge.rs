@@ -506,6 +506,8 @@ impl BridgeCore {
         let mut line = Vec::new();
         loop {
             line.clear();
+            // A message of exactly the limit fits together with its newline; anything longer is
+            // known to be oversized after one more byte.
             let read = (&mut reader)
                 .take(MAX_MESSAGE_BYTES as u64 + 1)
                 .read_until(b'\n', &mut line)
@@ -514,7 +516,8 @@ impl BridgeCore {
                 Ok(0) | Err(_) => break,
                 Ok(_) => {}
             }
-            if line.len() > MAX_MESSAGE_BYTES {
+            let message_len = line.len() - usize::from(line.last() == Some(&b'\n'));
+            if message_len > MAX_MESSAGE_BYTES {
                 warn!(
                     limit = MAX_MESSAGE_BYTES,
                     "closing a Codex tool bridge connection that sent an oversized message"

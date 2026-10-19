@@ -419,7 +419,9 @@ Rules:
   resumed agent goes back to its own provider from a parent or sender on another one:
   `model_verbosity`, `model_context_window`, `model_auto_compact_token_limit`, and the
   `agents.default_subagent_model` and `agents.default_subagent_reasoning_effort` defaults. An agent
-  role still applies on top of that reset. If the role pins a model that the child's provider does not serve, the spawn is
+  role still applies on top of that reset when a child starts and when a multi-agent v2 child is
+  reloaded. Resuming a whole agent tree from saved rollouts does not re-apply roles. If the role
+  pins a model that the child's provider does not serve, the spawn is
   rejected. On a Claude provider this also holds when the child stays on its parent's provider:
   the Claude catalog is closed, so a role model it does not list (for example a Claude CLI alias
   such as `opus`, or a gateway model id) is rejected with a hint to use another `agent_type` or
