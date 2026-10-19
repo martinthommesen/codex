@@ -79,6 +79,15 @@ async fn memories_startup_creates_memory_root() -> anyhow::Result<()> {
 
 #[tokio::test]
 async fn memories_startup_skips_claude_code_sessions() -> anyhow::Result<()> {
+    assert_memories_startup_skipped(ModelProviderInfo::create_claude_code_provider()).await
+}
+
+#[tokio::test]
+async fn memories_startup_skips_claude_oauth_sessions() -> anyhow::Result<()> {
+    assert_memories_startup_skipped(ModelProviderInfo::create_claude_oauth_provider()).await
+}
+
+async fn assert_memories_startup_skipped(provider: ModelProviderInfo) -> anyhow::Result<()> {
     let server = start_mock_server().await;
     let home = Arc::new(TempDir::new()?);
     let memory_root = home.path().join("memories");
@@ -89,7 +98,7 @@ async fn memories_startup_skips_claude_code_sessions() -> anyhow::Result<()> {
         .features
         .enable(Feature::MemoryTool)
         .expect("test config should allow feature update");
-    config.model_provider = ModelProviderInfo::create_claude_code_provider();
+    config.model_provider = provider;
     let parent_permission_profile = config.permissions.effective_permission_profile();
 
     start_memories_startup_task(
