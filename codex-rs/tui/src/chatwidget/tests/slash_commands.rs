@@ -4043,6 +4043,7 @@ async fn owned_copy_guard_defers_queued_input_until_released() {
 #[tokio::test]
 async fn config_reloaded_from_disk_updates_settings_gated_state() {
     let (mut chat, _rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+    set_chatgpt_auth(&mut chat);
     let mut reloaded = chat.config.clone();
     // Another Codex turned these off in /settings.
     for feature in [Feature::Plugins, Feature::Apps, Feature::Skills] {
@@ -4077,5 +4078,43 @@ async fn config_reloaded_from_disk_updates_settings_gated_state() {
             false,
             codex_protocol::config_types::WebSearchMode::Disabled
         )
+    );
+}
+
+#[tokio::test]
+async fn apps_command_is_explained_only_where_turning_apps_on_helps() {
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+    chat.set_feature_enabled(Feature::Apps, /*enabled*/ false);
+    // Without a ChatGPT account /apps stays unavailable, so it is not explained as turned off.
+    assert!(chat.feature_command_flags().apps);
+    set_chatgpt_auth(&mut chat);
+    assert!(!chat.feature_command_flags().apps);
+
+    // With apps pinned off, turning the switch back on would only bring back plugins.
+    let mut warnings = Vec::new();
+    chat.config.features =
+        crate::legacy_core::config::ManagedFeatures::from_configured_with_warnings(
+            chat.config.features.get().clone(),
+            Some(codex_config::Sourced {
+                value: codex_config::FeatureRequirementsToml {
+                    entries: [("apps".to_string(), false)].into_iter().collect(),
+                },
+                source: codex_config::RequirementSource::Unknown,
+            }),
+            &mut warnings,
+        )
+        .expect("pins are valid");
+    chat.set_feature_enabled(Feature::Plugins, /*enabled*/ false);
+    drain_insert_history(&mut rx);
+    chat.dispatch_command(SlashCommand::Apps);
+
+    let rendered = drain_insert_history(&mut rx)
+        .iter()
+        .map(|cell| lines_to_single_string(cell))
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        rendered.contains("Plugins & apps is managed by your administrator."),
+        "got {rendered:?}"
     );
 }

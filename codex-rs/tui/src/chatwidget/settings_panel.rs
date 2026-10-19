@@ -6,6 +6,7 @@ use crate::settings_panel::SettingsPanel;
 use crate::settings_panel::SettingsPanelUpdate;
 use crate::settings_panel::SettingsSwitch;
 use crate::settings_panel::SwitchStatus;
+use codex_features::Feature;
 
 impl ChatWidget {
     /// Shows saved values, which can differ from what the running session started with.
@@ -32,6 +33,22 @@ impl ChatWidget {
     }
 
     /// Points at `/settings`, unless requirements keep the feature off there too.
+    /// Like [`Self::turn_back_on_hint`], for a command that needs only `feature` of the switch.
+    pub(super) fn feature_back_on_hint(
+        &self,
+        switch: SettingsSwitch,
+        feature: Feature,
+        hint: &str,
+    ) -> String {
+        // Requirements silently keep a pinned feature, so check the value that sticks.
+        let mut features = self.config.features.clone();
+        if features.set_enabled(feature, /*enabled*/ true).is_ok() && features.enabled(feature) {
+            hint.to_string()
+        } else {
+            format!("{} is managed by your administrator.", switch.label())
+        }
+    }
+
     pub(super) fn turn_back_on_hint(&self, switch: SettingsSwitch, hint: &str) -> String {
         if switch
             .apply(&mut self.config.clone(), /*enabled*/ true)

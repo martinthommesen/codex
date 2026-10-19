@@ -360,33 +360,94 @@ fn remote_web_search_follows_the_app_servers_requirements() {
 }
 
 #[test]
-fn replaced_server_feature_flags_are_detected_in_both_directions() {
-    let session_flags = || origin(ApiSource::SessionFlags);
+fn replaced_server_feature_flags_that_can_hide_an_opposing_layer() {
     let origins = |key: &str| {
         HashMap::from([(
             key.to_string(),
-            serde_json::from_value(session_flags()).expect("valid origin"),
+            serde_json::from_value(origin(ApiSource::SessionFlags)).expect("valid origin"),
         )])
     };
     let launch_overrides =
         HashMap::from([("features".to_string(), serde_json::json!({ "goals": true }))]);
+    let replaced = |enabled: bool, key: &str| {
+        server_feature_flags_replaced(
+            SettingsSwitch::Subagents,
+            enabled,
+            Some(&launch_overrides),
+            &origins(key),
+        )
+    };
 
-    // `--enable multi_agent_v2` on the server can hide `agents.enabled = false` below it.
-    assert!(server_feature_flags_replaced(
-        SettingsSwitch::Subagents,
-        Some(&launch_overrides),
-        &origins("features.multi_agent_v2.enabled"),
+    // `--enable multi_agent_v2` on the server can hide `agents.enabled = false` below it, and it
+    // decides turning subagents off.
+    assert!(replaced(
+        /*enabled*/ true,
+        "features.multi_agent_v2.enabled"
     ));
+    assert!(replaced(
+        /*enabled*/ false,
+        "features.multi_agent_v2.enabled"
+    ));
+    // `multi_agent` cannot keep subagents on once `agents.enabled` is off.
+    assert!(replaced(/*enabled*/ true, "features.multi_agent"));
+    assert!(!replaced(/*enabled*/ false, "features.multi_agent"));
     // Keys outside `[features]` still reach new threads.
-    assert!(!server_feature_flags_replaced(
-        SettingsSwitch::Subagents,
-        Some(&launch_overrides),
-        &origins("agents.enabled"),
-    ));
+    assert!(!replaced(/*enabled*/ true, "agents.enabled"));
     // Without a forwarded table the server's flags stay in place.
     assert!(!server_feature_flags_replaced(
         SettingsSwitch::Subagents,
+        /*enabled*/ true,
         /*launch_overrides*/ None,
         &origins("features.multi_agent_v2.enabled"),
     ));
+}
+
+#[test]
+fn remote_save_trusts_this_tuis_own_flag_over_replaced_server_flags() {
+    let written = user_file("config.toml");
+    let read_back = || {
+        config_read(serde_json::json!({
+            "config": { "features": { "memories": true } },
+            "origins": { "features.memories": origin(ApiSource::SessionFlags) },
+        }))
+    };
+    let launch_origins = HashMap::new();
+    let launch = |features: serde_json::Value| RemoteLaunch {
+        overrides: Some(HashMap::from([("features".to_string(), features)])),
+        origins: &launch_origins,
+        web_search_source: None,
+        web_search_modes: None,
+    };
+
+    // The server's `--enable memories` agrees with the save, but this TUI's `--disable memories`
+    // reaches every new thread.
+    let mut effective_config = read_back();
+    let resolution = resolve_remote_save(
+        SettingsSwitch::Memories,
+        /*enabled*/ true,
+        &mut effective_config,
+        &launch(serde_json::json!({ "memories": false })),
+        &written,
+        /*server_override*/ None,
+    );
+    assert_eq!(
+        (resolution.winner, resolution.unverified),
+        (
+            Some((OverrideLayer::CommandLine, "features.memories".to_string())),
+            None
+        )
+    );
+
+    // Without its own flag, the TUI cannot tell what replacing the server's leaves behind.
+    let mut effective_config = read_back();
+    let resolution = resolve_remote_save(
+        SettingsSwitch::Memories,
+        /*enabled*/ false,
+        &mut effective_config,
+        &launch(serde_json::json!({ "goals": true })),
+        &written,
+        Some(&ApiSource::SessionFlags),
+    );
+    assert!(resolution.unverified.is_some());
+    assert!(!resolution.server_override_stands);
 }

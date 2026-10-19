@@ -91,80 +91,36 @@ impl App {
             {
                 Ok(mut effective_config) => {
                     // The server cannot see the launch choices this TUI sends with each new thread.
-                    let launch_overrides =
-                        crate::app_server_session::config_request_overrides_from_config(
+                    let launch_origins = self.config.config_layer_stack.origins();
+                    let launch = RemoteLaunch {
+                        overrides: crate::app_server_session::config_request_overrides_from_config(
                             &self.config,
                             app_server.thread_params_mode(),
-                        );
-                    let server_flags_replaced = server_feature_flags_replaced(
-                        switch,
-                        launch_overrides.as_ref(),
-                        &effective_config.origins,
-                    );
-                    if server_flags_replaced
-                        && response
-                            .overridden_metadata
-                            .as_ref()
-                            .is_some_and(|metadata| {
-                                matches!(
-                                    metadata.overriding_layer.name,
-                                    codex_app_server_protocol::ConfigLayerSource::SessionFlags
-                                )
-                            })
-                    {
-                        // Those flags do not reach new threads either, so they cannot override.
-                        overridden = None;
-                    }
-                    let flagged =
-                        overlay_launch_overrides(&mut effective_config, launch_overrides.as_ref());
-                    let requirements_disallow =
-                        remote_web_search_modes.as_ref().is_some_and(|modes| {
-                            constrain_web_search(&mut effective_config, modes.as_deref())
-                        });
-                    adopt_effective_switch_state(&mut self.config, switch, &effective_config);
-                    let launch_origins = self.config.config_layer_stack.origins();
-                    let web_search_source = crate::app_server_session::forwarded_web_search_key(
-                        &self.config,
-                        app_server.thread_params_mode(),
-                    );
-                    let flag_precedence =
-                        codex_app_server_protocol::ConfigLayerSource::SessionFlags.precedence();
-                    winner = switch_override_layer(
+                        ),
+                        origins: &launch_origins,
+                        web_search_source: crate::app_server_session::forwarded_web_search_key(
+                            &self.config,
+                            app_server.thread_params_mode(),
+                        ),
+                        web_search_modes: remote_web_search_modes.as_ref(),
+                    };
+                    let resolution = resolve_remote_save(
                         switch,
                         enabled,
-                        &serde_json::to_value(&effective_config.config).unwrap_or_default(),
-                        effective_config
-                            .origins
-                            .iter()
-                            .map(|(key, origin)| {
-                                let layer = OverrideLayer::from_api(&origin.name, written);
-                                (key.as_str(), origin.name.precedence(), layer)
-                            })
-                            .chain(flagged.iter().map(|key| {
-                                let source = launch_source_key(key, web_search_source.as_deref());
-                                let layer = OverrideLayer::launch(launch_origins.get(source));
-                                (key.as_str(), flag_precedence, Some(layer))
-                            })),
-                    )
-                    .map(|(layer, key)| {
-                        // Name the launch key the user set, such as a legacy search feature.
-                        let launched = flagged.contains(&key)
-                            && matches!(layer, OverrideLayer::CommandLine | OverrideLayer::Profile);
-                        let key = if launched {
-                            launch_source_key(&key, web_search_source.as_deref()).to_string()
-                        } else {
-                            key
-                        };
-                        (layer, key)
-                    })
-                    .or_else(|| {
-                        requirements_disallow
-                            .then(|| (OverrideLayer::Requirements, "web_search".to_string()))
-                    });
-                    server_flags_replaced.then(|| {
-                        "the app server's own feature flags do not reach threads this TUI starts"
-                            .to_string()
-                    })
+                        &mut effective_config,
+                        &launch,
+                        written,
+                        response
+                            .overridden_metadata
+                            .as_ref()
+                            .map(|metadata| &metadata.overriding_layer.name),
+                    );
+                    adopt_effective_switch_state(&mut self.config, switch, &effective_config);
+                    if !resolution.server_override_stands {
+                        overridden = None;
+                    }
+                    winner = resolution.winner;
+                    resolution.unverified
                 }
                 Err(err) => {
                     tracing::warn!(error = %err, switch = label, "failed to read config after a settings save");
@@ -471,10 +427,101 @@ fn constrain_web_search(
     true
 }
 
+/// The launch choices this TUI sends with each new thread to a remote app server, and where they
+/// came from.
+struct RemoteLaunch<'a> {
+    overrides: Option<HashMap<String, serde_json::Value>>,
+    origins: &'a HashMap<String, codex_config::ConfigLayerMetadata>,
+    /// The launch key behind a forwarded `web_search`.
+    web_search_source: Option<String>,
+    /// The app server's allowed web search modes, when this save needs them.
+    web_search_modes: Option<&'a Option<Vec<WebSearchMode>>>,
+}
+
+/// What a remote save resolves to for new threads.
+struct RemoteResolution {
+    winner: Option<(OverrideLayer, String)>,
+    unverified: Option<String>,
+    /// False when the app server's override comes from its own launch flags, which do not reach
+    /// threads this TUI starts.
+    server_override_stands: bool,
+}
+
+/// Applies `launch` to what a remote app server read back and finds what still decides `switch`.
+fn resolve_remote_save(
+    switch: SettingsSwitch,
+    enabled: bool,
+    effective_config: &mut ConfigReadResponse,
+    launch: &RemoteLaunch<'_>,
+    written: &AbsolutePathBuf,
+    server_override: Option<&codex_app_server_protocol::ConfigLayerSource>,
+) -> RemoteResolution {
+    let server_flags_replaced = server_feature_flags_replaced(
+        switch,
+        enabled,
+        launch.overrides.as_ref(),
+        &effective_config.origins,
+    );
+    let flagged = overlay_launch_overrides(effective_config, launch.overrides.as_ref());
+    let requirements_disallow = launch
+        .web_search_modes
+        .is_some_and(|modes| constrain_web_search(effective_config, modes.as_deref()));
+    let flag_precedence = codex_app_server_protocol::ConfigLayerSource::SessionFlags.precedence();
+    let web_search_source = launch.web_search_source.as_deref();
+    let winner = switch_override_layer(
+        switch,
+        enabled,
+        &serde_json::to_value(&effective_config.config).unwrap_or_default(),
+        effective_config
+            .origins
+            .iter()
+            .map(|(key, origin)| {
+                let layer = OverrideLayer::from_api(&origin.name, written);
+                (key.as_str(), origin.name.precedence(), layer)
+            })
+            .chain(flagged.iter().map(|key| {
+                let source = launch_source_key(key, web_search_source);
+                let layer = OverrideLayer::launch(launch.origins.get(source));
+                (key.as_str(), flag_precedence, Some(layer))
+            })),
+    );
+    // This TUI's own forwarded flag reaches new threads, so it decides even when the server's
+    // flags are replaced.
+    let launch_decides = winner.as_ref().is_some_and(|(layer, key)| {
+        flagged.contains(key)
+            && matches!(layer, OverrideLayer::CommandLine | OverrideLayer::Profile)
+    });
+    let winner = winner
+        .map(|(layer, key)| {
+            // Name the launch key the user set, such as a legacy search feature.
+            let key = if launch_decides {
+                launch_source_key(&key, web_search_source).to_string()
+            } else {
+                key
+            };
+            (layer, key)
+        })
+        .or_else(|| {
+            requirements_disallow.then(|| (OverrideLayer::Requirements, "web_search".to_string()))
+        });
+    RemoteResolution {
+        winner,
+        unverified: (server_flags_replaced && !launch_decides).then(|| {
+            "the app server's own feature flags do not reach threads this TUI starts".to_string()
+        }),
+        server_override_stands: !(server_flags_replaced
+            && matches!(
+                server_override,
+                Some(codex_app_server_protocol::ConfigLayerSource::SessionFlags)
+            )),
+    }
+}
+
 /// Whether the app server's own `[features]` launch flags decide `switch`. thread/start replaces
 /// them with the table this TUI sends, so what they leave behind is not visible in config/read.
 fn server_feature_flags_replaced(
     switch: SettingsSwitch,
+    enabled: bool,
     launch_overrides: Option<&HashMap<String, serde_json::Value>>,
     origins: &HashMap<String, codex_app_server_protocol::ConfigLayerMetadata>,
 ) -> bool {
@@ -484,9 +531,10 @@ fn server_feature_flags_replaced(
                 origin.name,
                 codex_app_server_protocol::ConfigLayerSource::SessionFlags
             ) && key.starts_with("features.")
-                // A flag that agrees with the save can still hide a layer that opposes it.
-                && (decides_switch(switch, /*enabled*/ true, key)
-                    || decides_switch(switch, /*enabled*/ false, key))
+                // Turning Subagents on, an agreeing `multi_agent_v2` flag can still hide an
+                // opposing `agents.enabled`; the other switches decide the same way both ways.
+                && (decides_switch(switch, enabled, key)
+                    || (enabled && decides_switch(switch, /*enabled*/ false, key)))
         })
 }
 

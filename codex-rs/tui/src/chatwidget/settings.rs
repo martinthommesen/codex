@@ -304,6 +304,7 @@ impl ChatWidget {
         self.has_codex_backend_auth = has_codex_backend_auth;
         self.bottom_pane
             .set_connectors_enabled(self.connectors_enabled());
+        self.sync_feature_commands();
         self.refresh_connector_mentions(/*force_refresh*/ false);
         self.bottom_pane
             .set_token_activity_command_enabled(has_codex_backend_auth);
@@ -366,7 +367,12 @@ impl ChatWidget {
     }
 
     pub(super) fn feature_command_flags(&self) -> FeatureCommandFlags {
-        FeatureCommandFlags::from_features(&self.config.features)
+        FeatureCommandFlags {
+            // Without a ChatGPT account /apps is unavailable whatever the switch says, so it is
+            // not explained as turned off.
+            apps: self.config.features.enabled(Feature::Apps) || !self.has_chatgpt_account,
+            ..FeatureCommandFlags::from_features(&self.config.features)
+        }
     }
 
     pub(super) fn sync_feature_commands(&mut self) {
