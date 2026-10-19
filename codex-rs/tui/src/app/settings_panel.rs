@@ -458,8 +458,8 @@ fn resolve_remote_save(
 ) -> RemoteResolution {
     // The overlay changes values, not origins, so origins still name the server's own flags.
     let flagged = overlay_launch_overrides(effective_config, launch.overrides.as_ref());
-    let server_flags_replaced = |covered: &HashSet<String>| {
-        server_feature_flags_replaced(
+    let replaced_keys = |covered: &HashSet<String>| {
+        replaced_server_feature_keys(
             switch,
             enabled,
             launch.overrides.as_ref(),
@@ -469,8 +469,11 @@ fn resolve_remote_save(
     };
     // Server flags on keys this TUI forwards are overwritten in the overlay already; the rest
     // leave something behind that config/read cannot show.
-    let unchecked = server_flags_replaced(&flagged);
-    let server_override_stands = !(server_flags_replaced(&HashSet::new())
+    let hidden = replaced_keys(&flagged)
+        .into_iter()
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    let server_override_stands = !(!replaced_keys(&HashSet::new()).is_empty()
         && matches!(
             server_override,
             Some(codex_app_server_protocol::ConfigLayerSource::SessionFlags)
@@ -497,12 +500,26 @@ fn resolve_remote_save(
                 (key.as_str(), flag_precedence, Some(layer))
             })),
     );
+    let launched_winner = winner
+        .as_ref()
+        .filter(|(layer, key)| {
+            flagged.contains(key)
+                && matches!(layer, OverrideLayer::CommandLine | OverrideLayer::Profile)
+        })
+        .map(|(_, key)| switch_feature_for_key(switch, key));
+    // This TUI's own forwarded flag reaches new threads, so it settles the switch unless a hidden
+    // server flag sets the same feature (a legacy alias can still win) or subagents are turned on
+    // and a hidden `multi_agent_v2` could still turn them on.
+    let launch_decides = launched_winner.is_some_and(|feature| {
+        !(switch == SettingsSwitch::Subagents && enabled)
+            && hidden
+                .iter()
+                .all(|key| switch_feature_for_key(switch, key) != feature)
+    });
     let winner = winner
         .map(|(layer, key)| {
             // Name the launch key the user set, such as a legacy search feature.
-            let launched = flagged.contains(&key)
-                && matches!(layer, OverrideLayer::CommandLine | OverrideLayer::Profile);
-            let key = if launched {
+            let key = if launched_winner.is_some() {
                 launch_source_key(&key, web_search_source).to_string()
             } else {
                 key
@@ -514,34 +531,56 @@ fn resolve_remote_save(
         });
     RemoteResolution {
         winner,
-        unverified: unchecked.then(|| {
+        unverified: (!hidden.is_empty() && !launch_decides).then(|| {
             "the app server's own feature flags do not reach threads this TUI starts".to_string()
         }),
         server_override_stands,
     }
 }
 
-/// Whether the app server's own `[features]` launch flags decide `switch`. thread/start replaces
+/// The app server's own `[features]` launch flags that can decide `switch`. thread/start replaces
 /// them with the table this TUI sends, so what they leave behind is not visible in config/read.
-/// Keys in `covered`, which that table sets itself, are already resolved and do not count.
-fn server_feature_flags_replaced(
+/// Keys in `covered`, which that table sets itself, are already resolved and are left out.
+fn replaced_server_feature_keys<'a>(
     switch: SettingsSwitch,
     enabled: bool,
     launch_overrides: Option<&HashMap<String, serde_json::Value>>,
-    origins: &HashMap<String, codex_app_server_protocol::ConfigLayerMetadata>,
+    origins: &'a HashMap<String, codex_app_server_protocol::ConfigLayerMetadata>,
     covered: &HashSet<String>,
-) -> bool {
-    launch_overrides.is_some_and(|overrides| overrides.contains_key("features"))
-        && origins.iter().any(|(key, origin)| {
+) -> Vec<&'a str> {
+    if !launch_overrides.is_some_and(|overrides| overrides.contains_key("features")) {
+        return Vec::new();
+    }
+    origins
+        .iter()
+        .filter(|(key, origin)| {
             matches!(
                 origin.name,
                 codex_app_server_protocol::ConfigLayerSource::SessionFlags
             ) && key.starts_with("features.")
-                && !covered.contains(key)
+                && !covered.contains(key.as_str())
                 // Turning Subagents on, an agreeing `multi_agent_v2` flag can still hide an
                 // opposing `agents.enabled`; the other switches decide the same way both ways.
                 && (decides_switch(switch, enabled, key)
                     || (enabled && decides_switch(switch, /*enabled*/ false, key)))
+        })
+        .map(|(key, _)| key.as_str())
+        .collect()
+}
+
+/// The feature of `switch` that a `features.*` key sets, directly or through a legacy alias.
+fn switch_feature_for_key(switch: SettingsSwitch, key: &str) -> Option<Feature> {
+    let name = key.strip_prefix("features.")?;
+    let name = name.strip_suffix(".enabled").unwrap_or(name);
+    switch
+        .features()
+        .iter()
+        .copied()
+        .chain((switch == SettingsSwitch::Subagents).then_some(Feature::MultiAgentV2))
+        .find(|feature| {
+            std::iter::once(feature.key())
+                .chain(codex_features::legacy_keys_for_feature(*feature))
+                .any(|feature_key| feature_key == name)
         })
 }
 
@@ -705,26 +744,17 @@ fn opposes_save(
 
 /// Whether `key` can keep the switch from reaching `enabled`.
 fn decides_switch(switch: SettingsSwitch, enabled: bool, key: &str) -> bool {
-    let sets_feature = |feature: Feature| {
-        let Some(name) = key.strip_prefix("features.") else {
-            return false;
-        };
-        let name = name.strip_suffix(".enabled").unwrap_or(name);
-        std::iter::once(feature.key())
-            .chain(codex_features::legacy_keys_for_feature(feature))
-            .any(|feature_key| feature_key == name)
-    };
     match switch {
         SettingsSwitch::WebSearch => key == "web_search",
         // Subagents need `agents.enabled` and `multi_agent` to turn on, and `agents.enabled` and
         // `multi_agent_v2` off to turn off.
         SettingsSwitch::Subagents => {
-            key == "agents.enabled"
-                || sets_feature(if enabled {
-                    Feature::Collab
-                } else {
-                    Feature::MultiAgentV2
-                })
+            let deciding = if enabled {
+                Feature::Collab
+            } else {
+                Feature::MultiAgentV2
+            };
+            key == "agents.enabled" || switch_feature_for_key(switch, key) == Some(deciding)
         }
         SettingsSwitch::PluginsAndApps
         | SettingsSwitch::Skills
@@ -732,10 +762,7 @@ fn decides_switch(switch: SettingsSwitch, enabled: bool, key: &str) -> bool {
         | SettingsSwitch::AgentsMd
         | SettingsSwitch::Memories
         | SettingsSwitch::ImageGeneration
-        | SettingsSwitch::Goals => switch
-            .features()
-            .iter()
-            .any(|feature| sets_feature(*feature)),
+        | SettingsSwitch::Goals => switch_feature_for_key(switch, key).is_some(),
     }
 }
 
