@@ -661,6 +661,82 @@ async fn skills_only_plugins_add_no_plugin_guidance_when_skills_are_off() -> Res
     Ok(())
 }
 
+/// A hosted plugin with no connectors, so skills would be its only capability.
+struct SkillsOnlyHostedPlugin;
+
+impl codex_extension_api::McpServerContributor<Config> for SkillsOnlyHostedPlugin {
+    fn id(&self) -> &'static str {
+        "skills_only_hosted_plugin"
+    }
+
+    fn contribute<'a>(
+        &'a self,
+        _context: codex_extension_api::McpServerContributionContext<'a, Config>,
+    ) -> ExtensionFuture<'a, Vec<codex_extension_api::McpServerContribution>> {
+        Box::pin(async {
+            vec![
+                codex_extension_api::McpServerContribution::HostedPluginConnectors {
+                    plugin_id: "hosted@test".to_string(),
+                    plugin_display_name: "Hosted".to_string(),
+                    connector_ids: Vec::new(),
+                },
+            ]
+        })
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn selected_skills_only_plugins_add_no_plugin_guidance_when_skills_are_off() -> Result<()> {
+    skip_if_no_network!(Ok(()));
+
+    for skills_enabled in [true, false] {
+        let server = responses::start_mock_server().await;
+        let response = mount_sse_once(
+            &server,
+            sse(vec![ev_response_created("resp1"), ev_completed("resp1")]),
+        )
+        .await;
+        let mut extensions = ExtensionRegistryBuilder::<Config>::new();
+        extensions.mcp_server_contributor(Arc::new(SkillsOnlyHostedPlugin));
+        let test = test_codex()
+            .with_extensions(Arc::new(extensions.build()))
+            .with_config(move |config| {
+                for (feature, enabled) in
+                    [(Feature::Plugins, true), (Feature::Skills, skills_enabled)]
+                {
+                    config
+                        .features
+                        .set_enabled(feature, enabled)
+                        .expect("test config should allow feature update");
+                }
+            })
+            .build_with_auto_env(&server)
+            .await?;
+
+        test.codex
+            .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
+                text: "hello".to_string(),
+                text_elements: Vec::new(),
+            }]))
+            .await?;
+        core_test_support::wait_for_event(&test.codex, |event| {
+            matches!(event, EventMsg::TurnComplete(_))
+        })
+        .await;
+
+        let developer_text = response
+            .single_request()
+            .message_input_texts("developer")
+            .join("\n\n");
+        assert_eq!(
+            developer_text.contains("## Plugins"),
+            skills_enabled,
+            "skills_enabled={skills_enabled}: {developer_text}"
+        );
+    }
+    Ok(())
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn capability_sections_render_in_order_with_host_repo_and_plugin_skills() -> Result<()> {
     skip_if_wine_exec!(

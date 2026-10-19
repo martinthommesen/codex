@@ -1951,10 +1951,17 @@ impl ChatWidget {
     }
 
     pub(crate) fn sync_plugin_mentions_config(&mut self, config: &Config) {
+        let skills_were_enabled = self.config.features.enabled(Feature::Skills);
         self.config.features = config.features.clone();
         self.config.config_layer_stack = config.config_layer_stack.clone();
         self.config.memories = config.memories.clone();
         self.sync_mentions_v2_enabled();
+        // `/settings` in another Codex can change these on disk.
+        self.sync_feature_commands();
+        self.sync_goal_command_enabled();
+        if self.config.features.enabled(Feature::Skills) != skills_were_enabled {
+            self.refresh_skills_for_current_cwd(/*force_reload*/ true);
+        }
     }
 
     pub(crate) fn token_usage(&self) -> TokenUsage {

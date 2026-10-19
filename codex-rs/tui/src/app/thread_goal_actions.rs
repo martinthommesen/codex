@@ -352,9 +352,21 @@ async fn cleanup_materialized_goal_files(
 fn thread_goal_error_message(action: &str, err: &color_eyre::Report) -> String {
     if is_ephemeral_thread_goal_error(err) {
         EPHEMERAL_THREAD_GOAL_ERROR_MESSAGE.to_string()
+    } else if is_goals_off_for_thread_error(err) {
+        GOALS_OFF_FOR_THREAD_ERROR_MESSAGE.to_string()
     } else {
         format!("Failed to {action} thread goal: {err}")
     }
+}
+
+/// Each thread keeps the Goals setting it started with, so turning Goals on in `/settings` only
+/// reaches new sessions.
+const GOALS_OFF_FOR_THREAD_ERROR_MESSAGE: &str =
+    "Goals were off when this session started. Use /new to start a session with goals.";
+
+fn is_goals_off_for_thread_error(err: &color_eyre::Report) -> bool {
+    err.chain()
+        .any(|cause| cause.to_string().contains("goals feature is disabled"))
 }
 
 fn is_ephemeral_thread_goal_error(err: &color_eyre::Report) -> bool {
@@ -420,6 +432,17 @@ mod tests {
         .expect("insert history lines");
 
         insta::assert_snapshot!(terminal.backend());
+    }
+
+    #[test]
+    fn thread_goal_error_message_explains_goals_off_for_the_session() {
+        let err = color_eyre::eyre::eyre!("thread/goal/get failed: goals feature is disabled")
+            .wrap_err("thread/goal/get failed in TUI");
+
+        assert_eq!(
+            thread_goal_error_message("read", &err),
+            GOALS_OFF_FOR_THREAD_ERROR_MESSAGE
+        );
     }
 
     #[test]

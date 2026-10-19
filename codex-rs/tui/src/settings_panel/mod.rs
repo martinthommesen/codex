@@ -127,7 +127,7 @@ impl SettingsSwitch {
     /// Effective state of every key this switch writes.
     pub(crate) fn state(self, config: &Config) -> SwitchState {
         match self {
-            Self::Subagents => SwitchState::from_values(&[subagents_available(config)]),
+            Self::Subagents => subagents_state(config),
             Self::WebSearch => SwitchState::from_values(&[
                 config.web_search_mode.value() != WebSearchMode::Disabled
             ]),
@@ -163,12 +163,19 @@ impl SettingsSwitch {
         }
         match self {
             Self::Subagents => {
+                let before = self.state(config);
                 config.agents_enabled = enabled;
                 if !enabled && let Err(err) = set_feature(config, Feature::MultiAgentV2, enabled) {
                     pinned = pinned.or(Some(err));
                 }
                 // Subagents follow the combined keys, so a pin only matters if it decides them.
-                if subagents_available(config) != enabled {
+                let after = self.state(config);
+                let reached = if enabled {
+                    after != SwitchState::Off
+                } else {
+                    after == SwitchState::Off
+                };
+                if !reached || after == before {
                     return Err(pinned.unwrap_or_else(|| {
                         "requirements decide whether subagents are available".to_string()
                     }));
@@ -282,11 +289,19 @@ impl SettingsSwitch {
     }
 }
 
-/// Mirrors core: `features.multi_agent_v2` turns subagents on regardless of `agents.enabled`, which
-/// in turn overrides `features.multi_agent`.
-fn subagents_available(config: &Config) -> bool {
-    config.features.enabled(Feature::MultiAgentV2)
-        || (config.agents_enabled && config.features.enabled(Feature::Collab))
+/// Mirrors core: `features.multi_agent_v2` turns subagents on and `agents.enabled = false` turns
+/// them off. Otherwise the model's catalog version decides, and `features.multi_agent` only
+/// applies to models without one, so that case is partial.
+fn subagents_state(config: &Config) -> SwitchState {
+    if config.features.enabled(Feature::MultiAgentV2) {
+        SwitchState::On
+    } else if !config.agents_enabled {
+        SwitchState::Off
+    } else if config.features.enabled(Feature::Collab) {
+        SwitchState::On
+    } else {
+        SwitchState::Partial
+    }
 }
 
 fn feature_edit(feature: Feature, enabled: bool) -> ConfigEdit {

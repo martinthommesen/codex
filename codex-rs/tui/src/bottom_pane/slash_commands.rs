@@ -167,9 +167,9 @@ pub(crate) fn commands_for_input(
 
 /// Find a single built-in command by a recognized name or alias, after applying feature gating.
 ///
-/// Side-conversation, token-activity, and `/settings` feature gating are intentionally enforced by
-/// dispatch rather than command lookup so a typed command can produce a specific unavailable
-/// message while the popup still hides it.
+/// Side-conversation, token-activity, goal, and `/settings` feature gating are intentionally
+/// enforced by dispatch rather than command lookup so a typed command can produce a specific
+/// unavailable message while the popup still hides it.
 pub(crate) fn find_builtin_command(name: &str, flags: BuiltinCommandFlags) -> Option<SlashCommand> {
     let cmd = SlashCommand::from_str(name).ok().or_else(|| {
         let repeated_os = name.strip_prefix('g')?.strip_suffix("al")?;
@@ -180,6 +180,7 @@ pub(crate) fn find_builtin_command(name: &str, flags: BuiltinCommandFlags) -> Op
         token_activity_command_enabled: true,
         daybreak_command_description: Some(""),
         side_conversation_active: false,
+        goal_command_enabled: true,
         feature_commands: FeatureCommandFlags::ALL,
         ..flags
     })
@@ -370,10 +371,20 @@ mod tests {
     }
 
     #[test]
-    fn goal_command_is_hidden_when_disabled() {
+    fn goal_command_is_hidden_when_disabled_but_still_parses() {
         let mut flags = all_enabled_flags();
         flags.goal_command_enabled = false;
-        assert_eq!(find_builtin_command("goal", flags), None);
+        assert_eq!(
+            builtins_for_input(flags)
+                .into_iter()
+                .find(|(_, command)| *command == SlashCommand::Goal),
+            None
+        );
+        // Dispatch explains why goals are unavailable instead of reporting an unknown command.
+        assert_eq!(
+            find_builtin_command("goal", flags),
+            Some(SlashCommand::Goal)
+        );
     }
 
     #[test]

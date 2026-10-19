@@ -1280,6 +1280,10 @@ impl ChatWidget {
             rest_offset + leading_trimmed,
             &text_elements,
         );
+        // A refused new goal only prints why, so later queued input can go out.
+        let refused_new_goal = cmd == SlashCommand::Goal
+            && !self.config.features.enabled(Feature::Goals)
+            && !is_goal_control_args(trimmed_rest);
         self.dispatch_prepared_command_with_args(
             cmd,
             PreparedSlashCommandArgs {
@@ -1292,6 +1296,9 @@ impl ChatWidget {
                 source: SlashCommandDispatchSource::Queued,
             },
         );
+        if refused_new_goal {
+            return QueueDrain::Continue;
+        }
         self.queued_command_drain_result(cmd)
     }
 
@@ -1475,4 +1482,12 @@ impl ChatWidget {
         self.bottom_pane.drain_pending_submission_state();
         false
     }
+}
+
+/// `/goal` arguments that act on the current goal instead of starting a new one.
+fn is_goal_control_args(args: &str) -> bool {
+    matches!(
+        args.to_ascii_lowercase().as_str(),
+        "clear" | "edit" | "pause" | "resume"
+    )
 }

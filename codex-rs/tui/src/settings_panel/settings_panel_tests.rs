@@ -474,3 +474,55 @@ async fn subagents_turn_off_and_on_while_multi_agent_is_pinned_on() {
         .expect("agents.enabled can turn subagents back on");
     assert_eq!(subagents.state(&config), SwitchState::On);
 }
+
+#[tokio::test]
+async fn subagents_turn_off_while_multi_agent_is_pinned_off() {
+    let (_codex_home, mut config) = test_config().await;
+    let mut warnings = Vec::new();
+    config.features = ManagedFeatures::from_configured_with_warnings(
+        config.features.get().clone(),
+        Some(Sourced {
+            value: FeatureRequirementsToml {
+                entries: [("multi_agent".to_string(), false)].into_iter().collect(),
+            },
+            source: RequirementSource::Unknown,
+        }),
+        &mut warnings,
+    )
+    .expect("pins are valid");
+    let subagents = SettingsSwitch::Subagents;
+    let status_of = |config: &Config| {
+        statuses(config)
+            .into_iter()
+            .find(|status| status.switch == subagents)
+            .expect("subagents has a status")
+    };
+
+    // Models with a catalog version still get subagents, so the switch is partial and can still
+    // turn them off through `agents.enabled`.
+    assert_eq!(
+        status_of(&config),
+        SwitchStatus {
+            switch: subagents,
+            state: SwitchState::Partial,
+            target: Some(false),
+            managed: true,
+        }
+    );
+    subagents
+        .apply(&mut config, /*enabled*/ false)
+        .expect("agents.enabled can turn subagents off");
+    assert_eq!(
+        status_of(&config),
+        SwitchStatus {
+            switch: subagents,
+            state: SwitchState::Off,
+            target: Some(true),
+            managed: true,
+        }
+    );
+    subagents
+        .apply(&mut config, /*enabled*/ true)
+        .expect("agents.enabled can turn subagents back on");
+    assert_eq!(subagents.state(&config), SwitchState::Partial);
+}
