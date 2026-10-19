@@ -79,6 +79,35 @@ async fn explicit_env_key_is_sent_as_x_api_key() {
 }
 
 #[tokio::test]
+async fn custom_anthropic_messages_provider_without_env_key_sends_the_stored_key() {
+    // Documented in docs/claude.md: every `anthropic_messages` provider shares the stored key,
+    // whatever its id and base URL, unless it sets its own credential source.
+    let codex_home = tempfile::tempdir().expect("tempdir");
+    let auth_manager = AuthManager::from_auth_for_testing_with_home(
+        CodexAuth::from_api_key("sk-openai-test"),
+        codex_home.path().to_path_buf(),
+    );
+    auth_manager
+        .anthropic_auth_config()
+        .save_api_key("sk-ant-stored-shared-key")
+        .expect("store key");
+    let info = ModelProviderInfo {
+        name: "Gateway".to_string(),
+        base_url: Some("https://gateway.example/v1".to_string()),
+        wire_api: codex_model_provider_info::WireApi::AnthropicMessages,
+        ..Default::default()
+    };
+    let provider = create_model_provider(info, Some(auth_manager));
+    let auth = provider.api_auth().await.expect("auth resolves");
+    let mut headers = HeaderMap::new();
+    auth.add_auth_headers(&mut headers);
+    assert_eq!(
+        headers.get("x-api-key").map(|value| value.to_str().ok()),
+        Some(Some("sk-ant-stored-shared-key"))
+    );
+}
+
+#[tokio::test]
 async fn env_key_that_cannot_be_sent_fails_without_echoing_it() {
     const VAR: &str = "CODEX_TEST_ANTHROPIC_INVALID_KEY_5c1e";
     // SAFETY: the variable name is unique to this test.

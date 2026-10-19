@@ -10,11 +10,11 @@ Codex ships three built-in Claude providers. Their credentials stay separate fro
 from your ChatGPT/OpenAI login. Selecting `claude-oauth` is an explicit opt-in to an experimental,
 unsupported compatibility transport.
 
-| Provider id    | How it authenticates                               | How requests are sent                                                             | Billing                                                             |
-| -------------- | -------------------------------------------------- | --------------------------------------------------------------------------------- | ------------------------------------------------------------------- |
-| `anthropic`    | An Anthropic API key (Claude Console)              | Native HTTP to the Messages API                                                   | API usage on your Console organization                              |
-| `claude-code`  | The official Claude Code binary's own sign-in      | Codex runs the unmodified `claude` CLI                                            | Whatever Anthropic charges for that Claude Code sign-in             |
-| `claude-oauth` | A separate interactive OAuth login stored by Codex | Native Rust HTTP directly to Anthropic; no CLI, Agent SDK, or CLIProxyAPI process | Anthropic decides; subscription allowance has **not been verified** |
+| Provider id    | How it authenticates                               | How requests are sent                                                             | Billing                                                                                                                                                               |
+| -------------- | -------------------------------------------------- | --------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `anthropic`    | An Anthropic API key (Claude Console)              | Native HTTP to the Messages API                                                   | API usage on your Console organization (or whatever a gateway you configure charges)                                                                                  |
+| `claude-code`  | The official Claude Code binary's own sign-in      | Codex runs the unmodified `claude` CLI                                            | Whatever the credential Claude Code uses charges: a Claude subscription, an Anthropic Console API key, or a cloud provider such as Amazon Bedrock or Google Vertex AI |
+| `claude-oauth` | A separate interactive OAuth login stored by Codex | Native Rust HTTP directly to Anthropic; no CLI, Agent SDK, or CLIProxyAPI process | Anthropic decides; subscription allowance has **not been verified**                                                                                                   |
 
 ### Authentication policy and experimental support
 
@@ -58,14 +58,32 @@ codex logout --provider anthropic
 ```
 
 - Codex stores the key in its own Anthropic credential store, not in `auth.json`. The store follows
-  `cli_auth_credentials_store` (`file`, `keyring`, `auto`, `ephemeral`). In file mode the key is
-  written to `$CODEX_HOME/anthropic_auth.json` with mode `0600`. In keyring mode it is saved under
-  the keyring service `Codex Anthropic Auth`, or in the encrypted secrets file
+  `cli_auth_credentials_store` (`file` by default, or `keyring`, `auto`, `ephemeral`). In file mode
+  the key is written to `$CODEX_HOME/anthropic_auth.json` with mode `0600`. In keyring mode it is
+  saved under the keyring service `Codex Anthropic Auth`, or in the encrypted secrets file
   `$CODEX_HOME/secrets/anthropic_auth.age`.
+- In `auto` mode Codex tries the keyring first. If saving there fails, it writes the key to the
+  plaintext `$CODEX_HOME/anthropic_auth.json` (mode `0600`) instead and only logs a warning; the
+  login message does not say which store was used. Codex also reads that file whenever the keyring
+  has no key or cannot be read. A later successful keyring save removes the plaintext copy. Use
+  `keyring` mode if a missing keyring should be an error. Unlike `claude-oauth`, the Anthropic key
+  store has this plaintext fallback.
 - If Codex has no stored key, it falls back to the `ANTHROPIC_API_KEY` environment variable.
-- Codex sends the key as an `x-api-key` header only to the configured Anthropic base URL. It is
-  marked sensitive, never logged, never written to transcripts or rollouts, and never shown to the
-  model. CLI output only ever shows a masked form such as `sk-ant-api***abcd`.
+- Codex trims surrounding whitespace, such as a trailing CR/LF, from the key it stores and from
+  `ANTHROPIC_API_KEY` or a provider's `env_key` variable. A key that is empty or still contains a
+  control character fails the request with an error that names `ANTHROPIC_API_KEY` or `env_key`
+  and never shows the key.
+- Codex sends the key as an `x-api-key` header to the `base_url` of the provider in use. Every
+  provider with `wire_api = "anthropic_messages"` shares this one stored key (or
+  `ANTHROPIC_API_KEY`): the built-in `anthropic`, an `anthropic` override with another `base_url`,
+  and any custom provider id. The exceptions are a provider that sets `env_key` (only that
+  variable is sent; if it is unset the request fails, with no fallback) and a custom provider that
+  sets `experimental_bearer_token` or `auth` (sent as a bearer token instead). See the warning in
+  [Overriding the providers](#overriding-the-providers).
+- Codex never follows redirects for these providers or for `claude-oauth`: a redirect fails the
+  request, so the key is never forwarded to another origin.
+- The key is marked sensitive, never logged, never written to transcripts or rollouts, and never
+  shown to the model. CLI output only ever shows a masked form such as `sk-ant-api***abcd`.
 - `codex login --with-api-key` (the OpenAI login) refuses keys that start with `sk-ant-` and points
   you to `--provider anthropic`.
 
@@ -97,11 +115,25 @@ codex logout --provider claude-code    # disconnects Codex only
 - Codex never passes `--bare`, because bare mode ignores your subscription sign-in. Claude Code's
   docs say bare mode will become the default for `claude -p` in a future release. If that happens
   before Codex adds a way to opt out, this provider stops using your subscription.
-- Billing is Anthropic's call. Its Help Center
+- Billing follows the sign-in that `claude auth status` reports. With a Claude subscription,
+  Anthropic decides: its Help Center
   ([log in article](https://support.claude.com/en/articles/13189465-log-in-to-your-claude-account))
   says it may bill use from third-party tools to usage credits instead of plan limits, and that
   "advertised usage limits ... assume ordinary, individual usage". Codex does not hide that the
-  requests come from Codex.
+  requests come from Codex. With an Anthropic Console API key that Claude Code manages, that
+  Console organization is billed; with a cloud provider such as Amazon Bedrock or Google Vertex AI,
+  that cloud account is billed. `codex login --provider claude-code` prints a note when the
+  sign-in is not a subscription.
+- Because Codex starts Claude Code without your settings files, a cloud provider works only when
+  it is selected through environment variables (for example `CLAUDE_CODE_USE_BEDROCK=1`) in the
+  shell that starts Codex.
+- Claude Code reaches Codex tools through a local MCP bridge: it starts `codex stdio-to-uds`, which
+  connects to a socket that Codex creates in a private directory (owner-only, mode `0600`, on
+  Unix). The bridge never runs tools itself; Codex runs each call through its own approvals and
+  sandbox. The bridge closes a connection that sends a message over 16 MiB, keeps at most 128 calls
+  waiting per connection (further calls get an immediate error result), and, once a call carries
+  Claude Code's `tool_use` id, refuses calls without one. A current Claude Code release stays
+  within these limits.
 
 ### Experimental native OAuth (`claude-oauth`)
 
@@ -147,9 +179,16 @@ Access tokens refresh shortly before expiration. In-process synchronization and 
 lock serialize refresh across agents/processes, then reload the latest rotated credential.
 Rotation is persisted before optional profile follow-up. Rate-limited refresh honors bounded
 `Retry-After`/`Retry-After-Ms` backoff. An interrupted or ambiguous single-use refresh is not blindly
-replayed; sign in again if Codex cannot safely recover it. Revocation or an account-identity change
-also requires an explicit login. Logout removes local credential ciphertext, the direct keyring
-credential entry, and in-memory credentials without changing another provider's login. Following
+replayed; sign in again if Codex cannot safely recover it. Refresh tokens are single-use, so Codex
+marks a refresh as in progress before sending it. If that request fails for any network reason
+(even a DNS or connection failure where nothing reached Anthropic), the response cannot be read,
+or the process stops mid-refresh, Codex cannot tell whether the token was consumed: it then
+requires `codex login --provider claude-oauth` again instead of retrying, so one transient network
+failure can force a new login. Only an HTTP 429 or three 5xx responses in a row leave the login
+usable. `codex login status --provider claude-oauth` does not show that a new login is required.
+Revocation or an account-identity change also requires an explicit login. Logout removes local
+credential ciphertext, the direct keyring credential entry, and in-memory credentials without
+changing another provider's login. Following
 the existing secrets-store convention, an unused encryption-passphrase keyring entry can remain;
 it contains no access or refresh token.
 
@@ -211,17 +250,35 @@ experimental third-party client is not permitted.
 
 ```shell
 codex login status                    # OpenAI line, plus a line for each connected Claude provider
-codex login status --provider all
+codex login status --provider all     # one line for every provider
 codex logout                          # OpenAI/ChatGPT only (unchanged behavior)
 codex logout --provider anthropic     # Anthropic key only
-codex logout --provider claude-oauth   # experimental OAuth credential only
+codex logout --provider claude-oauth  # experimental OAuth credential only
 codex logout --provider all           # every provider
 ```
 
+`codex login status` prints to stderr, always in the order OpenAI, Anthropic API, Claude Code,
+Claude OAuth (experimental):
+
+| Command                                                                  | Lines printed                                                                                                                                                                                                           | Exit status                                                               |
+| ------------------------------------------------------------------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------- |
+| `codex login status` (or `--provider openai`)                            | The OpenAI status, then the Anthropic API line if a key is usable, the Claude Code line if Codex is connected to Claude Code (even when Claude Code is signed out), and the Claude OAuth line if a credential is stored | 0 only when the OpenAI login is usable; the Claude lines do not affect it |
+| `codex login status --provider anthropic`, `claude-code`, `claude-oauth` | That provider's line                                                                                                                                                                                                    | 0 when that provider is usable, otherwise 1                               |
+| `codex login status --provider all`                                      | All four lines; the first starts with `OpenAI: `                                                                                                                                                                        | 0 when at least one provider is usable, 1 when none is                    |
+
+A provider is usable when: for `anthropic`, a key is available (the `env_key` variable if one is
+configured, otherwise the stored key or `ANTHROPIC_API_KEY`); for `claude-code`, Codex is
+connected, Claude Code is signed in, and the sign-in is not an `apiKeyHelper`; for
+`claude-oauth`, a credential is stored. Status never contacts Anthropic, so a stored OAuth
+credential counts even when it has expired or needs a new login.
+
+`codex logout --provider all` signs out of Anthropic, Claude Code, Claude OAuth and then
+OpenAI/ChatGPT. It attempts every provider even when one of them fails, prints each result (the
+OpenAI result starts with `OpenAI: `), and exits 1 if any of them failed.
+
 Each provider has its own storage. Logging in, refreshing tokens, or logging out of one provider
 never rewrites or deletes another provider's credentials. Persistent storage survives restarts;
-`ephemeral` storage does not. The
-exit code of `codex login status` without `--provider` still reflects only the OpenAI login.
+`ephemeral` storage does not.
 
 ## Choosing Claude for the main agent
 
@@ -257,9 +314,12 @@ other Responses API providers, including when it is set through managed requirem
 Bundled Claude models: `claude-opus-5-5`, `claude-sonnet-5-5`, `claude-haiku-5-5` and
 `claude-fable-5-1`. Older models are hidden from the picker but still accepted: `claude-opus-5`,
 `claude-sonnet-5`, `claude-opus-4-8`, `claude-opus-4-7`, `claude-opus-4-6`, `claude-sonnet-4-6`,
-`claude-opus-4-5`, `claude-sonnet-4-5` and `claude-haiku-4-5`. Other `claude-*` names are sent as
-given, but Codex has no metadata for them: it warns and uses generic defaults for the context
-window and reasoning levels.
+`claude-opus-4-5`, `claude-sonnet-4-5` and `claude-haiku-4-5`. Other model ids, such as a newer
+`claude-*` model or a gateway's own ids, are sent as given, but Codex has no metadata for them: it
+warns and uses generic defaults for the context window and reasoning levels. When such an id names
+a Claude model behind a provider or gateway prefix, or writes its version with dots (for example
+`us.anthropic.claude-sonnet-4-5-...`, `anthropic/claude-opus-4-6` or `claude-haiku-4.5`), Codex
+translates the effort with the thinking rules of the Claude model it names.
 
 ### Reasoning effort
 
@@ -281,25 +341,41 @@ and for `none`, Codex warns and Claude Code uses its default thinking.
 
 ### Overriding the providers
 
-The built-in providers can be customized under `[model_providers]`:
+The built-in providers can be customized under `[model_providers]`. A partial override of a
+built-in id does not need a provider name:
 
 ```toml
 [model_providers.anthropic]
 base_url = "https://api.anthropic.com/v1"   # e.g. a gateway that speaks the Messages API
 env_key = "MY_ANTHROPIC_KEY"                # use only this variable (replaces the stored key)
-http_headers = { "anthropic-beta" = "..." }
+http_headers = { "anthropic-beta" = "..." } # added to the betas Codex sends
 request_max_retries = 4
 stream_idle_timeout_ms = 300000
 ```
 
+`anthropic` accepts `base_url`, `env_key`, `env_key_instructions`, `http_headers`,
+`request_max_retries`, `stream_max_retries` and `stream_idle_timeout_ms`. `claude-code` accepts
+the same fields except `base_url` and `env_key`, because the Claude Code CLI makes every request
+itself. Other fields are rejected. `anthropic-beta` values in `http_headers` are merged with the
+betas Codex sends rather than replacing them.
+
+**Warning:** an `anthropic_messages` provider without `env_key` receives your stored Anthropic API
+key (or `ANTHROPIC_API_KEY`). That includes `[model_providers.anthropic]` with a changed `base_url`
+and every custom `anthropic_messages` provider. Point `base_url` only at a gateway you trust with
+that key, or give the gateway its own key with `env_key`. Codex refuses redirects for these
+providers, and provider definitions in a repository's `.codex/config.toml` are ignored.
+
+A `[model_providers.anthropic]` or `[model_providers.claude-code]` entry whose `name` or
+`wire_api` differs from the built-in (`Anthropic`, `Claude Code`) is rejected at startup. If you
+defined a custom provider with one of these ids before they became built-in, rename it (for
+example to `anthropic-custom`).
+
 Custom providers can use the new wire APIs as well: `wire_api = "anthropic_messages"` or
-`wire_api = "claude_code"`. An `anthropic_messages` provider without `base_url` uses
-`https://api.anthropic.com/v1`. The `claude-code` provider does not accept `base_url` or `env_key`,
-because the Claude Code CLI makes every request itself. The `claude-oauth` provider uses
+`wire_api = "claude_code"`. Like any custom provider, they need a `name`. An `anthropic_messages`
+provider without `base_url` uses `https://api.anthropic.com/v1`. The `claude-oauth` provider uses
 `wire_api = "claude_oauth"`, fixes its Anthropic origin, and rejects configurable base URLs and
 credential/header overrides. Only `request_max_retries`, `stream_max_retries`, and
-`stream_idle_timeout_ms` can be overridden, including in managed requirements. A partial override
-does not need a provider name:
+`stream_idle_timeout_ms` can be overridden, including in managed requirements:
 
 ```toml
 [model_providers.claude-oauth]
@@ -312,7 +388,10 @@ stream_idle_timeout_ms = 300000
 
 When more than one provider is connected, the `spawn_agent` tool gets an optional
 `model_provider` argument. Its description lists the connected providers and a few models for
-each, including `claude-oauth` after its separate login. A parent agent can:
+each, including `claude-oauth` after its separate login. For this list, Codex re-reads the Claude
+OAuth store, and the Anthropic key store unless it uses the `file` mode, at most every 30 seconds,
+so a login or logout can take that long to show up there; `spawn_agent` checks the connection
+again when it runs. A parent agent can:
 
 - start an OpenAI child from a Claude parent, or a Claude child from an OpenAI parent;
 - start a child on the same provider with a different model;
@@ -332,17 +411,26 @@ Rules:
   `model_provider`, for example when a `claude-*` model is requested on `openai`. Codex never
   switches providers on its own.
 - Spawning on a provider that is not connected fails with the command to connect it.
+- If managed requirements pin `model_provider`, `spawn_agent` offers no other provider, and
+  spawning or resuming an agent on another provider fails with "model_provider `<id>` is not
+  allowed because managed requirements pin model_provider `<pinned id>`".
 - A child's provider and model affect only that child. The parent and its siblings keep theirs.
-  Settings tied to one provider are reset for a child on a different provider: `model_verbosity`,
-  `model_context_window`, `model_auto_compact_token_limit`, and the `agents.default_subagent_model`
-  and `agents.default_subagent_reasoning_effort` defaults. An agent role still applies. If the role
-  pins a model that the child's provider does not serve, the spawn is rejected.
+  Settings tied to one provider are reset when a child starts on a different provider, and when a
+  resumed agent goes back to its own provider from a parent or sender on another one:
+  `model_verbosity`, `model_context_window`, `model_auto_compact_token_limit`, and the
+  `agents.default_subagent_model` and `agents.default_subagent_reasoning_effort` defaults. An agent
+  role still applies on top of that reset. If the role pins a model that the child's provider does not serve, the spawn is
+  rejected. On a Claude provider this also holds when the child stays on its parent's provider:
+  the Claude catalog is closed, so a role model it does not list (for example a Claude CLI alias
+  such as `opus`, or a gateway model id) is rejected with a hint to use another `agent_type` or
+  to pass the `model_provider` that serves it.
 - Sandbox, approval policy, permission profile, working directory and exec policy are inherited
   exactly as they are for children on the same provider. Every provider runs its tool calls through
   the same Codex tool runtime.
 - Handoff, `send_message`, `followup_task`, `wait_agent`, interrupts, completion notices and results
   work the same way whatever the provider.
-- When the child is resumed, it comes back on the provider recorded in its thread.
+- When the child is resumed, it comes back on the provider recorded in its thread, unless managed
+  requirements now pin a different provider, in which case the resume fails.
 - If no other provider is connected, the tool schema is exactly what it was before this change.
 
 ### Inter-agent message encryption
@@ -352,25 +440,27 @@ decrypt them. Claude cannot read OpenAI-encrypted messages, so once a Claude pro
 connected, the collaboration tools switch to plaintext. Once an agent tree includes a Claude agent,
 or agents on different providers, every agent in it keeps plaintext for the rest of the session and
 after a resume, even if that provider is disconnected later. Those messages then appear in rollouts
-the same way ordinary tool arguments do.
+the same way ordinary tool arguments do. The tree switches only once such a child has started: a
+spawn that fails, or that names a provider that is unknown, not allowed or not connected, leaves
+the tree as it was.
 
 ## What Claude providers support
 
-| Capability                                                               | `anthropic` | `claude-code` | `claude-oauth` | Notes                                                                                                             |
-| ------------------------------------------------------------------------ | :---------: | :-----------: | :------------: | ----------------------------------------------------------------------------------------------------------------- |
-| Streaming text and thinking summaries                                    |     ✅      |      ✅       |       ✅       | Thinking is shown as a reasoning summary                                                                          |
-| Shell / unified exec, `apply_patch`, MCP tools, dynamic tools            |     ✅      |      ✅       |       ✅       | Every tool goes through Codex sandboxing and approvals; `claude-code` reaches Codex tools over a local MCP bridge |
-| Parallel tool calls                                                      |     ✅      |      ✅       |       ✅       | Claude Code controls its own batching                                                                             |
-| Images in input                                                          |     ✅      |      ✅       |       ✅       | Shared prompt translation                                                                                         |
-| Cancellation                                                             |     ✅      |      ✅       |       ✅       | HTTP streams are dropped; `claude-code` interrupts the CLI                                                        |
-| Resume and fork                                                          |     ✅      |      ✅       |       ✅       | Codex history and signed thinking replay; experimental wire compatibility still depends on the server             |
-| Reasoning effort                                                         |     ✅      |      ✅       |       ✅       | See the effort table above                                                                                        |
-| Token/cache usage                                                        |     ✅      |      ✅       |       ✅       | Counts do not establish billing category                                                                          |
-| Local auto-compaction                                                    |     ✅      |      ✅       |       ✅       | Remote/server-side compaction is not wired up                                                                     |
-| Structured output (`--output-schema`)                                    |     ✅      |      ❌       |       ✅       | `claude-code` warns and ignores the schema                                                                        |
-| Memory generation (`features.memories`)                                  |     ✅      |      ❌       |       ✅       | Background model work may consume usage; existing memories remain readable on all providers                       |
-| Hosted web search, image generation, tool search                         |     ❌      |      ❌       |       ❌       | Not exposed by this integration                                                                                   |
-| `model_verbosity`, service tiers, reasoning summary `concise`/`detailed` |     ❌      |      ❌       |       ❌       | Codex warns and ignores them                                                                                      |
+| Capability                                                               | `anthropic` | `claude-code` | `claude-oauth` | Notes                                                                                                                                                                                                                                                                                                                   |
+| ------------------------------------------------------------------------ | :---------: | :-----------: | :------------: | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Streaming text and thinking summaries                                    |     ✅      |      ✅       |       ✅       | Thinking is shown as a reasoning summary                                                                                                                                                                                                                                                                                |
+| Shell / unified exec, `apply_patch`, MCP tools, dynamic tools            |     ✅      |      ✅       |       ✅       | Every tool goes through Codex sandboxing and approvals; `claude-code` reaches Codex tools over a local MCP bridge                                                                                                                                                                                                       |
+| Parallel tool calls                                                      |     ✅      |      ✅       |       ✅       | Claude Code controls its own batching                                                                                                                                                                                                                                                                                   |
+| Images in input                                                          |     ✅      |      ✅       |       ✅       | Shared prompt translation. `anthropic` and `claude-oauth` send the 20 most recent images per request and replace older ones with a short note, and Codex warns (the API limits requests with more than 20 images to 2000 px per side). An inline image that is not base64-encoded is replaced by a note, with a warning |
+| Cancellation                                                             |     ✅      |      ✅       |       ✅       | HTTP streams are dropped; `claude-code` interrupts the CLI                                                                                                                                                                                                                                                              |
+| Resume and fork                                                          |     ✅      |      ✅       |       ✅       | Codex history and signed thinking replay; experimental wire compatibility still depends on the server                                                                                                                                                                                                                   |
+| Reasoning effort                                                         |     ✅      |      ✅       |       ✅       | See the effort table above                                                                                                                                                                                                                                                                                              |
+| Token/cache usage                                                        |     ✅      |      ✅       |       ✅       | Counts do not establish billing category                                                                                                                                                                                                                                                                                |
+| Local auto-compaction                                                    |     ✅      |      ✅       |       ✅       | Remote/server-side compaction is not wired up                                                                                                                                                                                                                                                                           |
+| Structured output (`--output-schema`)                                    |     ✅      |      ❌       |       ✅       | `claude-code` warns and ignores the schema                                                                                                                                                                                                                                                                              |
+| Memory generation (`features.memories`)                                  |     ✅      |      ❌       |       ❌       | On `anthropic`, background model work is billed as API usage; existing memories remain readable on all providers                                                                                                                                                                                                        |
+| Hosted web search, image generation, tool search                         |     ❌      |      ❌       |       ❌       | Not exposed by this integration                                                                                                                                                                                                                                                                                         |
+| `model_verbosity`, service tiers, reasoning summary `concise`/`detailed` |     ❌      |      ❌       |       ❌       | Codex warns and ignores them                                                                                                                                                                                                                                                                                            |
 
 When Anthropic supplies valid unified utilization/reset headers, `claude-oauth` reports the server's
 5-hour, 7-day, `7d_oi`, and overage windows through Codex's existing rate-limit event display,
@@ -401,16 +491,41 @@ not be presented as a confirmed remaining subscription balance.
   `codex login --provider claude-oauth` explicitly before starting a session.
 - **Realtime conversations:** realtime voice sessions use OpenAI's realtime API and are refused
   while the thread runs on a Claude provider.
-- **Memories on `claude-code`:** memory extraction and consolidation do not run while the thread
-  uses `claude-code`, so background jobs never spend your Claude plan. Use `anthropic` or OpenAI to
-  generate memories.
+- **Memories on `claude-code` and `claude-oauth`:** memory extraction and consolidation do not run
+  while the thread uses `claude-code` or `claude-oauth`, so background jobs never spend your Claude
+  plan. Use `anthropic` or OpenAI to generate memories. On `anthropic`, memory jobs do not check
+  ChatGPT rate limits (so `memories.min_rate_limit_remaining_percent` does not apply to them) and
+  never contact the ChatGPT backend.
 - **Switching providers mid-thread:** a thread stays on one provider. When a history moves between
   providers, as with forks and resumes, Codex drops reasoning that the other provider cannot verify
   (OpenAI encrypted reasoning, Claude thinking signatures) and keeps everything else.
+- **Thinking replay:** Codex replays earlier Claude thinking only with its signature. A thinking
+  block recorded without one (for example through a gateway that drops signatures) is not
+  replayed, and Codex warns once. If Anthropic rejects replayed thinking on `anthropic` or
+  `claude-oauth`, Codex retries without it and warns; for the rest of that session it stops
+  replaying Claude thinking blocks and stops sending `block_binding` and its beta. A compaction does
+  not reset this; a new session or a resume does.
+- **Tool history:** if history holds more than one output for the same tool call, only the first
+  is sent as that call's result; the others are sent as text.
+- **Tool names:** Claude tool names may contain only letters, digits, `_` and `-`, so Codex
+  derives them from Codex tool names and namespaces. If two different tools end up with the same
+  Claude name, Claude is offered only the first, and Codex warns with the names of both tools.
+- **Refusals and truncated responses:** when Claude refuses, the turn fails with "Claude declined
+  to respond (refusal category: ...)", no tool call from that response runs, and its partial answer
+  is not recorded. If a response stops at `max_tokens` before any complete tool call, the turn
+  fails with an incomplete-response error instead of ending with a truncated answer. Tool calls
+  whose input was cut off by `max_tokens` or the context window are dropped; after a `max_tokens`
+  stop, complete tool calls still run and the model continues after them.
+- **Claude Code sessions:** Claude Code keeps its own copy of the conversation, so each turn sends
+  only what Codex added since the last one. When Codex history no longer matches that copy (after a
+  compaction, rollback or fork) or Claude Code failed before it started its session, Codex starts a
+  fresh Claude Code session: it sends the earlier conversation as a text transcript (images in it
+  appear as `[image]`) and your latest message, with its images, as the live prompt.
 - **Environment inheritance:** shell commands run by any agent inherit your environment as before.
   An exported `ANTHROPIC_API_KEY` is visible to them, so prefer `codex login --provider anthropic`.
-  With the `file` credential store, any shell command that can read `$CODEX_HOME` can read the key
-  file. Use `keyring` mode or the sandbox's read restrictions if that matters.
+  With the `file` credential store, or after an `auto` fallback to it, any shell command that can
+  read `$CODEX_HOME` can read the key file. Use `keyring` mode or the sandbox's read restrictions
+  if that matters.
 - **Claude Code CLI version:** the `claude-code` provider relies on the documented `claude -p`
   stream-json interface, the `--mcp-config`, `--tools`, `--allowedTools`, `--setting-sources` and
   `--resume` flags, and `claude auth status`. Use a current Claude Code release.
