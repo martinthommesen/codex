@@ -2362,34 +2362,55 @@ async fn multi_agent_v2_spawn_on_disconnected_provider_keeps_tree_encrypted() {
 
 #[tokio::test]
 async fn failed_multi_agent_v2_spawn_on_another_provider_keeps_tree_encrypted() {
-    let (_manager, session, turn) = multi_agent_v2_root_session().await;
-    let invocation = invocation(
-        Arc::clone(&session),
-        turn,
-        "spawn_agent",
-        function_payload(json!({
-            "message": "inspect this repo",
-            "task_name": "BadName",
-            "model_provider": "ollama",
-            "fork_turns": "none"
-        })),
-    );
-    let Err(err) = plaintext_spawn_handler().handle(invocation).await else {
-        panic!("invalid agent name should be rejected");
-    };
-    assert_eq!(
-        err,
-        FunctionCallError::RespondToModel(
-            "agent_name must use only lowercase letters, digits, and underscores".to_string()
-        )
-    );
-    assert!(
-        !session
-            .services
-            .local_agent_runtime
-            .plaintext_collaboration_messages(),
-        "no agent started on another provider"
-    );
+    // The first call carries an encrypted task, the resend a plaintext one; neither may switch
+    // the tree when the spawn fails its other checks.
+    for (handler, encoding) in [
+        (SpawnAgentHandlerV2::default(), "encrypted"),
+        (plaintext_spawn_handler(), "plaintext"),
+    ] {
+        for (args, expected) in [
+            (
+                json!({ "task_name": "BadName" }),
+                "agent_name must use only lowercase letters, digits, and underscores",
+            ),
+            (
+                json!({ "task_name": "worker", "agent_type": "missing_role" }),
+                "unknown agent_type 'missing_role'",
+            ),
+        ] {
+            let (_manager, session, turn) = multi_agent_v2_root_session().await;
+            let mut arguments = json!({
+                "message": "inspect this repo",
+                "model_provider": "ollama",
+                "fork_turns": "none"
+            });
+            arguments
+                .as_object_mut()
+                .expect("arguments should be an object")
+                .extend(args.as_object().expect("args should be an object").clone());
+            let invocation = invocation(
+                Arc::clone(&session),
+                turn,
+                "spawn_agent",
+                function_payload(arguments),
+            );
+            let Err(err) = handler.handle(invocation).await else {
+                panic!("{encoding} spawn with {args} should be rejected");
+            };
+            assert_eq!(
+                err,
+                FunctionCallError::RespondToModel(expected.to_string()),
+                "{encoding} spawn with {args}"
+            );
+            assert!(
+                !session
+                    .services
+                    .local_agent_runtime
+                    .plaintext_collaboration_messages(),
+                "no agent started on another provider ({encoding} spawn with {args})"
+            );
+        }
+    }
 }
 
 #[tokio::test]

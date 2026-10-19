@@ -21,19 +21,25 @@ fn claude_oauth_login_status_and_logout_select_the_isolated_provider() {
     assert_eq!(logout.provider, Some(LoginProvider::ClaudeOauth));
 }
 
+/// Renders `--help` without wrapping, so a phrase never depends on the terminal's width.
+fn unwrapped_help(arguments: &[&str]) -> String {
+    MultitoolCli::command()
+        .term_width(0)
+        .try_get_matches_from(arguments)
+        .expect_err("help display")
+        .to_string()
+}
+
 #[test]
 fn login_status_help_documents_exit_codes() {
-    let cli = MultitoolCli::try_parse_from(["codex", "login", "status", "--help"])
-        .expect_err("help display");
-    let help = cli.to_string();
+    let help = unwrapped_help(&["codex", "login", "status", "--help"]);
     assert!(help.contains("Exit status"), "{help}");
     assert!(help.contains("at least one provider"), "{help}");
 }
 
 #[test]
 fn login_help_marks_claude_oauth_experimental() {
-    let cli = MultitoolCli::try_parse_from(["codex", "login", "--help"]).expect_err("help display");
-    let help = cli.to_string();
+    let help = unwrapped_help(&["codex", "login", "--help"]);
     assert!(help.contains("claude-oauth"), "{help}");
     assert!(help.contains("experimental"), "{help}");
 }

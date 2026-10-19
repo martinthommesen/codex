@@ -440,9 +440,13 @@ decrypt them. Claude cannot read OpenAI-encrypted messages, so once a Claude pro
 connected, the collaboration tools switch to plaintext. Once an agent tree includes a Claude agent,
 or agents on different providers, every agent in it keeps plaintext for the rest of the session and
 after a resume, even if that provider is disconnected later. Those messages then appear in rollouts
-the same way ordinary tool arguments do. The tree switches only once such a child has started: a
-spawn that fails, or that names a provider that is unknown, not allowed or not connected, leaves
-the tree as it was.
+the same way ordinary tool arguments do. A spawn that fails its checks (a provider that is unknown,
+not allowed or not connected, an invalid task name, an unknown `agent_type`, a model the provider
+does not serve) leaves the tree as it was. Otherwise the tree switches once such a child has
+started, with one exception: with MultiAgentV2, a `spawn_agent` call that passes those checks but
+carries an encrypted task for another provider switches the tree to plaintext right away and asks
+the model to send the task again, since only a plaintext schema lets it do so. The tree then stays
+plaintext even if that second call fails or never comes.
 
 ## What Claude providers support
 

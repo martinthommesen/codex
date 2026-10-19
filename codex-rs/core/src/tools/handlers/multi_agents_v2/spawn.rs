@@ -1,6 +1,5 @@
 use super::*;
 use crate::agent::child_config::requested_spawn_provider;
-use crate::agent::child_config::validate_spawn_provider;
 use crate::agent::role::DEFAULT_ROLE_NAME;
 use crate::agent::types::SpawnAgentForkMode;
 use crate::codex_thread::ThreadConfigSnapshot;
@@ -118,25 +117,9 @@ async fn handle_spawn_agent(
     let args: SpawnAgentArgs = parse_arguments(&arguments)?;
     let fork_mode = args.fork_mode()?;
     let message = message_content(args.message)?;
+    // An encrypted task for a child on another provider is answered by `thread_spawn::spawn` with a
+    // request to resend it in plaintext, once every other check has passed.
     let model_provider = requested_spawn_provider(args.model_provider.as_deref());
-    // A child on another provider cannot read an encrypted task. Once that provider is known to be
-    // usable, switch the tree to plaintext and have the model resend, so its next schema asks for a
-    // plaintext message.
-    if !plaintext_messages
-        && let Some(provider_id) = model_provider
-        && validate_spawn_provider(&session, &turn.config, provider_id)
-            .map_err(FunctionCallError::RespondToModel)?
-            .is_some()
-    {
-        session
-            .services
-            .local_agent_runtime
-            .mark_plaintext_collaboration_messages();
-        return Err(FunctionCallError::RespondToModel(format!(
-            "model_provider `{provider_id}` needs a plaintext message. Call spawn_agent again with \
-the same arguments."
-        )));
-    }
     let role_name = args
         .agent_type
         .as_deref()

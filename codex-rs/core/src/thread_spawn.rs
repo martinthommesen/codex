@@ -107,6 +107,20 @@ pub(crate) async fn spawn(
         .unwrap_or_else(AgentPath::root)
         .join(&task_name)
         .map_err(ThreadSpawnError::Preparation)?;
+    if mark_plaintext_tree && matches!(message, AgentMessage::Encrypted(_)) {
+        // A child on another provider, or under a Claude agent, cannot read an encrypted task.
+        // Every other check has passed, so switch the tree to plaintext now and have the model
+        // resend: its next schema asks for a plaintext message.
+        session
+            .services
+            .local_agent_runtime
+            .mark_plaintext_collaboration_messages();
+        return Err(ThreadSpawnError::Preparation(format!(
+            "model_provider `{}` needs a plaintext message. Call spawn_agent again with the same \
+arguments.",
+            config.model_provider_id
+        )));
+    }
     let spawn_source = SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
         parent_thread_id: session.thread_id,
         depth: next_thread_spawn_depth(&turn.session_source),
