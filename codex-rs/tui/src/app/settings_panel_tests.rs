@@ -359,204 +359,211 @@ fn remote_web_search_follows_the_app_servers_requirements() {
     ));
 }
 
-#[test]
-fn replaced_server_feature_flags_that_can_hide_an_opposing_layer() {
-    let origins = |key: &str| {
-        HashMap::from([(
-            key.to_string(),
-            serde_json::from_value(origin(ApiSource::SessionFlags)).expect("valid origin"),
-        )])
-    };
-    let launch_overrides =
-        HashMap::from([("features".to_string(), serde_json::json!({ "goals": true }))]);
-    let replaced = |enabled: bool, key: &str| {
-        !replaced_server_feature_keys(
-            SettingsSwitch::Subagents,
-            enabled,
-            Some(&launch_overrides),
-            &origins(key),
-            &HashSet::new(),
-        )
-        .is_empty()
-    };
+fn layer(source: ApiSource, config: serde_json::Value) -> serde_json::Value {
+    serde_json::json!({ "name": source, "version": "1", "config": config })
+}
 
-    // `--enable multi_agent_v2` on the server can hide `agents.enabled = false` below it, and it
-    // decides turning subagents off.
-    assert!(replaced(
-        /*enabled*/ true,
-        "features.multi_agent_v2.enabled"
-    ));
-    assert!(replaced(
-        /*enabled*/ false,
-        "features.multi_agent_v2.enabled"
-    ));
-    // `multi_agent` cannot keep subagents on once `agents.enabled` is off.
-    assert!(replaced(/*enabled*/ true, "features.multi_agent"));
-    assert!(!replaced(/*enabled*/ false, "features.multi_agent"));
-    // Keys outside `[features]` still reach new threads.
-    assert!(!replaced(/*enabled*/ true, "agents.enabled"));
-    // Without a forwarded table the server's flags stay in place.
+/// Resolves a remote save of `switch` with this TUI forwarding `features`.
+fn resolve_with_launch_features(
+    switch: SettingsSwitch,
+    enabled: bool,
+    effective_config: &mut ConfigReadResponse,
+    features: serde_json::Value,
+) -> RemoteResolution {
+    let launch_origins = HashMap::new();
+    resolve_remote_save(
+        switch,
+        enabled,
+        effective_config,
+        &RemoteLaunch {
+            overrides: Some(HashMap::from([("features".to_string(), features)])),
+            origins: &launch_origins,
+            web_search_source: None,
+            web_search_modes: None,
+        },
+        &user_file("config.toml"),
+    )
+}
+
+#[test]
+fn replaced_server_flags_resolve_from_the_layers_below() {
+    let written = user_file("config.toml");
+    let mut effective_config = config_read(serde_json::json!({
+        "config": { "features": { "memories": true, "apps": true, "multi_agent_v2": true } },
+        "origins": {
+            "features.memories": origin(ApiSource::SessionFlags),
+            "features.apps": origin(ApiSource::User { file: written.clone(), profile: None }),
+            "features.multi_agent_v2.enabled": origin(ApiSource::SessionFlags),
+        },
+        "layers": [
+            layer(ApiSource::SessionFlags, serde_json::json!({
+                "features": { "memories": true, "multi_agent_v2": true },
+            })),
+            layer(ApiSource::User { file: written, profile: None }, serde_json::json!({
+                "features": { "apps": true },
+            })),
+            layer(
+                ApiSource::Project { dot_codex_folder: user_file(".codex") },
+                serde_json::json!({ "features": { "memories": false } }),
+            ),
+        ],
+    }));
+
+    assert!(drop_replaced_server_features(&mut effective_config));
+
     assert_eq!(
-        replaced_server_feature_keys(
-            SettingsSwitch::Subagents,
-            /*enabled*/ true,
-            /*launch_overrides*/ None,
-            &origins("features.multi_agent_v2.enabled"),
-            &HashSet::new(),
-        ),
-        Vec::<&str>::new()
+        effective_config.config.additional["features"],
+        serde_json::json!({ "memories": false, "apps": true })
     );
-    // A key this TUI forwards itself overwrites the server's flag.
     assert_eq!(
-        replaced_server_feature_keys(
-            SettingsSwitch::Subagents,
-            /*enabled*/ true,
-            Some(&launch_overrides),
-            &origins("features.multi_agent_v2.enabled"),
-            &HashSet::from(["features.multi_agent_v2.enabled".to_string()]),
-        ),
-        Vec::<&str>::new()
+        effective_config.origins["features.memories"].name,
+        ApiSource::Project {
+            dot_codex_folder: user_file(".codex")
+        }
+    );
+    assert!(
+        !effective_config
+            .origins
+            .contains_key("features.multi_agent_v2.enabled")
     );
 }
 
 #[test]
-fn remote_save_trusts_this_tuis_own_flag_over_replaced_server_flags() {
-    let written = user_file("config.toml");
-    let read_back = || {
-        config_read(serde_json::json!({
-            "config": { "features": { "memories": true } },
-            "origins": { "features.memories": origin(ApiSource::SessionFlags) },
-        }))
-    };
-    let launch_origins = HashMap::new();
-    let launch = |features: serde_json::Value| RemoteLaunch {
-        overrides: Some(HashMap::from([("features".to_string(), features)])),
-        origins: &launch_origins,
-        web_search_source: None,
-        web_search_modes: None,
-    };
+fn replaced_server_flags_without_layers_cannot_be_checked() {
+    let mut effective_config = config_read(serde_json::json!({
+        "config": { "features": { "memories": true } },
+        "origins": { "features.memories": origin(ApiSource::SessionFlags) },
+    }));
 
-    // The server's `--enable memories` agrees with the save, but this TUI's `--disable memories`
-    // reaches every new thread.
-    let mut effective_config = read_back();
-    let resolution = resolve_remote_save(
-        SettingsSwitch::Memories,
-        /*enabled*/ true,
-        &mut effective_config,
-        &launch(serde_json::json!({ "memories": false })),
-        &written,
-        /*server_override*/ None,
-    );
-    assert_eq!(
-        (resolution.winner, resolution.unverified),
-        (
-            Some((OverrideLayer::CommandLine, "features.memories".to_string())),
-            None
-        )
-    );
-
-    // Without its own flag, the TUI cannot tell what replacing the server's leaves behind.
-    let mut effective_config = read_back();
-    let resolution = resolve_remote_save(
+    let resolution = resolve_with_launch_features(
         SettingsSwitch::Memories,
         /*enabled*/ false,
         &mut effective_config,
-        &launch(serde_json::json!({ "goals": true })),
-        &written,
-        Some(&ApiSource::SessionFlags),
+        serde_json::json!({ "goals": true }),
     );
+
     assert!(resolution.unverified.is_some());
-    assert!(!resolution.server_override_stands);
 }
 
 #[test]
-fn remote_save_keeps_the_caveat_when_a_replaced_server_flag_on_another_key_decides() {
+fn remote_save_names_this_tuis_flag_over_what_server_flags_hid() {
     let written = user_file("config.toml");
-    let launch_origins = HashMap::new();
-    let launch = |features: serde_json::Value| RemoteLaunch {
-        overrides: Some(HashMap::from([("features".to_string(), features)])),
-        origins: &launch_origins,
-        web_search_source: None,
-        web_search_modes: None,
+    let user = |features: serde_json::Value| {
+        layer(
+            ApiSource::User {
+                file: written.clone(),
+                profile: None,
+            },
+            serde_json::json!({ "features": features }),
+        )
+    };
+    let user_origin = || {
+        origin(ApiSource::User {
+            file: written.clone(),
+            profile: None,
+        })
     };
 
-    // The server's `--enable multi_agent_v2` would turn subagents on, but it does not reach new
-    // threads; only this TUI's `--disable multi_agent` does.
+    // Subagents on: the server's `--enable multi_agent_v2` does not reach new threads, and this
+    // TUI's `--disable multi_agent` does.
     let mut effective_config = config_read(serde_json::json!({
         "config": {
             "agents": { "enabled": true },
             "features": { "multi_agent": true, "multi_agent_v2": true },
         },
         "origins": {
-            "agents.enabled": origin(ApiSource::User { file: written.clone(), profile: None }),
-            "features.multi_agent": origin(ApiSource::User { file: written.clone(), profile: None }),
+            "agents.enabled": user_origin(),
+            "features.multi_agent": user_origin(),
             "features.multi_agent_v2.enabled": origin(ApiSource::SessionFlags),
         },
+        "layers": [
+            layer(ApiSource::SessionFlags, serde_json::json!({ "features": { "multi_agent_v2": true } })),
+            user(serde_json::json!({ "multi_agent": true })),
+        ],
     }));
-    let resolution = resolve_remote_save(
+    let resolution = resolve_with_launch_features(
         SettingsSwitch::Subagents,
         /*enabled*/ true,
         &mut effective_config,
-        &launch(serde_json::json!({ "multi_agent": false })),
-        &written,
-        /*server_override*/ None,
+        serde_json::json!({ "multi_agent": false }),
     );
-    assert!(resolution.unverified.is_some());
+    assert_eq!(
+        (resolution.winner, resolution.unverified),
+        (
+            Some((
+                OverrideLayer::CommandLine,
+                "features.multi_agent".to_string()
+            )),
+            None
+        )
+    );
 
-    // A hidden legacy alias of the same feature can still win over this TUI's flag.
+    // Plugins & apps off, whichever feature this TUI turns on and whichever the server did.
+    for (tui_feature, server_feature) in [("apps", "plugins"), ("plugins", "apps")] {
+        let mut effective_config = config_read(serde_json::json!({
+            "config": { "features": { tui_feature: false, server_feature: true } },
+            "origins": {
+                format!("features.{tui_feature}"): user_origin(),
+                format!("features.{server_feature}"): origin(ApiSource::SessionFlags),
+            },
+            "layers": [
+                layer(ApiSource::SessionFlags, serde_json::json!({ "features": { server_feature: true } })),
+                user(serde_json::json!({ tui_feature: false, server_feature: false })),
+            ],
+        }));
+        let resolution = resolve_with_launch_features(
+            SettingsSwitch::PluginsAndApps,
+            /*enabled*/ false,
+            &mut effective_config,
+            serde_json::json!({ tui_feature: true }),
+        );
+        assert_eq!(
+            (resolution.winner, resolution.unverified),
+            (
+                Some((
+                    OverrideLayer::CommandLine,
+                    format!("features.{tui_feature}")
+                )),
+                None
+            ),
+            "{tui_feature}"
+        );
+    }
+}
+
+#[test]
+fn a_project_alias_the_server_flag_hid_still_wins() {
+    let written = user_file("config.toml");
+    // The server's `memory_tool` flag is replaced, but the project's `memory_tool = true` is not,
+    // and the legacy alias beats this TUI's `--disable memories` in the merged table.
     let mut effective_config = config_read(serde_json::json!({
         "config": { "features": { "memories": true, "memory_tool": true } },
         "origins": {
             "features.memories": origin(ApiSource::User { file: written.clone(), profile: None }),
             "features.memory_tool": origin(ApiSource::SessionFlags),
         },
+        "layers": [
+            layer(ApiSource::SessionFlags, serde_json::json!({ "features": { "memory_tool": true } })),
+            layer(ApiSource::User { file: written, profile: None }, serde_json::json!({
+                "features": { "memories": true },
+            })),
+            layer(
+                ApiSource::Project { dot_codex_folder: user_file(".codex") },
+                serde_json::json!({ "features": { "memory_tool": true } }),
+            ),
+        ],
     }));
-    let resolution = resolve_remote_save(
+
+    let resolution = resolve_with_launch_features(
         SettingsSwitch::Memories,
         /*enabled*/ true,
         &mut effective_config,
-        &launch(serde_json::json!({ "memories": false })),
-        &written,
-        /*server_override*/ None,
-    );
-    assert!(resolution.unverified.is_some());
-}
-
-#[test]
-fn remote_save_names_this_tuis_flag_when_it_settles_the_switch_alone() {
-    let written = user_file("config.toml");
-    let launch_origins = HashMap::new();
-    // This TUI's `--enable apps` keeps Plugins & apps from turning off whatever the server's
-    // replaced `--enable plugins` was hiding.
-    let mut effective_config = config_read(serde_json::json!({
-        "config": { "features": { "apps": false, "plugins": true } },
-        "origins": {
-            "features.apps": origin(ApiSource::User { file: written.clone(), profile: None }),
-            "features.plugins": origin(ApiSource::SessionFlags),
-        },
-    }));
-    let resolution = resolve_remote_save(
-        SettingsSwitch::PluginsAndApps,
-        /*enabled*/ false,
-        &mut effective_config,
-        &RemoteLaunch {
-            overrides: Some(HashMap::from([(
-                "features".to_string(),
-                serde_json::json!({ "apps": true }),
-            )])),
-            origins: &launch_origins,
-            web_search_source: None,
-            web_search_modes: None,
-        },
-        &written,
-        Some(&ApiSource::SessionFlags),
+        serde_json::json!({ "memories": false }),
     );
 
-    assert_eq!(
-        (resolution.winner, resolution.unverified),
-        (
-            Some((OverrideLayer::CommandLine, "features.apps".to_string())),
-            None
-        )
-    );
+    assert!(resolution.unverified.is_none());
+    assert!(feature_enabled_from_effective_config(
+        &effective_config,
+        Feature::MemoryTool
+    ));
 }

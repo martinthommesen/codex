@@ -73,7 +73,7 @@ impl App {
                 return;
             }
         };
-        let mut overridden = (response.status == WriteStatus::OkOverridden)
+        let overridden = (response.status == WriteStatus::OkOverridden)
             .then(|| overridden_write_message(&response).to_string());
         // The server only checks user-level layers for overrides, so a trusted project, a profile,
         // this TUI's launch flags or a legacy alias in another layer can still win. Resolve what
@@ -83,7 +83,7 @@ impl App {
         let unverified = if app_server.uses_remote_workspace() {
             // New remote sessions start where /new starts them, not in the displayed thread's cwd.
             let cwd = app_server.remote_cwd_override().unwrap_or(Path::new("."));
-            match crate::config_update::read_effective_config(
+            match crate::config_update::read_effective_config_with_layers(
                 app_server.request_handle(),
                 cwd.display().to_string(),
             )
@@ -110,15 +110,8 @@ impl App {
                         &mut effective_config,
                         &launch,
                         written,
-                        response
-                            .overridden_metadata
-                            .as_ref()
-                            .map(|metadata| &metadata.overriding_layer.name),
                     );
                     adopt_effective_switch_state(&mut self.config, switch, &effective_config);
-                    if !resolution.server_override_stands {
-                        overridden = None;
-                    }
                     winner = resolution.winner;
                     resolution.unverified
                 }
@@ -442,9 +435,6 @@ struct RemoteLaunch<'a> {
 struct RemoteResolution {
     winner: Option<(OverrideLayer, String)>,
     unverified: Option<String>,
-    /// False when the app server's override comes from its own launch flags, which do not reach
-    /// threads this TUI starts.
-    server_override_stands: bool,
 }
 
 /// Applies `launch` to what a remote app server read back and finds what still decides `switch`.
@@ -454,31 +444,19 @@ fn resolve_remote_save(
     effective_config: &mut ConfigReadResponse,
     launch: &RemoteLaunch<'_>,
     written: &AbsolutePathBuf,
-    server_override: Option<&codex_app_server_protocol::ConfigLayerSource>,
 ) -> RemoteResolution {
-    // The overlay changes values, not origins, so origins still name the server's own flags.
+    // thread/start replaces the app server's own `[features]` launch flags with the table this TUI
+    // sends, so resolve what is left without them before adding this TUI's flags.
+    let forwards_features = launch
+        .overrides
+        .as_ref()
+        .is_some_and(|overrides| overrides.contains_key("features"));
+    let unverified =
+        (forwards_features && !drop_replaced_server_features(effective_config)).then(|| {
+            "the app server did not report the config layers below its own feature flags"
+                .to_string()
+        });
     let flagged = overlay_launch_overrides(effective_config, launch.overrides.as_ref());
-    let replaced_keys = |covered: &HashSet<String>| {
-        replaced_server_feature_keys(
-            switch,
-            enabled,
-            launch.overrides.as_ref(),
-            &effective_config.origins,
-            covered,
-        )
-    };
-    // Server flags on keys this TUI forwards are overwritten in the overlay already; the rest
-    // leave something behind that config/read cannot show.
-    let hidden = replaced_keys(&flagged)
-        .into_iter()
-        .map(str::to_string)
-        .collect::<Vec<_>>();
-    // The server's own flags do not reach new threads, so an override they cause does not stand.
-    let server_override_stands = replaced_keys(&HashSet::new()).is_empty()
-        || !matches!(
-            server_override,
-            Some(codex_app_server_protocol::ConfigLayerSource::SessionFlags)
-        );
     let requirements_disallow = launch
         .web_search_modes
         .is_some_and(|modes| constrain_web_search(effective_config, modes.as_deref()));
@@ -500,73 +478,151 @@ fn resolve_remote_save(
                 let layer = OverrideLayer::launch(launch.origins.get(source));
                 (key.as_str(), flag_precedence, Some(layer))
             })),
-    );
-    let launched_winner = winner
-        .as_ref()
-        .filter(|(layer, key)| {
-            flagged.contains(key)
-                && matches!(layer, OverrideLayer::CommandLine | OverrideLayer::Profile)
-        })
-        .map(|(_, key)| switch_feature_for_key(switch, key));
-    // This TUI's own forwarded flag reaches new threads, so it settles the switch unless a hidden
-    // server flag sets the same feature (a legacy alias can still win) or subagents are turned on
-    // and a hidden `multi_agent_v2` could still turn them on.
-    let launch_decides = launched_winner.is_some_and(|feature| {
-        !(switch == SettingsSwitch::Subagents && enabled)
-            && hidden
-                .iter()
-                .all(|key| switch_feature_for_key(switch, key) != feature)
+    )
+    .map(|(layer, key)| {
+        // Name the launch key the user set, such as a legacy search feature.
+        let launched = flagged.contains(&key)
+            && matches!(layer, OverrideLayer::CommandLine | OverrideLayer::Profile);
+        let key = if launched {
+            launch_source_key(&key, web_search_source).to_string()
+        } else {
+            key
+        };
+        (layer, key)
+    })
+    .or_else(|| {
+        requirements_disallow.then(|| (OverrideLayer::Requirements, "web_search".to_string()))
     });
-    let winner = winner
-        .map(|(layer, key)| {
-            // Name the launch key the user set, such as a legacy search feature.
-            let key = if launched_winner.is_some() {
-                launch_source_key(&key, web_search_source).to_string()
-            } else {
-                key
-            };
-            (layer, key)
+    RemoteResolution { winner, unverified }
+}
+
+/// Removes the app server's own `[features]` launch flags from what it read back and resolves
+/// those keys from the layers below them, the way a thread this TUI starts sees them. Returns
+/// false when the server reported its own flags but not its layers.
+fn drop_replaced_server_features(effective_config: &mut ConfigReadResponse) -> bool {
+    let replaced = effective_config
+        .origins
+        .iter()
+        .filter(|(key, origin)| {
+            key.starts_with("features.")
+                && matches!(
+                    origin.name,
+                    codex_app_server_protocol::ConfigLayerSource::SessionFlags
+                )
         })
-        .or_else(|| {
-            requirements_disallow.then(|| (OverrideLayer::Requirements, "web_search".to_string()))
-        });
-    RemoteResolution {
-        winner,
-        unverified: (!hidden.is_empty() && !launch_decides).then(|| {
-            "the app server's own feature flags do not reach threads this TUI starts".to_string()
-        }),
-        server_override_stands,
+        .map(|(key, _)| key.clone())
+        .collect::<Vec<_>>();
+    if replaced.is_empty() {
+        return true;
+    }
+    let Some(layers) = effective_config.layers.as_ref() else {
+        return false;
+    };
+    let features = effective_config
+        .config
+        .additional
+        .entry("features".to_string())
+        .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
+    for key in replaced {
+        // Layers come highest first, and no layer above the server's flags sets these keys.
+        let fallback = layers
+            .iter()
+            .filter(|layer| {
+                layer.disabled_reason.is_none()
+                    && !matches!(
+                        layer.name,
+                        codex_app_server_protocol::ConfigLayerSource::SessionFlags
+                    )
+            })
+            .find_map(|layer| value_at(&layer.config, &key).map(|value| (layer, value.clone())));
+        let path = key
+            .strip_prefix("features.")
+            .unwrap_or(&key)
+            .split('.')
+            .collect::<Vec<_>>();
+        match fallback {
+            Some((layer, value)) => {
+                set_feature_value(features, &path, value);
+                effective_config.origins.insert(
+                    key.clone(),
+                    codex_app_server_protocol::ConfigLayerMetadata {
+                        name: layer.name.clone(),
+                        version: layer.version.clone(),
+                    },
+                );
+            }
+            None => {
+                remove_feature_value(features, &path);
+                effective_config.origins.remove(&key);
+            }
+        }
+    }
+    true
+}
+
+/// Sets a `[features]` value, keeping a structured feature's plain-bool form for `enabled`.
+fn set_feature_value(features: &mut serde_json::Value, path: &[&str], value: serde_json::Value) {
+    let Some(table) = features.as_object_mut() else {
+        return;
+    };
+    match path {
+        [] => {}
+        [name] => {
+            table.insert((*name).to_string(), value);
+        }
+        [name, "enabled"]
+            if value.is_boolean()
+                && !table.get(*name).is_some_and(serde_json::Value::is_object) =>
+        {
+            table.insert((*name).to_string(), value);
+        }
+        [name, rest @ ..] => {
+            let entry = table
+                .entry((*name).to_string())
+                .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
+            if !entry.is_object() {
+                // A plain bool stands for `enabled`.
+                let enabled = entry.take();
+                *entry = serde_json::Value::Object(
+                    enabled
+                        .is_boolean()
+                        .then(|| ("enabled".to_string(), enabled))
+                        .into_iter()
+                        .collect(),
+                );
+            }
+            set_feature_value(entry, rest, value);
+        }
     }
 }
 
-/// The app server's own `[features]` launch flags that can decide `switch`. thread/start replaces
-/// them with the table this TUI sends, so what they leave behind is not visible in config/read.
-/// Keys in `covered`, which that table sets itself, are already resolved and are left out.
-fn replaced_server_feature_keys<'a>(
-    switch: SettingsSwitch,
-    enabled: bool,
-    launch_overrides: Option<&HashMap<String, serde_json::Value>>,
-    origins: &'a HashMap<String, codex_app_server_protocol::ConfigLayerMetadata>,
-    covered: &HashSet<String>,
-) -> Vec<&'a str> {
-    if !launch_overrides.is_some_and(|overrides| overrides.contains_key("features")) {
-        return Vec::new();
+/// Removes a `[features]` value and any table it leaves empty.
+fn remove_feature_value(features: &mut serde_json::Value, path: &[&str]) {
+    let Some(table) = features.as_object_mut() else {
+        return;
+    };
+    match path {
+        [] => {}
+        [name] => {
+            table.remove(*name);
+        }
+        [name, rest @ ..] => {
+            let Some(entry) = table.get_mut(*name) else {
+                return;
+            };
+            if !entry.is_object() {
+                // A plain bool stands for `enabled`.
+                if rest == ["enabled"] {
+                    table.remove(*name);
+                }
+                return;
+            }
+            remove_feature_value(entry, rest);
+            if entry.as_object().is_some_and(serde_json::Map::is_empty) {
+                table.remove(*name);
+            }
+        }
     }
-    origins
-        .iter()
-        .filter(|(key, origin)| {
-            matches!(
-                origin.name,
-                codex_app_server_protocol::ConfigLayerSource::SessionFlags
-            ) && key.starts_with("features.")
-                && !covered.contains(key.as_str())
-                // Turning Subagents on, an agreeing `multi_agent_v2` flag can still hide an
-                // opposing `agents.enabled`; the other switches decide the same way both ways.
-                && (decides_switch(switch, enabled, key)
-                    || (enabled && decides_switch(switch, /*enabled*/ false, key)))
-        })
-        .map(|(key, _)| key.as_str())
-        .collect()
 }
 
 /// The feature of `switch` that a `features.*` key sets, directly or through a legacy alias.
