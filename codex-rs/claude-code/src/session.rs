@@ -454,11 +454,7 @@ async fn send_incremental(
     if !answers.is_empty() {
         // Answers for a process that has exited would be lost; the next request replays them to
         // its replacement as notes instead.
-        if inner
-            .process
-            .as_mut()
-            .is_none_or(ClaudeProcess::is_closed)
-        {
+        if inner.process.as_mut().is_none_or(ClaudeProcess::is_closed) {
             return false;
         }
         if !blocks.is_empty()
