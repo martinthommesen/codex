@@ -4,6 +4,7 @@ use super::spawn_telemetry::SpawnMeasurements;
 use super::spawn_telemetry::record_spawn_success;
 use super::*;
 use crate::agent::child_config::build_agent_resume_config;
+use crate::agent::child_config::switch_agent_provider;
 use crate::agent::role::apply_role_to_config;
 use crate::agent::types::AgentMetadata;
 use crate::agent::types::LiveAgent;
@@ -432,6 +433,12 @@ impl LocalAgentControl {
             None
         };
         config.model_reasoning_effort = stored_reasoning_effort;
+        mark_mixed_provider_resume(&mut config, &stored_model_provider);
+        // Switch before the role applies, so that what the role sets survives the switch, as on
+        // spawn.
+        if config.model_provider_id != stored_model_provider {
+            resume_on_stored_provider(&mut config, &stored_model_provider)?;
+        }
         if let Some(role_name) = session_source.get_agent_role() {
             let runtime_approval_policy = config.permissions.approval_policy.value();
             let runtime_approvals_reviewer = config.approvals_reviewer;
@@ -471,27 +478,6 @@ impl LocalAgentControl {
         config.service_tier = self.root_service_tier();
         if let Some(model) = stored_model {
             config.model = Some(model);
-        }
-        mark_mixed_provider_resume(&mut config, &stored_model_provider);
-        if config.model_provider_id != stored_model_provider {
-            check_required_model_provider(&config, &stored_model_provider)
-                .map_err(CodexErr::InvalidRequest)?;
-            config.model_provider = config
-                .model_providers
-                .get(&stored_model_provider)
-                .cloned()
-                .ok_or_else(|| {
-                    CodexErr::InvalidRequest(format!(
-                        "Model provider `{stored_model_provider}` not found"
-                    ))
-                })?;
-            config.model_provider_id = stored_model_provider;
-            // The sender's provider-specific tuning does not carry over, as on spawn.
-            config.model_verbosity = None;
-            config.model_context_window = None;
-            config.model_auto_compact_token_limit = None;
-            config.agent_default_subagent_model = None;
-            config.agent_default_subagent_reasoning_effort = None;
         }
         let parent_thread_id = owner_thread_id
             .or_else(|| initial_history.get_resumed_parent_thread_id())
@@ -1464,30 +1450,11 @@ impl LocalAgentControl {
         {
             // A child spawned on another provider resumes there; the parent's model and tuning
             // belong to the parent's provider.
-            check_required_model_provider(&config, &stored_thread.model_provider)
-                .map_err(CodexErr::InvalidRequest)?;
-            config.model_provider = config
-                .model_providers
-                .get(&stored_thread.model_provider)
-                .cloned()
-                .ok_or_else(|| {
-                    CodexErr::InvalidRequest(format!(
-                        "Model provider `{}` not found",
-                        stored_thread.model_provider
-                    ))
-                })?;
-            config
-                .model_provider_id
-                .clone_from(&stored_thread.model_provider);
+            resume_on_stored_provider(&mut config, &stored_thread.model_provider)?;
             config.model.clone_from(&stored_thread.model);
             config
                 .model_reasoning_effort
                 .clone_from(&stored_thread.reasoning_effort);
-            config.model_verbosity = None;
-            config.model_context_window = None;
-            config.model_auto_compact_token_limit = None;
-            config.agent_default_subagent_model = None;
-            config.agent_default_subagent_reasoning_effort = None;
         }
         let resumed_agent_path = stored_thread
             .agent_path
@@ -1589,6 +1556,23 @@ impl LocalAgentControl {
 
         Ok((resumed_thread.thread_id, multi_agent_version))
     }
+}
+
+/// Moves a resuming child back onto the provider it was spawned on.
+fn resume_on_stored_provider(config: &mut Config, stored_model_provider: &str) -> CodexResult<()> {
+    check_required_model_provider(config, stored_model_provider)
+        .map_err(CodexErr::InvalidRequest)?;
+    let provider = config
+        .model_providers
+        .get(stored_model_provider)
+        .cloned()
+        .ok_or_else(|| {
+            CodexErr::InvalidRequest(format!(
+                "Model provider `{stored_model_provider}` not found"
+            ))
+        })?;
+    switch_agent_provider(config, stored_model_provider, provider);
+    Ok(())
 }
 
 /// A resumed agent keeps collaboration messages in plaintext when `config` (its parent's, or the

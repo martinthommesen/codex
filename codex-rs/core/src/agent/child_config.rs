@@ -16,8 +16,8 @@ use codex_features::Feature;
 use codex_model_provider_info::ANTHROPIC_PROVIDER_ID;
 use codex_model_provider_info::CLAUDE_CODE_PROVIDER_ID;
 use codex_model_provider_info::CLAUDE_OAUTH_PROVIDER_ID;
+use codex_model_provider_info::ModelProviderInfo;
 use codex_model_provider_info::OPENAI_PROVIDER_ID;
-use codex_model_provider_info::WireApi;
 use codex_models_manager::manager::RefreshStrategy;
 use codex_protocol::config_types::SERVICE_TIER_DEFAULT_REQUEST_VALUE;
 use codex_protocol::models::BaseInstructions;
@@ -55,6 +55,8 @@ pub(crate) struct SpawnConfigOptions<'a> {
 pub(crate) struct PreparedSpawnConfig {
     pub(crate) config: Config,
     pub(crate) role_name: Option<String>,
+    /// The whole tree switches to plaintext collaboration messages once this child has started.
+    pub(crate) mark_plaintext_tree: bool,
 }
 
 /// Resolves child settings before starting the thread, retaining the invoking tool's precedence.
@@ -81,11 +83,7 @@ pub(crate) async fn prepare_agent_spawn_config(
     let provider_changed = config.model_provider_id != turn.config.model_provider_id;
     // Every agent in a tree that includes a Claude model must send readable messages, and the
     // flag is inherited from here on.
-    let mixed_provider_tree = provider_changed
-        || matches!(
-            turn.config.model_provider.wire_api,
-            WireApi::AnthropicMessages | WireApi::ClaudeCode | WireApi::ClaudeOAuth
-        );
+    let mixed_provider_tree = provider_changed || turn.config.model_provider.wire_api.is_claude();
     if mixed_provider_tree {
         config.plaintext_collaboration_messages = true;
     }
@@ -94,8 +92,14 @@ pub(crate) async fn prepare_agent_spawn_config(
     {
         let model_before_role = config.model.clone();
         apply_spawn_agent_role(session, &mut config, options.role_name).await?;
-        if provider_changed && config.model != model_before_role {
-            reject_role_model_from_other_provider(session, &config, options.role_name).await?;
+        // The Claude catalog is closed, so a role model it does not list cannot run on a Claude
+        // child even on the parent's provider. As for an explicit `model`, that includes Claude
+        // CLI aliases and gateway model ids.
+        if (provider_changed || config.model_provider.wire_api.is_claude())
+            && config.model != model_before_role
+        {
+            reject_unserved_role_model(session, &config, options.role_name, provider_changed)
+                .await?;
         }
         if options.version == SpawnConfigVersion::V2
             && options.full_history_fork
@@ -122,15 +126,11 @@ pub(crate) async fn prepare_agent_spawn_config(
             .then_some(DEFAULT_ROLE_NAME)
         })
         .map(str::to_owned);
-    if mixed_provider_tree {
-        // The parent, its siblings and the root keep plaintext too, even if the provider that made
-        // this tree mixed is disconnected later.
-        session
-            .services
-            .local_agent_runtime
-            .mark_plaintext_collaboration_messages();
-    }
-    Ok(PreparedSpawnConfig { config, role_name })
+    Ok(PreparedSpawnConfig {
+        config,
+        role_name,
+        mark_plaintext_tree: mixed_provider_tree,
+    })
 }
 
 /// Builds the base config snapshot for a newly spawned sub-agent.
@@ -234,14 +234,21 @@ fn apply_spawn_agent_runtime_overrides(
     Ok(())
 }
 
-/// Switches the child to `provider_id`, keeping the parent and siblings untouched.
+/// The `model_provider` a spawn asks for; a blank id keeps the parent's provider.
+pub(crate) fn requested_spawn_provider(provider: Option<&str>) -> Option<&str> {
+    provider
+        .map(str::trim)
+        .filter(|provider| !provider.is_empty())
+}
+
+/// Checks that a child of an agent running with `config` may run on `provider_id`.
 ///
-/// Returns whether the provider differs from the inherited one.
-fn apply_requested_spawn_agent_provider(
+/// Returns the provider when it differs from the inherited one.
+pub(crate) fn validate_spawn_provider(
     session: &Session,
-    config: &mut Config,
+    config: &Config,
     provider_id: &str,
-) -> Result<bool, String> {
+) -> Result<Option<ModelProviderInfo>, String> {
     let Some(provider) = config.model_providers.get(provider_id).cloned() else {
         let mut available = config.model_providers.keys().cloned().collect::<Vec<_>>();
         available.sort();
@@ -251,7 +258,7 @@ fn apply_requested_spawn_agent_provider(
         ));
     };
     if provider_id == config.model_provider_id {
-        return Ok(false);
+        return Ok(None);
     }
     check_required_model_provider(config, provider_id)?;
     if let ProviderConnection::NotConnected { remedy } = provider_connection(
@@ -263,6 +270,16 @@ fn apply_requested_spawn_agent_provider(
             "model_provider `{provider_id}` is not connected. Ask the user to {remedy}."
         ));
     }
+    Ok(Some(provider))
+}
+
+/// Moves an agent's config to another provider. Spawn and both resume paths share it, so a child
+/// always starts on a provider the same way.
+pub(crate) fn switch_agent_provider(
+    config: &mut Config,
+    provider_id: &str,
+    provider: ModelProviderInfo,
+) {
     config.model_provider_id = provider_id.to_string();
     config.model_provider = provider;
     // Provider-specific tuning from the parent does not carry over to another backend.
@@ -273,15 +290,41 @@ fn apply_requested_spawn_agent_provider(
     // this child's own spawns.
     config.agent_default_subagent_model = None;
     config.agent_default_subagent_reasoning_effort = None;
+}
+
+/// Switches the child to `provider_id`, keeping the parent and siblings untouched.
+///
+/// Returns whether the provider differs from the inherited one.
+fn apply_requested_spawn_agent_provider(
+    session: &Session,
+    config: &mut Config,
+    provider_id: &str,
+) -> Result<bool, String> {
+    let Some(provider) = validate_spawn_provider(session, config, provider_id)? else {
+        return Ok(false);
+    };
+    switch_agent_provider(config, provider_id, provider);
+    // The child's models are resolved against its own provider's catalog, never the parent's.
+    if session
+        .services
+        .agent_control
+        .models_manager_for_config(config)
+        .is_none()
+    {
+        return Err(format!(
+            "spawn_agent cannot load the model catalog of model_provider `{provider_id}`."
+        ));
+    }
     Ok(true)
 }
 
-/// A role written for the parent's provider may pin a model the child's provider does not serve;
-/// fail the spawn instead of starting a child that cannot make a single request.
-async fn reject_role_model_from_other_provider(
+/// A role may pin a model the child's provider does not serve, for example one written for the
+/// parent's provider; fail the spawn instead of starting a child that cannot make a single request.
+async fn reject_unserved_role_model(
     session: &Session,
     config: &Config,
     role_name: Option<&str>,
+    provider_changed: bool,
 ) -> Result<(), String> {
     let Some(model) = config.model.as_deref() else {
         return Ok(());
@@ -291,9 +334,13 @@ async fn reject_role_model_from_other_provider(
         .get_model_info(model, &config.to_models_manager_config())
         .await;
     if model_info.used_fallback_model_metadata {
+        let hint = if provider_changed {
+            "Pass a `model` of that provider, or omit `model_provider`."
+        } else {
+            "Use another agent_type, or pass the `model_provider` that serves it."
+        };
         return Err(format!(
-            "agent role `{}` sets model `{model}`, which provider `{}` does not serve. Pass a \
-`model` of that provider, or omit `model_provider`.",
+            "agent role `{}` sets model `{model}`, which provider `{}` does not serve. {hint}",
             role_name.unwrap_or(DEFAULT_ROLE_NAME),
             config.model_provider_id
         ));
@@ -327,10 +374,7 @@ async fn apply_requested_spawn_agent_model_overrides(
     requested_reasoning_effort: Option<ReasoningEffort>,
 ) -> Result<(), String> {
     let turn = step_context.turn.as_ref();
-    let provider_changed = match requested_provider
-        .map(str::trim)
-        .filter(|provider| !provider.is_empty())
-    {
+    let provider_changed = match requested_spawn_provider(requested_provider) {
         Some(provider_id) => apply_requested_spawn_agent_provider(session, config, provider_id)?,
         None => false,
     };

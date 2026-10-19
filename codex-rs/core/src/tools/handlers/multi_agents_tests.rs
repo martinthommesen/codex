@@ -20,6 +20,7 @@ use crate::session::turn_context::TurnContext;
 use crate::session_prefix::format_inter_agent_completion_message;
 use crate::thread_manager::thread_store_from_config;
 use crate::tools::context::ToolOutput;
+use crate::tools::handlers::multi_agents_spec::SpawnAgentToolOptions;
 use crate::tools::handlers::multi_agents_v2::FollowupTaskHandler as FollowupTaskHandlerV2;
 use crate::tools::handlers::multi_agents_v2::InterruptAgentHandler;
 use crate::tools::handlers::multi_agents_v2::ListAgentsHandler as ListAgentsHandlerV2;
@@ -2254,6 +2255,172 @@ async fn multi_agent_v2_spawn_surfaces_task_name_validation_errors() {
         err,
         FunctionCallError::RespondToModel(
             "agent_name must use only lowercase letters, digits, and underscores".to_string()
+        )
+    );
+}
+
+/// A root session on the default OpenAI provider with MultiAgentV2 enabled. Keep the returned
+/// manager alive for as long as the session spawns agents.
+async fn multi_agent_v2_root_session() -> (
+    ThreadManager,
+    Arc<crate::session::session::Session>,
+    Arc<TurnContext>,
+) {
+    let (mut session, mut turn) = make_session_and_context().await;
+    let manager = thread_manager();
+    let root = manager
+        .start_thread(StartThreadOptions::new((*turn.config).clone()))
+        .await
+        .expect("root thread should start");
+    set_agent_control(&mut session, manager.agent_control());
+    session.thread_id = root.thread_id;
+    let mut config = (*turn.config).clone();
+    config
+        .features
+        .enable(Feature::MultiAgentV2)
+        .expect("test config should allow feature update");
+    set_turn_config(&mut turn, config);
+    (manager, Arc::new(session), Arc::new(turn))
+}
+
+fn plaintext_spawn_handler() -> SpawnAgentHandlerV2 {
+    SpawnAgentHandlerV2::new(
+        SpawnAgentToolOptions {
+            plaintext_messages: true,
+            ..Default::default()
+        },
+        /*description_override*/ None,
+    )
+}
+
+#[tokio::test]
+async fn multi_agent_v2_spawn_on_another_provider_asks_for_a_plaintext_task() {
+    // A padded id names the same provider, so it must reach the same resend guard.
+    for model_provider in ["ollama", " ollama "] {
+        let (_manager, session, turn) = multi_agent_v2_root_session().await;
+        let invocation = invocation(
+            Arc::clone(&session),
+            turn,
+            "spawn_agent",
+            function_payload(json!({
+                "message": "inspect this repo",
+                "task_name": "worker",
+                "model_provider": model_provider,
+                "fork_turns": "none"
+            })),
+        );
+        let Err(err) = SpawnAgentHandlerV2::default().handle(invocation).await else {
+            panic!("an encrypted task for `{model_provider}` should be sent again in plaintext");
+        };
+        assert_eq!(
+            err,
+            FunctionCallError::RespondToModel(
+                "model_provider `ollama` needs a plaintext message. Call spawn_agent again with \
+the same arguments."
+                    .to_string()
+            )
+        );
+        assert!(
+            session
+                .services
+                .local_agent_runtime
+                .plaintext_collaboration_messages()
+        );
+    }
+}
+
+#[tokio::test]
+async fn multi_agent_v2_spawn_on_disconnected_provider_keeps_tree_encrypted() {
+    let (_manager, session, turn) = multi_agent_v2_root_session().await;
+    let invocation = invocation(
+        Arc::clone(&session),
+        turn,
+        "spawn_agent",
+        function_payload(json!({
+            "message": "inspect this repo",
+            "task_name": "worker",
+            "model_provider": "claude-code",
+            "fork_turns": "none"
+        })),
+    );
+    let Err(FunctionCallError::RespondToModel(message)) =
+        SpawnAgentHandlerV2::default().handle(invocation).await
+    else {
+        panic!("a disconnected provider should be rejected");
+    };
+    assert!(
+        message.contains("model_provider `claude-code` is not connected"),
+        "{message}"
+    );
+    assert!(
+        !session
+            .services
+            .local_agent_runtime
+            .plaintext_collaboration_messages()
+    );
+}
+
+#[tokio::test]
+async fn failed_multi_agent_v2_spawn_on_another_provider_keeps_tree_encrypted() {
+    let (_manager, session, turn) = multi_agent_v2_root_session().await;
+    let invocation = invocation(
+        Arc::clone(&session),
+        turn,
+        "spawn_agent",
+        function_payload(json!({
+            "message": "inspect this repo",
+            "task_name": "BadName",
+            "model_provider": "ollama",
+            "fork_turns": "none"
+        })),
+    );
+    let Err(err) = plaintext_spawn_handler().handle(invocation).await else {
+        panic!("invalid agent name should be rejected");
+    };
+    assert_eq!(
+        err,
+        FunctionCallError::RespondToModel(
+            "agent_name must use only lowercase letters, digits, and underscores".to_string()
+        )
+    );
+    assert!(
+        !session
+            .services
+            .local_agent_runtime
+            .plaintext_collaboration_messages(),
+        "no agent started on another provider"
+    );
+}
+
+#[tokio::test]
+async fn multi_agent_v2_spawn_on_another_provider_needs_its_model_catalog() {
+    let (mut session, mut turn) = make_session_and_context().await;
+    // Without its thread manager the agent backend cannot load another provider's catalog.
+    set_agent_control(&mut session, thread_manager().agent_control());
+    let mut config = (*turn.config).clone();
+    config
+        .features
+        .enable(Feature::MultiAgentV2)
+        .expect("test config should allow feature update");
+    set_turn_config(&mut turn, config);
+    let invocation = invocation(
+        Arc::new(session),
+        Arc::new(turn),
+        "spawn_agent",
+        function_payload(json!({
+            "message": "inspect this repo",
+            "task_name": "worker",
+            "model_provider": "ollama",
+            "fork_turns": "none"
+        })),
+    );
+    let Err(err) = plaintext_spawn_handler().handle(invocation).await else {
+        panic!("a provider without a catalog should be rejected");
+    };
+    assert_eq!(
+        err,
+        FunctionCallError::RespondToModel(
+            "spawn_agent cannot load the model catalog of model_provider `ollama`.".to_string()
         )
     );
 }

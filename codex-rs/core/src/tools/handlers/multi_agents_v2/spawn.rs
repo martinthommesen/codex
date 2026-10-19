@@ -1,4 +1,6 @@
 use super::*;
+use crate::agent::child_config::requested_spawn_provider;
+use crate::agent::child_config::validate_spawn_provider;
 use crate::agent::role::DEFAULT_ROLE_NAME;
 use crate::agent::types::SpawnAgentForkMode;
 use crate::codex_thread::ThreadConfigSnapshot;
@@ -114,12 +116,17 @@ async fn handle_spawn_agent(
     let turn = &step_context.turn;
     let arguments = function_arguments(payload)?;
     let args: SpawnAgentArgs = parse_arguments(&arguments)?;
-    // A child on another provider cannot read an encrypted task. Switch the tree to plaintext and
-    // have the model resend, so its next schema asks for a plaintext message.
+    let fork_mode = args.fork_mode()?;
+    let message = message_content(args.message)?;
+    let model_provider = requested_spawn_provider(args.model_provider.as_deref());
+    // A child on another provider cannot read an encrypted task. Once that provider is known to be
+    // usable, switch the tree to plaintext and have the model resend, so its next schema asks for a
+    // plaintext message.
     if !plaintext_messages
-        && let Some(provider_id) = args.model_provider.as_deref()
-        && provider_id != turn.config.model_provider_id
-        && turn.config.model_providers.contains_key(provider_id)
+        && let Some(provider_id) = model_provider
+        && validate_spawn_provider(&session, &turn.config, provider_id)
+            .map_err(FunctionCallError::RespondToModel)?
+            .is_some()
     {
         session
             .services
@@ -130,8 +137,6 @@ async fn handle_spawn_agent(
 the same arguments."
         )));
     }
-    let fork_mode = args.fork_mode()?;
-    let message = message_content(args.message)?;
     let role_name = args
         .agent_type
         .as_deref()
@@ -151,7 +156,7 @@ the same arguments."
             },
             fork_mode: fork_mode.clone(),
             agent_type: args.agent_type.clone(),
-            model_provider: args.model_provider,
+            model_provider: model_provider.map(str::to_owned),
             model: args.model,
             reasoning_effort: args.reasoning_effort,
         },

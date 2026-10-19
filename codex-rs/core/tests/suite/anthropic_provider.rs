@@ -13,6 +13,7 @@ use std::time::Duration;
 use anyhow::Result;
 use codex_config::types::AuthCredentialsStoreMode;
 use codex_config::types::AuthKeyringBackendKind;
+use codex_core::config::AgentRoleConfig;
 use codex_core::config::Config;
 use codex_features::Feature;
 use codex_login::AnthropicAuthConfig;
@@ -71,6 +72,8 @@ const OPENAI_V2_CHILD_MODEL: &str = "gpt-5.6-terra";
 const PARENT_PROMPT: &str = "delegate the work please";
 const CLAUDE_CHILD_PROMPT: &str = "claude child: summarize the repository";
 const OPENAI_CHILD_PROMPT: &str = "openai child: list the test files";
+/// An OpenAI model that a role written for OpenAI sessions may pin.
+const ROLE_OPENAI_MODEL: &str = "gpt-5.4";
 
 // ---------------------------------------------------------------------------------------------
 // Anthropic mock helpers
@@ -1416,5 +1419,222 @@ async fn openai_only_tree_returns_to_encrypted_messages() -> Result<()> {
             "{declaration}"
         );
     }
+    Ok(())
+}
+
+/// Returns the text of the user block that delivers another agent's message, if the request
+/// carries one.
+fn delivered_agent_message(request: &Request) -> Option<String> {
+    request_json(request)["messages"]
+        .as_array()?
+        .iter()
+        .filter(|message| message["role"] == "user")
+        .filter_map(|message| message["content"].as_array())
+        .flatten()
+        .filter_map(|block| block["text"].as_str())
+        .find(|text| text.starts_with("[message from agent "))
+        .map(str::to_string)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn openai_parent_delivers_plaintext_task_to_claude_child() -> Result<()> {
+    skip_if_no_network!(Ok(()));
+    let server = start_mock_server().await;
+    mount_sse_once_match(
+        &server,
+        |request: &Request| {
+            body_contains(request, PARENT_PROMPT) && !body_contains(request, "call-spawn-claude")
+        },
+        openai_spawn_turn(&[(
+            "call-spawn-claude",
+            spawn_args_without_fork(
+                "claude_worker",
+                CLAUDE_CHILD_PROMPT,
+                ANTHROPIC_PROVIDER_ID,
+                CLAUDE_CHILD_MODEL,
+            ),
+        )]),
+    )
+    .await;
+    // Match on the model alone, so the child's request is captured whatever task it carries.
+    let child = mount_messages_once(
+        &server,
+        |request| request_json_lossy(request)["model"] == CLAUDE_CHILD_MODEL,
+        anthropic_text_sse("msg_child", CLAUDE_CHILD_MODEL, "claude child done"),
+    )
+    .await;
+    mount_responses_fallback(&server).await;
+    mount_messages_fallback(
+        &server,
+        anthropic_text_sse("msg_extra", CLAUDE_CHILD_MODEL, "ok"),
+    )
+    .await;
+    let test = build(&server, OPENAI_PROVIDER_ID, OPENAI_PARENT_MODEL).await?;
+
+    test.submit_turn(PARENT_PROMPT).await?;
+
+    let child_request = child.wait_for_request().await?;
+    assert_anthropic_auth_only(&child_request);
+    // Without a forked history, the task reaches the child only as the delivered message.
+    let task = delivered_agent_message(&child_request)
+        .unwrap_or_else(|| panic!("no delivered task: {}", request_text(&child_request)));
+    assert!(task.contains(CLAUDE_CHILD_PROMPT), "{task}");
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn padded_provider_id_resends_the_task_in_plaintext() -> Result<()> {
+    skip_if_no_network!(Ok(()));
+    if std::env::var("ANTHROPIC_API_KEY").is_ok() {
+        // The environment key connects Anthropic, so the first schema already asks for plaintext.
+        return Ok(());
+    }
+    let server = start_mock_server().await;
+    let spawn = spawn_args_without_fork(
+        "claude_worker",
+        CLAUDE_CHILD_PROMPT,
+        " claude-gateway",
+        CLAUDE_CHILD_MODEL,
+    );
+    mount_sse_once_match(
+        &server,
+        |request: &Request| {
+            body_contains(request, PARENT_PROMPT) && !body_contains(request, "call-spawn-1")
+        },
+        openai_spawn_turn(&[("call-spawn-1", spawn.clone())]),
+    )
+    .await;
+    let resend = mount_sse_once_match(
+        &server,
+        |request: &Request| {
+            body_contains(request, "call-spawn-1") && !body_contains(request, "call-spawn-2")
+        },
+        openai_spawn_turn(&[("call-spawn-2", spawn)]),
+    )
+    .await;
+    let child = mount_messages_once(
+        &server,
+        |request| request_json_lossy(request)["model"] == CLAUDE_CHILD_MODEL,
+        anthropic_text_sse("msg_child", CLAUDE_CHILD_MODEL, "claude child done"),
+    )
+    .await;
+    mount_responses_fallback(&server).await;
+    mount_messages_fallback(
+        &server,
+        anthropic_text_sse("msg_extra", CLAUDE_CHILD_MODEL, "ok"),
+    )
+    .await;
+    // No built-in Claude provider is connected, so the parent's first schema asks for encrypted
+    // messages, and a custom gateway is never offered as a spawn option.
+    let test = test_codex()
+        .with_auth(codex_login::CodexAuth::from_api_key(OPENAI_TEST_KEY))
+        .with_config(|config| {
+            route_providers_to_mock(config, OPENAI_PROVIDER_ID, OPENAI_PARENT_MODEL);
+            let mut gateway = config.model_providers[ANTHROPIC_PROVIDER_ID].clone();
+            gateway.name = "Claude gateway".to_string();
+            gateway.experimental_bearer_token = Some("gateway-token".into());
+            config
+                .model_providers
+                .insert("claude-gateway".to_string(), gateway);
+            enable_multi_agent_v2(config);
+        })
+        .build_with_auto_env(&server)
+        .await?;
+
+    test.submit_turn(PARENT_PROMPT).await?;
+
+    let first_output = wait_for_responses_request(&resend, answers_call("call-spawn-1"))
+        .await?
+        .function_call_output_text("call-spawn-1")
+        .expect("first spawn_agent output");
+    assert!(
+        first_output.contains("model_provider `claude-gateway` needs a plaintext message"),
+        "{first_output}"
+    );
+    let child_request = child.wait_for_request().await?;
+    let task = delivered_agent_message(&child_request)
+        .unwrap_or_else(|| panic!("no delivered task: {}", request_text(&child_request)));
+    assert!(task.contains(CLAUDE_CHILD_PROMPT), "{task}");
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn claude_parent_rejects_a_role_model_its_provider_does_not_serve() -> Result<()> {
+    skip_if_no_network!(Ok(()));
+    let server = start_mock_server().await;
+    mount_messages_once(
+        &server,
+        |request| body_contains(request, PARENT_PROMPT) && !has_tool_result(request),
+        anthropic_tool_use_sse(
+            "msg_parent",
+            CLAUDE_PARENT_MODEL,
+            &[(
+                "toolu_spawn_pinned",
+                ANTHROPIC_SPAWN_TOOL,
+                json!({
+                    "task_name": "pinned_worker",
+                    "message": CLAUDE_CHILD_PROMPT,
+                    "agent_type": "pinned",
+                    "fork_turns": "none",
+                }),
+            )],
+        ),
+    )
+    .await;
+    let parent_follow_up = mount_messages_once(
+        &server,
+        |request| body_contains(request, PARENT_PROMPT) && has_tool_result(request),
+        anthropic_text_sse("msg_parent_done", CLAUDE_PARENT_MODEL, "parent done"),
+    )
+    .await;
+    let pinned_child = mount_messages_once(
+        &server,
+        |request| request_json_lossy(request)["model"] == ROLE_OPENAI_MODEL,
+        anthropic_text_sse("msg_child", CLAUDE_CHILD_MODEL, "never served"),
+    )
+    .await;
+    mount_responses_fallback(&server).await;
+    mount_messages_fallback(
+        &server,
+        anthropic_text_sse("msg_extra", CLAUDE_PARENT_MODEL, "ok"),
+    )
+    .await;
+    let test = test_codex()
+        .with_auth(codex_login::CodexAuth::from_api_key(OPENAI_TEST_KEY))
+        .with_pre_build_hook(store_anthropic_key)
+        .with_config(|config| {
+            route_providers_to_mock(config, ANTHROPIC_PROVIDER_ID, CLAUDE_PARENT_MODEL);
+            enable_multi_agent_v2(config);
+            // A role written for OpenAI sessions.
+            let role_path = config.codex_home.join("pinned-role.toml");
+            std::fs::write(&role_path, format!("model = \"{ROLE_OPENAI_MODEL}\"\n"))
+                .expect("write role config");
+            config.agent_roles.insert(
+                "pinned".to_string(),
+                AgentRoleConfig {
+                    description: Some("Pinned to an OpenAI model".to_string()),
+                    config_file: Some(role_path.to_path_buf()),
+                    nickname_candidates: None,
+                },
+            );
+        })
+        .build_with_auto_env(&server)
+        .await?;
+
+    test.submit_turn(PARENT_PROMPT).await?;
+
+    let follow_up = parent_follow_up.wait_for_request().await?;
+    let result = tool_result(&follow_up, "toolu_spawn_pinned").expect("spawn result");
+    assert!(
+        tool_result_text(&result).contains(&format!(
+            "sets model `{ROLE_OPENAI_MODEL}`, which provider `{ANTHROPIC_PROVIDER_ID}` does \
+not serve"
+        )),
+        "{result}"
+    );
+    assert!(
+        pinned_child.requests().is_empty(),
+        "no child may send the role's OpenAI model to Anthropic"
+    );
     Ok(())
 }

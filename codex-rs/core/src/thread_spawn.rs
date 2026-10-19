@@ -99,6 +99,7 @@ pub(crate) async fn spawn(
     )
     .await
     .map_err(ThreadSpawnError::Preparation)?;
+    let mark_plaintext_tree = prepared.mark_plaintext_tree;
     let config = prepared.config;
     let task_name = turn
         .session_source
@@ -163,6 +164,14 @@ pub(crate) async fn spawn(
             },
         })
         .await?;
+    if mark_plaintext_tree {
+        // Only a started child makes the tree mixed. The parent, its siblings and the root keep
+        // plaintext from then on, even if the provider that made it mixed is disconnected later.
+        session
+            .services
+            .local_agent_runtime
+            .mark_plaintext_collaboration_messages();
+    }
     Ok(ThreadSpawnResult {
         agent,
         config,

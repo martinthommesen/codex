@@ -109,6 +109,7 @@ async fn handle_spawn_agent(
     )
     .await
     .map_err(FunctionCallError::RespondToModel)?;
+    let mark_plaintext_tree = prepared.mark_plaintext_tree;
     let config = prepared.config;
     let fork_mode = args.fork_context.then_some(SpawnAgentForkMode::FullHistory);
     let result = session
@@ -151,6 +152,13 @@ async fn handle_spawn_agent(
             );
             collab_spawn_error(err)
         });
+    if mark_plaintext_tree && result.is_ok() {
+        // Only a started child makes the tree mixed; see `thread_spawn::spawn`.
+        session
+            .services
+            .local_agent_runtime
+            .mark_plaintext_collaboration_messages();
+    }
     let (new_thread_id, status) = match &result {
         Ok((spawned_agent, _)) => (Some(spawned_agent.thread_id), spawned_agent.status.clone()),
         Err(_) => (None, AgentStatus::NotFound),

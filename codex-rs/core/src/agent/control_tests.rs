@@ -59,6 +59,7 @@ use codex_protocol::config_types::CollaborationMode;
 use codex_protocol::config_types::ModeKind;
 use codex_protocol::config_types::ReasoningSummary;
 use codex_protocol::config_types::Settings;
+use codex_protocol::config_types::Verbosity;
 use codex_protocol::error::AgentErrorContext;
 use codex_protocol::error::CodexErrKind;
 use codex_protocol::error::CodexErrorDetails;
@@ -1210,6 +1211,89 @@ async fn cancelled_v2_send_finishes_reload_registration() {
             "Message Type: NEW_TASK\nTask name: /root/worker\nSender: /root\nPayload:\nfollow-up after cancellation".to_string(),
             /*trigger_turn*/ true,
         )],
+    );
+}
+
+#[tokio::test]
+async fn ensure_v2_agent_loaded_keeps_role_verbosity_on_the_childs_provider() {
+    let (home, mut config) = test_config().await;
+    config.features.enable(Feature::MultiAgentV2).unwrap();
+    config.features.enable(Feature::Sqlite).unwrap();
+    let role_path = home.path().join("terse-role.toml");
+    std::fs::write(&role_path, "model_verbosity = \"low\"\n").expect("write role config");
+    config.agent_roles.insert(
+        "terse".to_string(),
+        AgentRoleConfig {
+            description: Some("Terse role".to_string()),
+            config_file: Some(role_path),
+            nickname_candidates: None,
+        },
+    );
+    let harness = AgentControlHarness::new_with_config(home, config).await;
+    let (_, parent) = harness.start_paginated_thread().await;
+    let control = parent
+        .session
+        .services
+        .local_agent_runtime
+        .control(parent.session.session_id());
+    let source = thread_spawn_source(
+        parent.session.thread_id,
+        &parent.session_source,
+        next_thread_spawn_depth(&parent.session_source),
+        Some("terse"),
+        Some("worker".to_string()),
+    )
+    .expect("child source");
+    let child = control
+        .spawn_agent_with_metadata(
+            harness.config.clone(),
+            text_input("hello child"),
+            source,
+            SpawnAgentOptions {
+                parent_thread_id: Some(parent.session.thread_id),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("spawn_agent should succeed");
+    let thread = harness.manager.get_thread(child.thread_id).await.unwrap();
+    thread
+        .inject_response_items(vec![assistant_message(
+            "child persisted",
+            Some(MessagePhase::FinalAnswer),
+        )])
+        .await
+        .unwrap();
+    // The fixture has no task runner to finish the initial turn.
+    thread.session.mark_interrupted();
+    *thread.session.active_turn.lock().await = None;
+    assert_eq!(
+        harness.manager.try_evict_v2_thread(thread).await.unwrap(),
+        ThreadEvictionOutcome::Evicted,
+    );
+
+    // A sender on another provider reloads the child onto its own provider, which drops the
+    // sender's tuning but, as on spawn, keeps what the child's role sets.
+    let mut sender_config = harness.config.clone();
+    sender_config.model_provider_id = "ollama".to_string();
+    sender_config.model_provider = sender_config.model_providers["ollama"].clone();
+    sender_config.model_verbosity = Some(Verbosity::High);
+    let _residency_pin = control
+        .ensure_v2_agent_loaded(sender_config, child.thread_id, /*parent*/ None)
+        .await
+        .expect("known v2 agent should reload");
+    let reloaded = harness
+        .manager
+        .get_thread(child.thread_id)
+        .await
+        .expect("reloaded child thread should exist");
+    let reloaded_config = reloaded.session.get_config().await;
+    assert_eq!(
+        (
+            reloaded_config.model_provider_id.as_str(),
+            reloaded_config.model_verbosity
+        ),
+        ("openai", Some(Verbosity::Low)),
     );
 }
 
