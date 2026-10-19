@@ -207,8 +207,10 @@ Rules:
 
 When only OpenAI is in use, Codex keeps encrypting inter-agent messages; only OpenAI's backend can
 decrypt them. Claude cannot read OpenAI-encrypted messages, so once a Claude provider is current or
-connected, the collaboration tools switch to plaintext. Those messages then appear in rollouts the
-same way ordinary tool arguments do.
+connected, the collaboration tools switch to plaintext. Once an agent tree includes a Claude agent,
+or agents on different providers, every agent in it keeps plaintext for the rest of the session and
+after a resume, even if that provider is disconnected later. Those messages then appear in rollouts
+the same way ordinary tool arguments do.
 
 ## What Claude providers support
 
