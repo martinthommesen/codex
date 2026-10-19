@@ -1245,6 +1245,11 @@ impl PluginRequestProcessor {
                 "remote plugin skill read is not enabled for marketplace {remote_marketplace_name}"
             )));
         }
+        if !config.features.enabled(Feature::Skills) {
+            return Err(invalid_request(
+                "plugin skills are unavailable because skills are turned off (`features.skills = false`)",
+            ));
+        }
         validate_remote_plugin_id(&remote_plugin_id)?;
         if skill_name.is_empty() {
             return Err(invalid_request(
