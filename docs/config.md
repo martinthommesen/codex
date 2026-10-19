@@ -49,7 +49,10 @@ a profile is selected, or a managed config, can still override the saved value;
 `/settings` then reports the save as overridden and names that layer and the
 key it sets.
 
-A running session keeps the skills, hooks, AGENTS.md, and goals it started
-with, but the TUI's `/skills`, `$` mentions, `/hooks`, and `/init` follow the
-saved setting right away. A goal that is already running stays visible and can
-still be paused or cleared after you turn Goals off.
+A running session keeps the features it started with: saving a switch does not
+add or remove that session's tools, model context, or goal support, or change
+whether its hooks run. The TUI's `/skills`, `$` mentions, `/hooks`, `/init`,
+`/agent`, and new `/goal` objectives follow the saved setting right away, so
+they can differ from the running session until you start a new one with `/new`.
+A goal that is already running keeps running after you turn Goals off, and you
+can still pause, resume, edit, or clear it.

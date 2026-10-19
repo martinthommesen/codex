@@ -1609,7 +1609,7 @@ impl TurnRequestProcessor {
                     .enabled(codex_features::Feature::Skills)
                 {
                     return Err(invalid_request(
-                        "Detached reviews use the $review-agent skill, but skills are turned off (`features.skills = false`). Use inline delivery or turn skills back on.",
+                        "Detached reviews use the $review-agent skill, but skills are turned off (`features.skills = false`). Use inline delivery, or turn skills back on and start a new session.",
                     ));
                 }
                 let review_skill_path = system_cache_root_dir(&self.config.codex_home)

@@ -333,7 +333,7 @@ impl ChatWidget {
                         "Turn AGENTS.md back on in /settings.",
                     );
                     self.add_info_message(
-                        "AGENTS.md is turned off, so Codex would not load the file /init creates."
+                        "AGENTS.md is turned off, so new sessions would not load the file /init creates."
                             .to_string(),
                         Some(hint),
                     );
