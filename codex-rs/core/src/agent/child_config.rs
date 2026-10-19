@@ -79,12 +79,12 @@ pub(crate) async fn prepare_agent_spawn_config(
     let provider_changed = config.model_provider_id != turn.config.model_provider_id;
     // Every agent in a tree that includes a Claude model must send readable messages, and the
     // flag is inherited from here on.
-    if provider_changed
+    let mixed_provider_tree = provider_changed
         || matches!(
             turn.config.model_provider.wire_api,
             WireApi::AnthropicMessages | WireApi::ClaudeCode
-        )
-    {
+        );
+    if mixed_provider_tree {
         config.plaintext_collaboration_messages = true;
     }
     if !options.full_history_fork
@@ -120,6 +120,14 @@ pub(crate) async fn prepare_agent_spawn_config(
             .then_some(DEFAULT_ROLE_NAME)
         })
         .map(str::to_owned);
+    if mixed_provider_tree {
+        // The parent, its siblings and the root keep plaintext too, even if the provider that made
+        // this tree mixed is disconnected later.
+        session
+            .services
+            .local_agent_runtime
+            .mark_plaintext_collaboration_messages();
+    }
     Ok(PreparedSpawnConfig { config, role_name })
 }
 

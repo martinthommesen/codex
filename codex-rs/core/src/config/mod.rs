@@ -1022,7 +1022,8 @@ pub struct Config {
 
     /// Keeps inter-agent messages in plaintext for this agent and the agents it spawns. Set at
     /// runtime on sub-agents of a Claude parent or of a cross-provider spawn, because only
-    /// OpenAI's backend can read encrypted collaboration messages. Not read from the config file.
+    /// OpenAI's backend can read encrypted collaboration messages; the rest of the agent tree
+    /// follows through its shared runtime. Not read from the config file.
     pub plaintext_collaboration_messages: bool,
 
     /// Path to the `codex-linux-sandbox` executable. This must be set if

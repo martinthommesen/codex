@@ -251,7 +251,8 @@ pub(crate) fn spawn_provider_options(
 /// Whether collaboration messages must be plaintext so agents on other providers can read them.
 ///
 /// OpenAI can encrypt collaboration arguments server-side, but only OpenAI models can read that
-/// ciphertext. Once a Claude provider is in the agent tree, messages are sent as plaintext.
+/// ciphertext. A connected Claude provider means a Claude agent may join the tree; once one has,
+/// the tree itself keeps plaintext (`LocalAgentRuntime`), even if the provider is disconnected.
 pub(crate) fn collaboration_messages_require_plaintext(options: &[SpawnProviderOption]) -> bool {
     options.iter().any(|option| option.wire_api.is_claude())
 }

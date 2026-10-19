@@ -116,6 +116,8 @@ struct CoreToolPlanContext<'a> {
     wait_for_environment_tool_config: Option<&'a Arc<crate::WaitForEnvironmentToolConfig>>,
     default_agent_type_description: &'a str,
     wait_agent_timeouts: WaitAgentTimeoutOptions,
+    /// The agent tree has included a Claude agent or agents on different providers.
+    plaintext_collaboration_tree: bool,
 }
 
 #[instrument(level = "trace", skip_all)]
@@ -146,6 +148,10 @@ pub(crate) fn build_tool_router(
         wait_for_environment_tool_config: wait_for_environment_tool_config.as_ref(),
         default_agent_type_description: &default_agent_type_description,
         wait_agent_timeouts: wait_agent_timeout_options(turn_context),
+        plaintext_collaboration_tree: session
+            .services
+            .local_agent_runtime
+            .plaintext_collaboration_messages(),
     };
     let mut registry = ToolRegistry::with_tool_policy(Arc::clone(&session.tool_policy));
     add_core_tool_sources(&context, &mut registry);
@@ -312,6 +318,7 @@ pub(crate) fn build_core_tool_registry(
         wait_for_environment_tool_config,
         default_agent_type_description: &default_agent_type_description,
         wait_agent_timeouts: wait_agent_timeout_options(turn_context),
+        plaintext_collaboration_tree: false,
     };
     let mut registry = ToolRegistry::default();
     add_core_tool_sources(&context, &mut registry);
@@ -1445,7 +1452,8 @@ fn add_collaboration_tools(context: &CoreToolPlanContext<'_>, registry: &mut Too
             turn_context.auth_manager.as_deref(),
             &turn_context.available_models,
         );
-        let plaintext_messages = turn_context.config.plaintext_collaboration_messages
+        let plaintext_messages = context.plaintext_collaboration_tree
+            || turn_context.config.plaintext_collaboration_messages
             || collaboration_messages_require_plaintext(&spawn_providers);
         if multi_agent_v2_enabled(turn_context) {
             let model_messages = ResolvedModelMessages::from_model(context.model_info);

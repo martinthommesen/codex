@@ -1282,3 +1282,139 @@ fn find_tool_declarations(value: &Value, name: &str, found: &mut Vec<Value>) {
         _ => {}
     }
 }
+
+const SECOND_PARENT_PROMPT: &str = "check on the worker please";
+
+/// Runs a parent turn that spawns a child on `provider`/`model`, removes the stored Anthropic key,
+/// and returns the collaboration tool declarations of the parent's next turn.
+async fn collaboration_tools_after_anthropic_disconnect(
+    provider: &str,
+    model: &str,
+) -> Result<Option<(Value, Vec<Value>)>> {
+    if std::env::var("ANTHROPIC_API_KEY").is_ok() {
+        // The environment key would keep Anthropic connected.
+        return Ok(None);
+    }
+    let server = start_mock_server().await;
+    mount_sse_once_match(
+        &server,
+        |request: &Request| {
+            body_contains(request, PARENT_PROMPT) && !body_contains(request, "call-spawn-child")
+        },
+        openai_spawn_turn(&[(
+            "call-spawn-child",
+            spawn_args_without_fork("worker", CLAUDE_CHILD_PROMPT, provider, model),
+        )]),
+    )
+    .await;
+    let parent_follow_up = mount_sse_once_match(
+        &server,
+        |request: &Request| {
+            body_contains(request, "call-spawn-child")
+                && !body_contains(request, SECOND_PARENT_PROMPT)
+        },
+        sse(vec![
+            ev_response_created("resp-parent-2"),
+            ev_assistant_message("msg-parent-2", "parent done"),
+            ev_completed("resp-parent-2"),
+        ]),
+    )
+    .await;
+    let second_turn = mount_sse_once_match(
+        &server,
+        |request: &Request| body_contains(request, SECOND_PARENT_PROMPT),
+        sse(vec![
+            ev_response_created("resp-parent-3"),
+            ev_assistant_message("msg-parent-3", "still working"),
+            ev_completed("resp-parent-3"),
+        ]),
+    )
+    .await;
+    mount_responses_fallback(&server).await;
+    mount_messages_fallback(
+        &server,
+        anthropic_text_sse("msg_child", CLAUDE_CHILD_MODEL, "claude child done"),
+    )
+    .await;
+    let test = build(&server, OPENAI_PROVIDER_ID, OPENAI_PARENT_MODEL).await?;
+
+    test.submit_turn(PARENT_PROMPT).await?;
+    let spawn_output =
+        wait_for_responses_request(&parent_follow_up, answers_call("call-spawn-child"))
+            .await?
+            .function_call_output_text("call-spawn-child")
+            .expect("spawn_agent output");
+    assert!(!spawn_output.contains("not connected"), "{spawn_output}");
+    AnthropicAuthConfig::new(
+        test.home.path().to_path_buf(),
+        AuthCredentialsStoreMode::File,
+        AuthKeyringBackendKind::default(),
+    )
+    .delete()
+    .expect("remove the stored Anthropic key");
+    test.submit_turn(SECOND_PARENT_PROMPT).await?;
+
+    // The turn can take more than one request (for example when the child reports back); every
+    // one of them must declare the same tools.
+    let requests = second_turn.requests();
+    assert!(
+        !requests.is_empty(),
+        "the second parent turn made no request"
+    );
+    let mut spawn_tools = Vec::new();
+    let mut declarations = Vec::new();
+    for request in requests {
+        let body = request.body_json();
+        find_tool_declarations(&body, "spawn_agent", &mut spawn_tools);
+        find_tool_declarations(&body, "send_message", &mut declarations);
+        find_tool_declarations(&body, "followup_task", &mut declarations);
+    }
+    let spawn_tool = spawn_tools.into_iter().next().expect("spawn_agent tool");
+    assert!(
+        !declarations.is_empty(),
+        "no collaboration tools in the second turn"
+    );
+    Ok(Some((spawn_tool, declarations)))
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn openai_parent_keeps_plaintext_messages_after_claude_disconnects() -> Result<()> {
+    skip_if_no_network!(Ok(()));
+    let Some((spawn_tool, declarations)) =
+        collaboration_tools_after_anthropic_disconnect(ANTHROPIC_PROVIDER_ID, CLAUDE_CHILD_MODEL)
+            .await?
+    else {
+        return Ok(());
+    };
+    // Anthropic is no longer offered, yet the Claude child must still read the parent's messages.
+    assert_eq!(
+        spawn_tool["parameters"]["properties"]["model_provider"],
+        Value::Null,
+        "{spawn_tool}"
+    );
+    for declaration in declarations {
+        assert!(
+            !declaration.to_string().contains("\"encrypted\":true"),
+            "{declaration}"
+        );
+    }
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn openai_only_tree_returns_to_encrypted_messages() -> Result<()> {
+    skip_if_no_network!(Ok(()));
+    let Some((_, declarations)) =
+        collaboration_tools_after_anthropic_disconnect(OPENAI_PROVIDER_ID, OPENAI_CHILD_MODEL)
+            .await?
+    else {
+        return Ok(());
+    };
+    for declaration in declarations {
+        assert!(
+            declaration.to_string().contains("\"encrypted\":true"),
+            "{declaration}"
+        );
+    }
+    Ok(())
+}

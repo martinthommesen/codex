@@ -251,6 +251,13 @@ impl LocalAgentControl {
             if registry.agent_metadata_for_thread(thread_id).is_some() {
                 continue;
             }
+            // A tree with agents on different providers stays on plaintext collaboration messages.
+            if let Ok(stored_thread) = &stored_thread
+                && !stored_thread.model_provider.is_empty()
+                && stored_thread.model_provider != config.model_provider_id
+            {
+                self.runtime.mark_plaintext_collaboration_messages();
+            }
             let restore_result = stored_thread.and_then(|stored_thread| {
                 let stored_agent_path = stored_thread
                     .agent_path

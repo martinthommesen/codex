@@ -114,6 +114,22 @@ async fn handle_spawn_agent(
     let turn = &step_context.turn;
     let arguments = function_arguments(payload)?;
     let args: SpawnAgentArgs = parse_arguments(&arguments)?;
+    // A child on another provider cannot read an encrypted task. Switch the tree to plaintext and
+    // have the model resend, so its next schema asks for a plaintext message.
+    if !plaintext_messages
+        && let Some(provider_id) = args.model_provider.as_deref()
+        && provider_id != turn.config.model_provider_id
+        && turn.config.model_providers.contains_key(provider_id)
+    {
+        session
+            .services
+            .local_agent_runtime
+            .mark_plaintext_collaboration_messages();
+        return Err(FunctionCallError::RespondToModel(format!(
+            "model_provider `{provider_id}` needs a plaintext message. Call spawn_agent again with \
+the same arguments."
+        )));
+    }
     let fork_mode = args.fork_mode()?;
     let message = message_content(args.message)?;
     let role_name = args
