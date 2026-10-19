@@ -23,7 +23,26 @@ impl App {
         enabled: bool,
     ) {
         let label = switch.label();
-        // Stage locally first so values pinned by requirements fail before anything is written.
+        // Remote threads follow the app server's web search requirements, not this machine's.
+        let remote_web_search_modes = if switch == SettingsSwitch::WebSearch
+            && app_server.uses_remote_workspace()
+        {
+            match read_web_search_modes(app_server).await {
+                Ok(modes) => Some(modes),
+                Err(err) => {
+                    tracing::warn!(error = %err, "failed to read app server web search requirements");
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        if let Some(modes) = &remote_web_search_modes {
+            self.config.web_search_mode =
+                web_search_constraint(modes.as_deref(), self.config.web_search_mode.value());
+        }
+        // Stage first so values pinned by requirements fail before anything is written.
+        let edits = switch.edits(enabled, &self.config);
         let mut next_config = self.config.clone();
         if let Err(err) = switch.apply(&mut next_config, enabled) {
             tracing::warn!(error = %err, switch = label, "settings switch rejected by requirements");
@@ -35,7 +54,7 @@ impl App {
         }
         let response = match crate::config_update::write_config_batch(
             app_server.request_handle(),
-            switch.edits(enabled, &self.config),
+            edits,
         )
         .await
         {
@@ -73,8 +92,23 @@ impl App {
                             &self.config,
                             app_server.thread_params_mode(),
                         );
+                    // thread/start replaces the server's own `[features]` launch flags with this
+                    // TUI's table, so what they leave behind is not visible in config/read.
+                    let server_flags_replaced = launch_overrides
+                        .as_ref()
+                        .is_some_and(|overrides| overrides.contains_key("features"))
+                        && effective_config.origins.iter().any(|(key, origin)| {
+                            matches!(
+                                origin.name,
+                                codex_app_server_protocol::ConfigLayerSource::SessionFlags
+                            ) && decides_switch(switch, enabled, key)
+                        });
                     let flagged =
                         overlay_launch_overrides(&mut effective_config, launch_overrides.as_ref());
+                    let requirements_disallow =
+                        remote_web_search_modes.as_ref().is_some_and(|modes| {
+                            constrain_web_search(&mut effective_config, modes.as_deref())
+                        });
                     adopt_effective_switch_state(&mut self.config, switch, &effective_config);
                     let launch_origins = self.config.config_layer_stack.origins();
                     let flag_precedence =
@@ -91,11 +125,19 @@ impl App {
                                 (key.as_str(), origin.name.precedence(), layer)
                             })
                             .chain(flagged.iter().map(|key| {
-                                let layer = OverrideLayer::launch(launch_origins.get(key));
+                                let layer =
+                                    OverrideLayer::launch(launch_origin(&launch_origins, key));
                                 (key.as_str(), flag_precedence, Some(layer))
                             })),
-                    );
-                    None
+                    )
+                    .or_else(|| {
+                        requirements_disallow
+                            .then(|| (OverrideLayer::Requirements, "web_search".to_string()))
+                    });
+                    server_flags_replaced.then(|| {
+                        "the app server's own feature flags do not reach threads this TUI starts"
+                            .to_string()
+                    })
                 }
                 Err(err) => {
                     tracing::warn!(error = %err, switch = label, "failed to read config after a settings save");
@@ -260,24 +302,166 @@ fn overlay_launch_overrides(
         return flagged;
     };
     for (name, value, key) in overlays {
-        // Merge tables such as `[features.multi_agent_v2]` instead of replacing them, and record
-        // their leaf keys the way config origins do.
-        match (features.get_mut(&name), value) {
-            (Some(serde_json::Value::Object(existing)), serde_json::Value::Object(value)) => {
-                flagged.extend(value.keys().map(|sub_key| format!("{key}.{sub_key}")));
-                existing.extend(value);
+        // Record leaf keys the way config origins do.
+        let structured = codex_config::is_structured_feature_path(&["features", name.as_str()]);
+        match &value {
+            serde_json::Value::Object(table) => {
+                flagged.extend(table.keys().map(|sub_key| format!("{key}.{sub_key}")));
             }
-            (_, serde_json::Value::Object(value)) => {
-                flagged.extend(value.keys().map(|sub_key| format!("{key}.{sub_key}")));
-                features.insert(name, serde_json::Value::Object(value));
+            serde_json::Value::Bool(_) if structured => {
+                flagged.insert(format!("{key}.enabled"));
             }
-            (_, value) => {
-                features.insert(name, value);
+            _ => {
                 flagged.insert(key);
+            }
+        }
+        match features.get_mut(&name) {
+            Some(existing) => merge_feature_value(existing, value, structured),
+            None => {
+                features.insert(name, value);
             }
         }
     }
     flagged
+}
+
+/// Merges a launch value into a feature the way config layers merge: tables merge key by key,
+/// and a structured feature such as `multi_agent_v2` keeps `enabled` across a bool and a table.
+fn merge_feature_value(base: &mut serde_json::Value, overlay: serde_json::Value, structured: bool) {
+    match (base, overlay) {
+        (base @ serde_json::Value::Bool(_), serde_json::Value::Object(overlay)) if structured => {
+            let mut table = serde_json::Map::from_iter([("enabled".to_string(), base.take())]);
+            for (key, value) in overlay {
+                merge_table_value(&mut table, key, value);
+            }
+            *base = serde_json::Value::Object(table);
+        }
+        (serde_json::Value::Object(table), serde_json::Value::Bool(enabled)) if structured => {
+            table.insert("enabled".to_string(), serde_json::Value::Bool(enabled));
+        }
+        (serde_json::Value::Object(table), serde_json::Value::Object(overlay)) => {
+            for (key, value) in overlay {
+                merge_table_value(table, key, value);
+            }
+        }
+        (base, overlay) => *base = overlay,
+    }
+}
+
+fn merge_table_value(
+    table: &mut serde_json::Map<String, serde_json::Value>,
+    key: String,
+    value: serde_json::Value,
+) {
+    match table.get_mut(&key) {
+        Some(existing) => merge_feature_value(existing, value, /*structured*/ false),
+        None => {
+            table.insert(key, value);
+        }
+    }
+}
+
+/// The web search modes a remote app server's requirements accept, or `None` when they accept
+/// every mode.
+async fn read_web_search_modes(
+    app_server: &AppServerSession,
+) -> Result<Option<Vec<WebSearchMode>>> {
+    let response: codex_app_server_protocol::ConfigRequirementsReadResponse = app_server
+        .request_handle()
+        .request_typed(
+            codex_app_server_protocol::ClientRequest::ConfigRequirementsRead {
+                request_id: codex_app_server_protocol::RequestId::String(format!(
+                    "tui-settings-requirements-{}",
+                    uuid::Uuid::new_v4()
+                )),
+                params: None,
+            },
+        )
+        .await
+        .wrap_err("configRequirements/read failed in TUI")?;
+    Ok(response
+        .requirements
+        .and_then(|requirements| requirements.allowed_web_search_modes))
+}
+
+/// The mode core falls back to when requirements reject the configured one.
+fn web_search_fallback(modes: &[WebSearchMode]) -> WebSearchMode {
+    [
+        WebSearchMode::Cached,
+        WebSearchMode::Indexed,
+        WebSearchMode::Live,
+    ]
+    .into_iter()
+    .find(|mode| modes.contains(mode))
+    .unwrap_or(WebSearchMode::Disabled)
+}
+
+/// Mirrors how core constrains `web_search` to the modes requirements allow; disabled is always
+/// allowed.
+fn web_search_constraint(
+    modes: Option<&[WebSearchMode]>,
+    current: WebSearchMode,
+) -> codex_config::Constrained<WebSearchMode> {
+    let Some(modes) = modes else {
+        return codex_config::Constrained::allow_any(current);
+    };
+    let allowed = modes.to_vec();
+    let initial = if current == WebSearchMode::Disabled || allowed.contains(&current) {
+        current
+    } else {
+        web_search_fallback(&allowed)
+    };
+    codex_config::Constrained::new(initial, move |mode| {
+        if *mode == WebSearchMode::Disabled || allowed.contains(mode) {
+            Ok(())
+        } else {
+            Err(codex_config::ConstraintError::InvalidValue {
+                field_name: "web_search",
+                candidate: mode.to_string(),
+                allowed: format!("{allowed:?}"),
+                requirement_source: codex_config::RequirementSource::Unknown,
+            })
+        }
+    })
+    .unwrap_or_else(|_| codex_config::Constrained::allow_any(initial))
+}
+
+/// Applies a remote app server's web search requirements to what it read, the way core falls
+/// back. Returns whether they changed the mode.
+fn constrain_web_search(
+    effective_config: &mut ConfigReadResponse,
+    modes: Option<&[WebSearchMode]>,
+) -> bool {
+    let (Some(modes), Some(mode)) = (modes, effective_config.config.web_search) else {
+        return false;
+    };
+    if mode == WebSearchMode::Disabled || modes.contains(&mode) {
+        return false;
+    }
+    effective_config.config.web_search = Some(web_search_fallback(modes));
+    true
+}
+
+/// Where this TUI's forwarded value for `key` came from. A forwarded `web_search` can come from the
+/// legacy search features instead of the key itself.
+fn launch_origin<'a>(
+    launch_origins: &'a HashMap<String, codex_config::ConfigLayerMetadata>,
+    key: &str,
+) -> Option<&'a codex_config::ConfigLayerMetadata> {
+    launch_origins.get(key).or_else(|| {
+        (key == "web_search")
+            .then(|| {
+                [
+                    "features.web_search_cached",
+                    "features.web_search_request",
+                    "features.web_search",
+                ]
+                .into_iter()
+                .filter_map(|legacy_key| launch_origins.get(legacy_key))
+                .max_by_key(|origin| origin.name.precedence())
+            })
+            .flatten()
+    })
 }
 
 /// The kind of config layer that still decides a switch after a save.
@@ -289,6 +473,8 @@ enum OverrideLayer {
     /// The main `config.toml` under a selected profile, whose file `/settings` writes instead.
     BaseUser,
     Managed,
+    /// The app server's requirements, which reject the saved value.
+    Requirements,
     Other,
 }
 
@@ -359,6 +545,9 @@ impl OverrideLayer {
                 "your main config.toml still sets `{key}`; remove it there, since /settings only writes the selected profile"
             ),
             Self::Managed => format!("a managed config still sets `{key}`"),
+            Self::Requirements => {
+                format!("the app server's requirements do not allow that `{key}` value")
+            }
             Self::Other => format!("another config file still sets `{key}`"),
         }
     }
@@ -391,6 +580,24 @@ fn opposes_save(
     key: &str,
     value: &serde_json::Value,
 ) -> bool {
+    decides_switch(switch, enabled, key)
+        && match switch {
+            SettingsSwitch::WebSearch => value
+                .as_str()
+                .is_some_and(|mode| (mode == "disabled") == enabled),
+            SettingsSwitch::PluginsAndApps
+            | SettingsSwitch::Skills
+            | SettingsSwitch::Hooks
+            | SettingsSwitch::AgentsMd
+            | SettingsSwitch::Memories
+            | SettingsSwitch::Subagents
+            | SettingsSwitch::ImageGeneration
+            | SettingsSwitch::Goals => value.as_bool().is_some_and(|value| value != enabled),
+        }
+}
+
+/// Whether `key` can keep the switch from reaching `enabled`.
+fn decides_switch(switch: SettingsSwitch, enabled: bool, key: &str) -> bool {
     let sets_feature = |feature: Feature| {
         let Some(name) = key.strip_prefix("features.") else {
             return false;
@@ -400,23 +607,17 @@ fn opposes_save(
             .chain(codex_features::legacy_keys_for_feature(feature))
             .any(|feature_key| feature_key == name)
     };
-    let pulls_away = value.as_bool().is_some_and(|value| value != enabled);
     match switch {
-        SettingsSwitch::WebSearch => {
-            key == "web_search"
-                && value
-                    .as_str()
-                    .is_some_and(|mode| (mode == "disabled") == enabled)
-        }
+        SettingsSwitch::WebSearch => key == "web_search",
         // Subagents need `agents.enabled` and `multi_agent` to turn on, and `agents.enabled` and
         // `multi_agent_v2` off to turn off.
         SettingsSwitch::Subagents => {
-            let deciding_feature = if enabled {
-                Feature::Collab
-            } else {
-                Feature::MultiAgentV2
-            };
-            pulls_away && (key == "agents.enabled" || sets_feature(deciding_feature))
+            key == "agents.enabled"
+                || sets_feature(if enabled {
+                    Feature::Collab
+                } else {
+                    Feature::MultiAgentV2
+                })
         }
         SettingsSwitch::PluginsAndApps
         | SettingsSwitch::Skills
@@ -424,20 +625,25 @@ fn opposes_save(
         | SettingsSwitch::AgentsMd
         | SettingsSwitch::Memories
         | SettingsSwitch::ImageGeneration
-        | SettingsSwitch::Goals => {
-            pulls_away
-                && switch
-                    .features()
-                    .iter()
-                    .any(|feature| sets_feature(*feature))
-        }
+        | SettingsSwitch::Goals => switch
+            .features()
+            .iter()
+            .any(|feature| sets_feature(*feature)),
     }
 }
 
-/// The value at a dotted config key such as `features.apps`.
+/// The value at a dotted config key such as `features.apps`. Origins name a structured feature set
+/// to a plain bool (`multi_agent_v2 = true`) as `features.multi_agent_v2.enabled`.
 fn value_at<'a>(values: &'a serde_json::Value, key: &str) -> Option<&'a serde_json::Value> {
-    key.split('.')
-        .try_fold(values, |value, part| value.get(part))
+    let lookup = |key: &str| {
+        key.split('.')
+            .try_fold(values, |value, part| value.get(part))
+    };
+    lookup(key).or_else(|| {
+        key.strip_suffix(".enabled")
+            .and_then(lookup)
+            .filter(|value| value.is_boolean())
+    })
 }
 
 /// Mirrors the effective values this folder resolves to after a save.

@@ -36,6 +36,7 @@ impl App {
             Err(err) => {
                 self.chat_widget
                     .add_error_message(thread_goal_error_message("read", &err));
+                self.chat_widget.maybe_send_next_queued_input();
                 return;
             }
         };
@@ -45,9 +46,11 @@ impl App {
                 GOAL_USAGE.to_string(),
                 Some("No goal is currently set.".to_string()),
             );
+            self.chat_widget.maybe_send_next_queued_input();
             return;
         };
 
+        // Queued input waits until the summary closes.
         self.chat_widget.show_goal_summary(goal);
     }
 
@@ -105,6 +108,7 @@ impl App {
             Err(err) => {
                 self.chat_widget
                     .add_error_message(thread_goal_error_message("read", &err));
+                self.chat_widget.maybe_send_next_queued_input();
                 return;
             }
         };
@@ -262,6 +266,7 @@ impl App {
                 .chat_widget
                 .add_error_message(thread_goal_error_message("update", &err)),
         }
+        self.chat_widget.maybe_send_next_queued_input();
     }
 
     pub(super) async fn clear_thread_goal(
@@ -290,6 +295,7 @@ impl App {
                 .chat_widget
                 .add_error_message(thread_goal_error_message("clear", &err)),
         }
+        self.chat_widget.maybe_send_next_queued_input();
     }
 
     pub(super) fn show_replace_thread_goal_confirmation(
@@ -340,6 +346,7 @@ impl App {
             GOAL_USAGE.to_string(),
             Some("Create a goal before editing it.".to_string()),
         );
+        self.chat_widget.maybe_send_next_queued_input();
     }
 }
 

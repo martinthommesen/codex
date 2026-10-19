@@ -200,3 +200,122 @@ fn unchecked_save_is_not_reported_as_a_plain_success() {
         )
     );
 }
+
+#[test]
+fn a_plain_bool_structured_feature_is_named_by_its_enabled_origin() {
+    let written = user_file("config.toml");
+    // Origins name `multi_agent_v2 = true` as `features.multi_agent_v2.enabled`.
+    let effective_config = config_read(serde_json::json!({
+        "config": {
+            "agents": { "enabled": false },
+            "features": { "multi_agent": false, "multi_agent_v2": true },
+        },
+        "origins": {
+            "agents.enabled": origin(ApiSource::User { file: written.clone(), profile: None }),
+            "features.multi_agent": origin(ApiSource::User { file: written.clone(), profile: None }),
+            "features.multi_agent_v2.enabled": origin(ApiSource::Project {
+                dot_codex_folder: user_file(".codex"),
+            }),
+        },
+    }));
+
+    assert_eq!(
+        remote_override(
+            SettingsSwitch::Subagents,
+            /*enabled*/ false,
+            &effective_config,
+            &written,
+        ),
+        Some((
+            OverrideLayer::Project,
+            "features.multi_agent_v2.enabled".to_string()
+        ))
+    );
+}
+
+#[test]
+fn launch_table_keeps_a_structured_feature_enabled() {
+    let mut effective_config = config_read(serde_json::json!({
+        "config": { "features": { "multi_agent_v2": true } },
+        "origins": {},
+    }));
+    let launch_overrides = HashMap::from([(
+        "features".to_string(),
+        serde_json::json!({ "multi_agent_v2": { "max_concurrent_threads_per_session": 4 } }),
+    )]);
+
+    overlay_launch_overrides(&mut effective_config, Some(&launch_overrides));
+
+    assert_eq!(
+        effective_config.config.additional["features"]["multi_agent_v2"],
+        serde_json::json!({ "enabled": true, "max_concurrent_threads_per_session": 4 })
+    );
+    assert!(feature_enabled_from_effective_config(
+        &effective_config,
+        Feature::MultiAgentV2
+    ));
+}
+
+#[test]
+fn legacy_search_features_in_a_profile_are_named_as_the_profile() {
+    let launch_origins = HashMap::from([(
+        "features.web_search_request".to_string(),
+        codex_config::ConfigLayerMetadata {
+            name: codex_config::ConfigLayerSource::User {
+                file: user_file("work.config.toml"),
+                profile: Some("work".to_string()),
+            },
+            version: "1".to_string(),
+        },
+    )]);
+
+    assert_eq!(
+        OverrideLayer::launch(launch_origin(&launch_origins, "web_search")),
+        OverrideLayer::Profile
+    );
+    assert_eq!(
+        OverrideLayer::launch(launch_origin(&launch_origins, "features.apps")),
+        OverrideLayer::CommandLine
+    );
+}
+
+#[test]
+fn remote_web_search_follows_the_app_servers_requirements() {
+    let live_only = [WebSearchMode::Live];
+    let constraint = web_search_constraint(Some(&live_only), WebSearchMode::Cached);
+    assert_eq!(constraint.value(), WebSearchMode::Live);
+    assert!(constraint.can_set(&WebSearchMode::Disabled).is_ok());
+    assert!(constraint.can_set(&WebSearchMode::Cached).is_err());
+    assert!(
+        web_search_constraint(/*modes*/ None, WebSearchMode::Indexed)
+            .can_set(&WebSearchMode::Live)
+            .is_ok()
+    );
+
+    let mut effective_config = config_read(serde_json::json!({
+        "config": { "web_search": "live" },
+        "origins": {},
+    }));
+    let cached_only = [WebSearchMode::Cached];
+    assert!(constrain_web_search(
+        &mut effective_config,
+        Some(&cached_only)
+    ));
+    assert_eq!(
+        effective_config.config.web_search,
+        Some(WebSearchMode::Cached)
+    );
+    let disabled_only: [WebSearchMode; 0] = [];
+    assert!(constrain_web_search(
+        &mut effective_config,
+        Some(&disabled_only)
+    ));
+    assert_eq!(
+        effective_config.config.web_search,
+        Some(WebSearchMode::Disabled)
+    );
+    assert!(!constrain_web_search(
+        &mut effective_config,
+        Some(&disabled_only)
+    ));
+}
