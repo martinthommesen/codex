@@ -101,4 +101,17 @@ fn claude_code_status_descriptions() {
     let (connected, message) = describe_claude_code_status(/*connected*/ true, &signed_out);
     assert!(!connected);
     assert!(message.contains("claude auth login"), "{message}");
+
+    // Sessions start Claude Code without user settings, so an apiKeyHelper sign-in is unusable.
+    let helper = ClaudeCodeAuthStatus {
+        logged_in: true,
+        auth_method: Some("api_key_helper".to_string()),
+        api_provider: Some("firstParty".to_string()),
+    };
+    let (connected, message) = describe_claude_code_status(/*connected*/ true, &helper);
+    assert!(!connected);
+    assert!(
+        message.starts_with("Claude Code: not usable in Codex"),
+        "{message}"
+    );
 }

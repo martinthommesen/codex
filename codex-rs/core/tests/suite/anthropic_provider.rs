@@ -61,6 +61,8 @@ const CLAUDE_PARENT_MODEL: &str = "claude-sonnet-5-5";
 const CLAUDE_CHILD_MODEL: &str = "claude-haiku-5-5";
 const OPENAI_PARENT_MODEL: &str = "gpt-5.5";
 const OPENAI_CHILD_MODEL: &str = "gpt-5.6-luna";
+/// A bundled model whose catalog entry gives sub-agents the V2 collaboration tools.
+const OPENAI_V2_CHILD_MODEL: &str = "gpt-5.6-terra";
 const PARENT_PROMPT: &str = "delegate the work please";
 const CLAUDE_CHILD_PROMPT: &str = "claude child: summarize the repository";
 const OPENAI_CHILD_PROMPT: &str = "openai child: list the test files";
@@ -523,7 +525,7 @@ async fn anthropic_tool_call_runs_shell_command_and_returns_output() -> Result<(
     .await;
     let second = mount_messages_once(
         &server,
-        |request| has_tool_result(request),
+        has_tool_result,
         anthropic_text_sse("msg_done", CLAUDE_PARENT_MODEL, "Command finished."),
     )
     .await;
@@ -572,7 +574,7 @@ async fn anthropic_tool_call_respects_approval_policy() -> Result<()> {
     .await;
     let second = mount_messages_once(
         &server,
-        |request| has_tool_result(request),
+        has_tool_result,
         anthropic_text_sse("msg_after_denial", CLAUDE_PARENT_MODEL, "Understood."),
     )
     .await;
@@ -635,7 +637,7 @@ async fn anthropic_apply_patch_edits_files() -> Result<()> {
     .await;
     let second = mount_messages_once(
         &server,
-        |request| has_tool_result(request),
+        has_tool_result,
         anthropic_text_sse("msg_patched", CLAUDE_PARENT_MODEL, "Patched."),
     )
     .await;
@@ -654,6 +656,46 @@ async fn anthropic_apply_patch_edits_files() -> Result<()> {
     assert_eq!(written, "written by claude\n");
     let follow_up = second.single_request();
     assert!(tool_result(&follow_up, "toolu_patch_1").is_some());
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn anthropic_key_is_not_sent_across_a_redirect() -> Result<()> {
+    skip_if_no_network!(Ok(()));
+    let server = start_mock_server().await;
+    let other_origin = start_mock_server().await;
+    Mock::given(method("POST"))
+        .and(path_regex(".*/v1/messages$"))
+        .respond_with(
+            ResponseTemplate::new(307)
+                .insert_header("location", format!("{}/v1/messages", other_origin.uri())),
+        )
+        .mount(&server)
+        .await;
+    let test = build(&server, ANTHROPIC_PROVIDER_ID, CLAUDE_PARENT_MODEL).await?;
+
+    start_turn(
+        &test,
+        "say hello",
+        AskForApproval::Never,
+        SandboxPolicy::new_read_only_policy(),
+    )
+    .await?;
+    let complete = wait_for_event_match(&test.codex, |event| match event {
+        EventMsg::TurnComplete(complete) => Some(complete.clone()),
+        _ => None,
+    })
+    .await;
+
+    assert!(complete.error.is_some(), "a redirect must fail the request");
+    assert!(
+        other_origin
+            .received_requests()
+            .await
+            .unwrap_or_default()
+            .is_empty(),
+        "the request, and with it x-api-key, must not reach the redirect target"
+    );
     Ok(())
 }
 
@@ -1074,4 +1116,107 @@ async fn parent_runs_children_on_different_providers_concurrently() -> Result<()
         "{rejected}"
     );
     Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn openai_child_of_a_claude_parent_keeps_plaintext_messages() {
+    skip_if_no_network!();
+    let server = start_mock_server().await;
+    mount_messages_once(
+        &server,
+        |request| body_contains(request, PARENT_PROMPT) && !has_tool_result(request),
+        anthropic_tool_use_sse(
+            "msg_parent",
+            CLAUDE_PARENT_MODEL,
+            &[(
+                "toolu_spawn_openai",
+                ANTHROPIC_SPAWN_TOOL,
+                spawn_args_without_fork(
+                    "openai_worker",
+                    OPENAI_CHILD_PROMPT,
+                    OPENAI_PROVIDER_ID,
+                    OPENAI_V2_CHILD_MODEL,
+                ),
+            )],
+        ),
+    )
+    .await;
+    let child = mount_sse_once_match(
+        &server,
+        |request: &Request| body_contains(request, OPENAI_CHILD_PROMPT),
+        sse(vec![
+            ev_response_created("resp-child-1"),
+            ev_assistant_message("msg-child-1", "openai child done"),
+            ev_completed("resp-child-1"),
+        ]),
+    )
+    .await;
+    mount_responses_fallback(&server).await;
+    mount_messages_fallback(
+        &server,
+        anthropic_text_sse("msg_extra", CLAUDE_PARENT_MODEL, "ok"),
+    )
+    .await;
+    // The parent runs on a custom Claude provider id with a gateway token, and no built-in Claude
+    // provider is connected, so the child cannot infer plaintext mode from connected providers.
+    let test = test_codex()
+        .with_auth(codex_login::CodexAuth::from_api_key(OPENAI_TEST_KEY))
+        .with_config(|config| {
+            route_providers_to_mock(config, OPENAI_PROVIDER_ID, CLAUDE_PARENT_MODEL);
+            let mut gateway = config.model_providers[ANTHROPIC_PROVIDER_ID].clone();
+            gateway.name = "Claude gateway".to_string();
+            gateway.experimental_bearer_token = Some("gateway-token".into());
+            config
+                .model_providers
+                .insert("claude-gateway".to_string(), gateway.clone());
+            config.model_provider_id = "claude-gateway".to_string();
+            config.model_provider = gateway;
+            // Leaf agents get no collaboration tools; allow the child to have them.
+            config.agent_max_depth = 3;
+            enable_multi_agent_v2(config);
+        })
+        .build_with_auto_env(&server)
+        .await
+        .expect("build");
+
+    test.submit_turn(PARENT_PROMPT).await.expect("turn");
+
+    let child_request = wait_for_responses_request(&child, uses_model(OPENAI_V2_CHILD_MODEL))
+        .await
+        .expect("child request");
+    // Tools may arrive in `tools` or as additional tools in the input (code mode), so search the
+    // whole request for the collaboration tool declarations.
+    let body = child_request.body_json();
+    let mut declarations = Vec::new();
+    find_tool_declarations(&body, "send_message", &mut declarations);
+    find_tool_declarations(&body, "followup_task", &mut declarations);
+    assert!(!declarations.is_empty(), "collaboration tools: {body}");
+    for declaration in declarations {
+        assert!(
+            !declaration.to_string().contains("\"encrypted\":true"),
+            "the child must not ask OpenAI to encrypt messages its Claude parent has to read: \
+{declaration}"
+        );
+    }
+}
+
+fn find_tool_declarations(value: &Value, name: &str, found: &mut Vec<Value>) {
+    match value {
+        Value::Object(map) => {
+            if map.get("name").and_then(Value::as_str) == Some(name)
+                && (map.contains_key("parameters") || map.contains_key("input_schema"))
+            {
+                found.push(value.clone());
+            }
+            for child in map.values() {
+                find_tool_declarations(child, name, found);
+            }
+        }
+        Value::Array(items) => {
+            for item in items {
+                find_tool_declarations(item, name, found);
+            }
+        }
+        _ => {}
+    }
 }

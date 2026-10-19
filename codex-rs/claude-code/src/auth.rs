@@ -49,6 +49,12 @@ impl ClaudeCodeAuthStatus {
             )
     }
 
+    /// Whether Codex sessions can use this sign-in. Sessions start Claude Code without user
+    /// settings, so a credential that only an `apiKeyHelper` setting provides is unavailable.
+    pub fn usable_in_codex(&self) -> bool {
+        self.logged_in && self.auth_method.as_deref() != Some("api_key_helper")
+    }
+
     /// Human-readable one-line summary; contains no credential material.
     pub fn describe(&self) -> String {
         if !self.logged_in {
@@ -128,6 +134,27 @@ pub async fn claude_code_auth_status(
             status: output.status.to_string(),
             stderr: bounded_tail(&String::from_utf8_lossy(&output.stderr), STDERR_LIMIT),
         }),
+    }
+}
+
+/// Runs `<command> auth login` interactively (inherited stdio) with a scrubbed environment, so
+/// Anthropic and Codex secrets from the caller's environment never reach the sign-in flow.
+pub async fn claude_code_auth_login(
+    command: &Path,
+) -> Result<std::process::ExitStatus, ClaudeCodeError> {
+    let mut cmd = Command::new(command);
+    cmd.args(["auth", "login"])
+        .stdin(Stdio::inherit())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit());
+    apply_scrubbed_env(&mut cmd);
+    match cmd.status().await {
+        Ok(status) => Ok(status),
+        Err(err) if err.kind() == ErrorKind::NotFound => Err(ClaudeCodeError::NotInstalled {
+            command: command.display().to_string(),
+            hint: CLAUDE_CODE_INSTALL_HINT,
+        }),
+        Err(err) => Err(ClaudeCodeError::Io(err)),
     }
 }
 

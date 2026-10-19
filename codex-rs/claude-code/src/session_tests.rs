@@ -38,7 +38,12 @@ fn result_errors_map_to_actionable_api_errors() {
     );
     assert_eq!(
         classify(json!({"is_error": true, "result": "Not logged in · Please run /login"})),
-        "invalid: Claude Code: Not logged in · Please run /login"
+        "invalid: Claude Code: Not logged in · Please run /login (sign in with `claude auth login`, \
+then run `codex login --provider claude-code`)"
+    );
+    assert_eq!(
+        classify(json!({"is_error": true, "result": "Claude usage limit reached"})),
+        "invalid: Claude Code: Claude usage limit reached"
     );
     assert_eq!(
         classify(

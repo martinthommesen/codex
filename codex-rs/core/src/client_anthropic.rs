@@ -11,6 +11,7 @@ use codex_api::anthropic::AnthropicRequestOptions;
 use codex_api::anthropic::build_anthropic_request;
 use codex_api::anthropic::is_thinking_replay_rejection;
 use codex_api::anthropic::resolve_claude_reasoning;
+use codex_login::default_client::ClientRedirectPolicy;
 use codex_otel::SessionTelemetry;
 use codex_protocol::config_types::ReasoningSummary as ReasoningSummaryConfig;
 use codex_protocol::openai_models::ModelInfo;
@@ -56,10 +57,12 @@ impl ModelClientSession {
         let setup = client
             .current_client_setup(ClientRouting::ConfiguredProvider)
             .await?;
+        // The key travels in `x-api-key`, which redirect handling does not strip on a
+        // cross-origin hop, and the Messages API never redirects.
         let transport = client.build_api_transport(
             &setup.api_provider,
             MESSAGES_PATH,
-            setup.redirect_policy,
+            ClientRedirectPolicy::Reject,
         )?;
         let request_auth_context = AuthRequestTelemetryContext::new(
             /*auth_mode*/ None,

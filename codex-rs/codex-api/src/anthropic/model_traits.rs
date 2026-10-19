@@ -220,8 +220,7 @@ pub fn resolve_claude_reasoning(
             .efforts
             .iter()
             .copied()
-            .filter(|value| order.iter().position(|o| o == value).unwrap_or(0) <= requested_rank)
-            .next_back()
+            .rfind(|value| order.iter().position(|o| o == value).unwrap_or(0) <= requested_rank)
             .unwrap_or(traits.efforts[0]);
         adjustments.push(format!(
             "reasoning effort `{level}` is not supported by {model}; using `{chosen}`"

@@ -43,9 +43,10 @@ use crate::provider::ProviderAccountResult;
 use crate::provider::ProviderAccountState;
 use crate::provider::ProviderUnauthorizedRecovery;
 
-const MISSING_KEY_INSTRUCTIONS: &str = "Run `codex login --provider anthropic` to store an \
-Anthropic API key (kept separate from your ChatGPT login), or export ANTHROPIC_API_KEY. To use a \
-Claude subscription instead, sign in to Claude Code and select the `claude-code` provider.";
+const MISSING_KEY_INSTRUCTIONS: &str = "Store an Anthropic API key (kept separate from your \
+ChatGPT login) with `printenv ANTHROPIC_API_KEY | codex login --provider anthropic --with-api-key`, \
+or export ANTHROPIC_API_KEY. To use a Claude subscription instead, run \
+`codex login --provider claude-code` and select the `claude-code` provider.";
 
 /// Capabilities shared by both Claude providers.
 fn claude_capabilities() -> ProviderCapabilities {

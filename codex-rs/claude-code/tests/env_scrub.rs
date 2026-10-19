@@ -111,6 +111,44 @@ async fn provider_secrets_are_removed_from_the_child_environment() {
         .expect("session id");
     assert!(uuid_like(session_id), "{session_id}");
     assert!(!record.contains("must-not-leak"));
+
+    // `codex login --provider claude-code` runs `claude auth login` with the same scrub.
+    let auth_record = dir.path().join("auth-record.jsonl");
+    // SAFETY: still the only test in this binary.
+    unsafe {
+        std::env::set_var("FAKE_CLAUDE_AUTH_RECORD", &auth_record);
+    }
+    let fake = codex_utils_cargo_bin::cargo_bin("codex-claude-code-fake").expect("fake");
+    let status = codex_claude_code::claude_code_auth_login(&fake)
+        .await
+        .expect("auth login");
+    assert!(status.success());
+    let login: Value = serde_json::from_str(
+        std::fs::read_to_string(&auth_record)
+            .expect("auth record")
+            .lines()
+            .next()
+            .expect("one auth record"),
+    )
+    .expect("auth record json");
+    assert_eq!(
+        (
+            &login["argv"],
+            &login["anthropic_api_key_present"],
+            &login["anthropic_auth_token_present"],
+            &login["openai_api_key_present"],
+            &login["codex_api_key_present"],
+            &login["oauth_token_present"],
+        ),
+        (
+            &json!(["auth", "login"]),
+            &json!(false),
+            &json!(false),
+            &json!(false),
+            &json!(false),
+            &json!(true)
+        )
+    );
 }
 
 fn uuid_like(text: &str) -> bool {

@@ -441,6 +441,46 @@ async fn rewritten_history_starts_a_fresh_session_with_a_transcript() {
 }
 
 #[tokio::test]
+async fn a_session_lost_before_startup_is_reseeded_on_retry() {
+    let fixture = Fixture::new();
+    let session = ClaudeCodeSession::new(fixture.config());
+    run_turn(&session, &[message("user", "first question")]).await;
+
+    // A rewritten history needs a fresh session, and that process dies during startup.
+    let rewritten = vec![
+        message("user", "summary of earlier work"),
+        message("assistant", "noted"),
+        message("user", "follow up"),
+    ];
+    let crash_flag = fixture.cwd.join("fake-claude-crash-before-init");
+    std::fs::write(&crash_flag, "").expect("flag");
+    let mut stream = session.stream(request(&rewritten)).await.expect("stream");
+    let mut failed = false;
+    while let Some(event) = timeout(EVENT_TIMEOUT, stream.rx_event.recv())
+        .await
+        .expect("events")
+    {
+        failed |= event.is_err();
+    }
+    assert!(failed, "the lost process fails the turn");
+    std::fs::remove_file(&crash_flag).expect("remove flag");
+
+    // Codex retries the same request; the new process must get the whole conversation again.
+    let events = run_turn(&session, &rewritten).await;
+    assert_eq!(
+        assistant_texts(&events),
+        vec!["echo: follow up".to_string()]
+    );
+    let messages = fixture.user_message_texts();
+    let reseeded = messages.last().expect("reseeded message");
+    assert!(
+        reseeded[0].starts_with("<prior_conversation>"),
+        "{reseeded:?}"
+    );
+    assert_eq!(reseeded.last().map(String::as_str), Some("follow up"));
+}
+
+#[tokio::test]
 async fn failed_resume_falls_back_to_a_seeded_fresh_session() {
     let fixture = Fixture::new();
     let mut input = vec![message("user", "hello")];

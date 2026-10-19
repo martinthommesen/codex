@@ -268,23 +268,58 @@ fn stop_reasons_map_to_errors() {
 
 #[test]
 fn truncated_tool_input_is_dropped_at_max_tokens() {
-    let events = run(vec![
-        message_start(),
-        json!({"type": "content_block_start", "index": 0, "content_block": {"type": "text", "text": "partial"}}),
-        json!({"type": "content_block_stop", "index": 0}),
-        json!({"type": "content_block_start", "index": 1, "content_block": {"type": "tool_use", "id": "toolu_x", "name": "shell", "input": {}}}),
-        json!({"type": "content_block_delta", "index": 1, "delta": {"type": "input_json_delta", "partial_json": "{\"command\": [\"l"}}),
-        json!({"type": "message_delta", "delta": {"stop_reason": "max_tokens"}}),
-        json!({"type": "message_stop"}),
-    ])
-    .expect("partial output is kept");
-    assert!(!events.iter().any(|event| matches!(
-        event,
-        ResponseEvent::OutputItemDone(ResponseItem::FunctionCall { .. })
-    )));
+    // The API closes every block before `message_delta` reports the stop reason.
+    for partial_json in ["{\"command\": [\"l", ""] {
+        let events = run(vec![
+            message_start(),
+            json!({"type": "content_block_start", "index": 0, "content_block": {"type": "text", "text": "partial"}}),
+            json!({"type": "content_block_stop", "index": 0}),
+            json!({"type": "content_block_start", "index": 1, "content_block": {"type": "tool_use", "id": "toolu_x", "name": "shell", "input": {}}}),
+            json!({"type": "content_block_delta", "index": 1, "delta": {"type": "input_json_delta", "partial_json": partial_json}}),
+            json!({"type": "content_block_stop", "index": 1}),
+            json!({"type": "message_delta", "delta": {"stop_reason": "max_tokens"}}),
+            json!({"type": "message_stop"}),
+        ])
+        .expect("partial output is kept");
+        assert!(
+            !events.iter().any(|event| matches!(
+                event,
+                ResponseEvent::OutputItemDone(ResponseItem::FunctionCall { .. })
+            )),
+            "{partial_json:?}"
+        );
+        assert!(matches!(
+            events.last(),
+            Some(ResponseEvent::Completed { end_turn: None, .. })
+        ));
+    }
+}
+
+#[test]
+fn complete_tool_calls_dispatch_early_and_argumentless_calls_wait_for_the_stop_reason() {
+    let mut translator = AnthropicStreamTranslator::new(tool_names());
+    let mut feed = |value: Value| translator.handle(event(value)).expect("event");
+    feed(message_start());
+    feed(
+        json!({"type": "content_block_start", "index": 0, "content_block": {"type": "tool_use", "id": "toolu_a", "name": "shell", "input": {}}}),
+    );
+    feed(
+        json!({"type": "content_block_delta", "index": 0, "delta": {"type": "input_json_delta", "partial_json": "{\"command\": [\"ls\"]}"}}),
+    );
+    let complete = feed(json!({"type": "content_block_stop", "index": 0}));
     assert!(matches!(
-        events.last(),
-        Some(ResponseEvent::Completed { end_turn: None, .. })
+        complete.as_slice(),
+        [ResponseEvent::OutputItemDone(ResponseItem::FunctionCall { call_id, .. })] if call_id == "toolu_a"
+    ));
+    feed(
+        json!({"type": "content_block_start", "index": 1, "content_block": {"type": "tool_use", "id": "toolu_b", "name": "shell", "input": {}}}),
+    );
+    assert!(feed(json!({"type": "content_block_stop", "index": 1})).is_empty());
+    let released = feed(json!({"type": "message_delta", "delta": {"stop_reason": "tool_use"}}));
+    assert!(matches!(
+        released.as_slice(),
+        [ResponseEvent::OutputItemDone(ResponseItem::FunctionCall { call_id, arguments, .. })]
+            if call_id == "toolu_b" && arguments == "{}"
     ));
 }
 

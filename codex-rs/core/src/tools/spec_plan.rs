@@ -1445,7 +1445,8 @@ fn add_collaboration_tools(context: &CoreToolPlanContext<'_>, registry: &mut Too
             turn_context.auth_manager.as_deref(),
             &turn_context.available_models,
         );
-        let plaintext_messages = collaboration_messages_require_plaintext(&spawn_providers);
+        let plaintext_messages = turn_context.config.plaintext_collaboration_messages
+            || collaboration_messages_require_plaintext(&spawn_providers);
         if multi_agent_v2_enabled(turn_context) {
             let model_messages = ResolvedModelMessages::from_model(context.model_info);
             let spawn_agent_description =
@@ -1482,7 +1483,7 @@ fn add_collaboration_tools(context: &CoreToolPlanContext<'_>, registry: &mut Too
                                 .multi_agent_v2
                                 .usage_hint_text
                                 .clone(),
-                            providers: spawn_providers.clone(),
+                            providers: spawn_providers,
                             plaintext_messages,
                         },
                         spawn_agent_description.map(str::to_owned),

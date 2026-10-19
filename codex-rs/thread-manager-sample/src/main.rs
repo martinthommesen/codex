@@ -345,6 +345,7 @@ async fn new_config(
         extra_config: None,
         file_opener: UriBasedFileOpener::VsCode,
         codex_self_exe: arg0_paths.codex_self_exe,
+        plaintext_collaboration_messages: false,
         codex_linux_sandbox_exe: arg0_paths.codex_linux_sandbox_exe,
         main_execve_wrapper_exe: None,
         zsh_path: None,

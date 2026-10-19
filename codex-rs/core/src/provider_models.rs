@@ -8,6 +8,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
 
+use codex_features::Feature;
 use codex_login::AuthManager;
 use codex_model_provider::claude_model_catalog;
 use codex_model_provider::create_model_provider;
@@ -57,12 +58,9 @@ impl ProviderModelsRegistry {
         }
     }
 
-    /// Returns the catalog for `provider_id`, building it on first use.
-    pub(crate) fn for_provider(
-        &self,
-        provider_id: &str,
-        provider: &ModelProviderInfo,
-    ) -> SharedModelsManager {
+    /// Returns the catalog for the provider selected by `config`, building it on first use.
+    pub(crate) fn for_config(&self, config: &Config) -> SharedModelsManager {
+        let provider_id = config.model_provider_id.as_str();
         match self.root_provider_id.as_deref() {
             None => return Arc::clone(&self.root),
             Some(root_id) if root_id == provider_id => return Arc::clone(&self.root),
@@ -73,15 +71,20 @@ impl ProviderModelsRegistry {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         Arc::clone(managers.entry(provider_id.to_string()).or_insert_with(|| {
+            let provider = &config.model_provider;
+            // A configured catalog describes OpenAI-style models; Claude providers ship their own.
+            let config_model_catalog = match provider.wire_api {
+                WireApi::Responses => config.model_catalog.clone(),
+                WireApi::AnthropicMessages | WireApi::ClaudeCode => None,
+            };
             // Secondary catalogs never write the root provider's on-disk cache.
-            create_model_provider(provider.clone(), self.auth_manager.clone())
-                .models_manager_without_cache(/*config_model_catalog*/ None)
+            let manager = create_model_provider(provider.clone(), self.auth_manager.clone())
+                .models_manager_without_cache(config_model_catalog);
+            manager.set_api_key_model_discovery_enabled(
+                config.features.enabled(Feature::ApiKeyModelDiscovery),
+            );
+            manager
         }))
-    }
-
-    /// Returns the catalog for the provider selected by `config`.
-    pub(crate) fn for_config(&self, config: &Config) -> SharedModelsManager {
-        self.for_provider(&config.model_provider_id, &config.model_provider)
     }
 }
 
@@ -107,12 +110,20 @@ pub(crate) fn provider_connection(
     auth_manager: Option<&AuthManager>,
     codex_home: &std::path::Path,
 ) -> ProviderConnection {
-    let env_key_present = provider.env_key.as_deref().is_some_and(|var| {
-        std::env::var(var)
+    // A configured `env_key` is the only key the provider will send, so it alone decides.
+    if let Some(var) = provider.env_key.as_deref() {
+        let present = std::env::var(var)
             .ok()
-            .is_some_and(|value| !value.trim().is_empty())
-    });
-    if env_key_present || provider.experimental_bearer_token.is_some() || provider.auth.is_some() {
+            .is_some_and(|value| !value.trim().is_empty());
+        return if present {
+            ProviderConnection::Connected
+        } else {
+            ProviderConnection::NotConnected {
+                remedy: format!("set the {var} environment variable"),
+            }
+        };
+    }
+    if provider.experimental_bearer_token.is_some() || provider.auth.is_some() {
         return ProviderConnection::Connected;
     }
     match provider.wire_api {

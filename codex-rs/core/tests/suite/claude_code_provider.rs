@@ -7,6 +7,8 @@
 //! (`cargo build -p codex-claude-code --bin codex-claude-code-fake`).
 
 use std::ffi::OsString;
+use std::sync::Arc;
+use std::sync::LazyLock;
 
 use anyhow::Result;
 use codex_model_provider_info::CLAUDE_CODE_PROVIDER_ID;
@@ -28,7 +30,13 @@ use pretty_assertions::assert_eq;
 
 const CLAUDE_CODE_MODEL: &str = "claude-sonnet-5-5";
 
-/// Points `CODEX_CLAUDE_CODE_PATH` at the fake for the duration of a test.
+/// Serializes the tests in this file: they share the process-global `CODEX_CLAUDE_CODE_PATH`, and
+/// a test that saw it restored mid-run would launch whatever `claude` is on `PATH`.
+static CLAUDE_CODE_PATH_LOCK: LazyLock<Arc<tokio::sync::Mutex<()>>> =
+    LazyLock::new(|| Arc::new(tokio::sync::Mutex::new(())));
+
+/// Points `CODEX_CLAUDE_CODE_PATH` at the fake for the duration of a test. Hold
+/// `CLAUDE_CODE_PATH_LOCK` for at least as long as this guard.
 struct ClaudeCodePathGuard {
     original: Option<OsString>,
 }
@@ -125,6 +133,7 @@ async fn last_agent_message(test: &TestCodex) -> Option<String> {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn claude_code_runs_codex_tools_through_the_bridge() -> Result<()> {
     let fake = fake_claude_or_skip!();
+    let _serial = Arc::clone(&CLAUDE_CODE_PATH_LOCK).lock_owned().await;
     let _guard = ClaudeCodePathGuard::set(&fake);
     // No model request goes to this server; the harness only needs a base URL.
     let server = start_mock_server().await;
@@ -159,6 +168,7 @@ async fn claude_code_runs_codex_tools_through_the_bridge() -> Result<()> {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn claude_code_tool_calls_respect_approval_policy() -> Result<()> {
     let fake = fake_claude_or_skip!();
+    let _serial = Arc::clone(&CLAUDE_CODE_PATH_LOCK).lock_owned().await;
     let _guard = ClaudeCodePathGuard::set(&fake);
     let server = start_mock_server().await;
     let test = build_claude_code(&server).await?;

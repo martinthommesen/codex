@@ -1020,6 +1020,11 @@ pub struct Config {
     /// file: it must be set in code via [`ConfigOverrides`].
     pub codex_self_exe: Option<PathBuf>,
 
+    /// Keeps inter-agent messages in plaintext for this agent and the agents it spawns. Set at
+    /// runtime on sub-agents of a Claude parent or of a cross-provider spawn, because only
+    /// OpenAI's backend can read encrypted collaboration messages. Not read from the config file.
+    pub plaintext_collaboration_messages: bool,
+
     /// Path to the `codex-linux-sandbox` executable. This must be set if
     /// [`codex_sandboxing::SandboxType::LinuxSeccomp`] is used. Note that this
     /// cannot be set in the config file: it must be set in code via
@@ -4547,6 +4552,7 @@ impl Config {
             bypass_hook_trust,
             file_opener: cfg.file_opener.unwrap_or(UriBasedFileOpener::VsCode),
             codex_self_exe,
+            plaintext_collaboration_messages: false,
             codex_linux_sandbox_exe,
             main_execve_wrapper_exe: None,
             zsh_path: None,

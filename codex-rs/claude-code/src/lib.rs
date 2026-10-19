@@ -19,6 +19,7 @@ use std::path::Path;
 use std::path::PathBuf;
 
 pub use auth::ClaudeCodeAuthStatus;
+pub use auth::claude_code_auth_login;
 pub use auth::claude_code_auth_status;
 pub use env::SCRUBBED_ENV_VARS;
 pub use error::ClaudeCodeError;

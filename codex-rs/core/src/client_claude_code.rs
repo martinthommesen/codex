@@ -16,6 +16,7 @@ use codex_claude_code::ClaudeCodeTurnRequest;
 use codex_claude_code::resolve_claude_command;
 use codex_otel::SessionTelemetry;
 use codex_protocol::config_types::ReasoningSummary as ReasoningSummaryConfig;
+use codex_protocol::models::ResponseItem;
 use codex_protocol::openai_models::ModelInfo;
 use codex_protocol::openai_models::ReasoningEffort as ReasoningEffortConfig;
 use codex_rollout_trace::InferenceTraceContext;
@@ -92,6 +93,7 @@ impl ModelClientSession {
         let client = &self.client;
         let session = client.claude_code_session()?;
 
+        let requested_effort = effort.clone();
         let effort = effort.or_else(|| model_info.default_reasoning_level.clone());
         let reasoning = resolve_claude_reasoning(
             &model_info.slug,
@@ -106,6 +108,15 @@ impl ModelClientSession {
 behavior instead of reasoning effort `none`"
                     .to_string(),
             );
+        } else if reasoning.effort.is_none()
+            && let Some(requested) = requested_effort.as_ref()
+        {
+            // Older models take a thinking budget, which Claude Code cannot be given.
+            warnings.push(format!(
+                "Claude Code cannot apply reasoning effort `{requested}` to {}; it uses its \
+default thinking behavior",
+                model_info.slug
+            ));
         }
         if prompt.output_schema.is_some() {
             warnings.push(
@@ -114,14 +125,23 @@ use the anthropic provider for structured output"
                     .to_string(),
             );
         }
+        let input = prompt.get_formatted_input_for_request(model_info);
+        let tools = create_tools_json_for_responses_api(&prompt.tools)?;
+        let mut declarations = tools.clone();
+        for item in &input {
+            if let ResponseItem::AdditionalTools { tools, .. } = item {
+                declarations.extend(tools.iter().cloned());
+            }
+        }
+        warnings.extend(codex_claude_code::unsupported_tool_notes(&declarations));
         client.emit_claude_warnings(responses_metadata, warnings);
 
         let request = ClaudeCodeTurnRequest {
             model: model_info.slug.clone(),
             effort: reasoning.effort.map(str::to_string),
             base_instructions: prompt.base_instructions.text.clone(),
-            input: prompt.get_formatted_input_for_request(model_info),
-            tools: create_tools_json_for_responses_api(&prompt.tools)?,
+            input,
+            tools,
         };
         let inference_trace_attempt = inference_trace.start_attempt();
         let stream = session

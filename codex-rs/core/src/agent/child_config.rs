@@ -15,6 +15,7 @@ use codex_features::Feature;
 use codex_model_provider_info::ANTHROPIC_PROVIDER_ID;
 use codex_model_provider_info::CLAUDE_CODE_PROVIDER_ID;
 use codex_model_provider_info::OPENAI_PROVIDER_ID;
+use codex_model_provider_info::WireApi;
 use codex_models_manager::manager::RefreshStrategy;
 use codex_protocol::config_types::SERVICE_TIER_DEFAULT_REQUEST_VALUE;
 use codex_protocol::models::BaseInstructions;
@@ -75,10 +76,25 @@ pub(crate) async fn prepare_agent_spawn_config(
         options.reasoning_effort,
     )
     .await?;
+    let provider_changed = config.model_provider_id != turn.config.model_provider_id;
+    // Every agent in a tree that includes a Claude model must send readable messages, and the
+    // flag is inherited from here on.
+    if provider_changed
+        || matches!(
+            turn.config.model_provider.wire_api,
+            WireApi::AnthropicMessages | WireApi::ClaudeCode
+        )
+    {
+        config.plaintext_collaboration_messages = true;
+    }
     if !options.full_history_fork
         || (options.version == SpawnConfigVersion::V2 && options.role_name.is_some())
     {
+        let model_before_role = config.model.clone();
         apply_spawn_agent_role(session, &mut config, options.role_name).await?;
+        if provider_changed && config.model != model_before_role {
+            reject_role_model_from_other_provider(session, &config, options.role_name).await?;
+        }
         if options.version == SpawnConfigVersion::V2
             && options.full_history_fork
             && config.developer_instructions.is_none()
@@ -243,7 +259,36 @@ fn apply_requested_spawn_agent_provider(
     config.model_verbosity = None;
     config.model_context_window = None;
     config.model_auto_compact_token_limit = None;
+    // Configured sub-agent defaults name models of the original provider; keep them from reaching
+    // this child's own spawns.
+    config.agent_default_subagent_model = None;
+    config.agent_default_subagent_reasoning_effort = None;
     Ok(true)
+}
+
+/// A role written for the parent's provider may pin a model the child's provider does not serve;
+/// fail the spawn instead of starting a child that cannot make a single request.
+async fn reject_role_model_from_other_provider(
+    session: &Session,
+    config: &Config,
+    role_name: Option<&str>,
+) -> Result<(), String> {
+    let Some(model) = config.model.as_deref() else {
+        return Ok(());
+    };
+    let model_info = spawn_models_manager(session, config)
+        .await
+        .get_model_info(model, &config.to_models_manager_config())
+        .await;
+    if model_info.used_fallback_model_metadata {
+        return Err(format!(
+            "agent role `{}` sets model `{model}`, which provider `{}` does not serve. Pass a \
+`model` of that provider, or omit `model_provider`.",
+            role_name.unwrap_or(DEFAULT_ROLE_NAME),
+            config.model_provider_id
+        ));
+    }
+    Ok(())
 }
 
 /// Returns the model catalog for the child's (possibly overridden) provider.

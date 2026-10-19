@@ -219,8 +219,16 @@ fn translate_declaration(
             let Some(name) = declaration.get("name").and_then(Value::as_str) else {
                 return;
             };
-            let description = joined_description(namespace, declaration);
-            let input_schema = normalize_input_schema(declaration.get("parameters"));
+            let mut description = joined_description(namespace, declaration);
+            let (input_schema, flattened) = normalize_input_schema(declaration.get("parameters"));
+            if let Some(flattened) = flattened {
+                description = format!("{description}\n\n{}", flattened.description_note);
+                translated.unsupported.push(format!(
+                    "tool `{name}`: Claude does not accept top-level {} in tool input schemas, so \
+its alternatives were merged into one object schema and described in text",
+                    flattened.keywords.join("/")
+                ));
+            }
             push_tool(
                 translated,
                 seen,
@@ -357,21 +365,94 @@ fn without_freeform_wording(description: &str) -> String {
         .to_string()
 }
 
-/// Anthropic requires `input_schema` to be a JSON Schema object with `type: "object"`.
-fn normalize_input_schema(parameters: Option<&Value>) -> Value {
-    match parameters {
-        Some(Value::Object(schema)) => {
-            let mut schema = schema.clone();
-            if schema.get("type").and_then(Value::as_str) != Some("object") {
-                schema.insert("type".to_string(), Value::String("object".to_string()));
-            }
-            if !schema.contains_key("properties") {
-                schema.insert("properties".to_string(), Value::Object(Map::new()));
-            }
-            Value::Object(schema)
+/// Top-level schema keywords the Messages API rejects in `input_schema`.
+const COMPOSITION_KEYWORDS: [&str; 4] = ["anyOf", "oneOf", "allOf", "not"];
+/// Caps the constraint text added to a tool description.
+const MAX_FLATTENED_NOTE_CHARS: usize = 2_000;
+
+/// What `normalize_input_schema` removed from a schema.
+struct FlattenedSchema {
+    keywords: Vec<&'static str>,
+    description_note: String,
+}
+
+/// Anthropic requires `input_schema` to be a JSON Schema object with `type: "object"` and no
+/// top-level `anyOf`/`oneOf`/`allOf`/`not`. Those are merged into one permissive object schema and
+/// the original constraints are returned so they can be described in text.
+fn normalize_input_schema(parameters: Option<&Value>) -> (Value, Option<FlattenedSchema>) {
+    let Some(Value::Object(schema)) = parameters else {
+        return (json!({"type": "object", "properties": {}}), None);
+    };
+    let mut schema = schema.clone();
+    let mut removed = Map::new();
+    for keyword in COMPOSITION_KEYWORDS {
+        if let Some(value) = schema.remove(keyword) {
+            removed.insert(keyword.to_string(), value);
         }
-        _ => json!({"type": "object", "properties": {}}),
     }
+    if schema.get("type").and_then(Value::as_str) != Some("object") {
+        schema.insert("type".to_string(), Value::String("object".to_string()));
+    }
+    if !schema.contains_key("properties") {
+        schema.insert("properties".to_string(), Value::Object(Map::new()));
+    }
+    if removed.is_empty() {
+        return (Value::Object(schema), None);
+    }
+
+    for keyword in ["anyOf", "oneOf", "allOf"] {
+        let Some(Value::Array(variants)) = removed.get(keyword) else {
+            continue;
+        };
+        for variant in variants {
+            if let Some(Value::Object(variant_properties)) = variant.get("properties")
+                && let Some(Value::Object(properties)) = schema.get_mut("properties")
+            {
+                for (name, property) in variant_properties {
+                    properties
+                        .entry(name.clone())
+                        .or_insert_with(|| property.clone());
+                }
+            }
+            // Every `allOf` branch applies, so its required fields stay required.
+            if keyword == "allOf"
+                && let Some(Value::Array(variant_required)) = variant.get("required")
+            {
+                let required = schema
+                    .entry("required".to_string())
+                    .or_insert_with(|| Value::Array(Vec::new()));
+                if let Value::Array(required) = required {
+                    for field in variant_required {
+                        if !required.contains(field) {
+                            required.push(field.clone());
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    let keywords = COMPOSITION_KEYWORDS
+        .into_iter()
+        .filter(|keyword| removed.contains_key(*keyword))
+        .collect::<Vec<_>>();
+    let mut constraints = Value::Object(removed).to_string();
+    if constraints.chars().count() > MAX_FLATTENED_NOTE_CHARS {
+        constraints = constraints
+            .chars()
+            .take(MAX_FLATTENED_NOTE_CHARS)
+            .collect::<String>()
+            + "...";
+    }
+    let description_note =
+        format!("The input must also satisfy these JSON Schema constraints: {constraints}");
+    (
+        Value::Object(schema),
+        Some(FlattenedSchema {
+            keywords,
+            description_note,
+        }),
+    )
 }
 
 #[cfg(test)]

@@ -65,6 +65,11 @@ const EVENT_CHANNEL_CAPACITY: usize = 1600;
 const INTERRUPTED_MESSAGE: &str = "The turn was interrupted before Codex ran this tool.";
 const RESTARTED_MESSAGE: &str = "Claude Code was restarted before Codex returned this result.";
 const MISSING_OUTPUT_MESSAGE: &str = "Codex did not return a result for this tool call.";
+/// How long Claude Code may be silent before the driver looks for stuck tool calls.
+const UNEXPECTED_CALL_CHECK_INTERVAL: Duration = Duration::from_secs(5);
+/// A bridged call Codex never saw (for example from a message Claude Code did not stream) is
+/// answered with an error after this long, so the turn cannot hang on it.
+const UNEXPECTED_CALL_GRACE: Duration = Duration::from_secs(30);
 
 /// Where and how to run Claude Code for one Codex thread.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -497,6 +502,17 @@ async fn settle_query(inner: &mut SessionInner, core: &BridgeCore) {
     }
     if !settled && let Some(mut process) = inner.process.take() {
         process.kill().await;
+        forget_unstarted_session(inner);
+    }
+}
+
+/// After the process is lost, a session Claude Code never started holds none of the input that
+/// was sent to it; clearing the id makes the next request rebuild the full payload.
+fn forget_unstarted_session(inner: &mut SessionInner) {
+    if !inner.session_started {
+        inner.session_id = None;
+        inner.synced_len = 0;
+        inner.prefix_hash = prefix_hash(&[]);
     }
 }
 
@@ -568,11 +584,20 @@ pub(crate) fn result_error(value: &Value) -> ApiError {
         "authentication",
         "oauth token",
         "unauthorized",
-        "usage limit",
-        "credit balance",
     ]
     .iter()
     .any(|needle| lower.contains(needle))
+    {
+        return ApiError::InvalidRequest {
+            message: format!(
+                "Claude Code: {message} (sign in with `claude auth login`, then run \
+`codex login --provider claude-code`)"
+            ),
+        };
+    }
+    if ["usage limit", "credit balance"]
+        .iter()
+        .any(|needle| lower.contains(needle))
     {
         return ApiError::InvalidRequest {
             message: format!("Claude Code: {message}"),
@@ -624,6 +649,7 @@ enum Wake {
     Event(ChildEvent),
     ConsumerGone,
     Abort,
+    CheckParked,
 }
 
 impl Driver {
@@ -644,6 +670,7 @@ impl Driver {
                     _ = self.tx.closed() => Wake::ConsumerGone,
                     _ = self.abort.changed() => Wake::Abort,
                     event = process.recv() => Wake::Event(event),
+                    _ = tokio::time::sleep(UNEXPECTED_CALL_CHECK_INTERVAL) => Wake::CheckParked,
                 }
             };
             let step = match wake {
@@ -655,6 +682,7 @@ impl Driver {
                     if let Some(mut process) = self.inner.process.take() {
                         process.kill().await;
                     }
+                    forget_unstarted_session(&mut self.inner);
                     self.inner.query_in_flight = false;
                     self.inner.outstanding.clear();
                     self.core.fail_all(INTERRUPTED_MESSAGE);
@@ -663,6 +691,23 @@ impl Driver {
                     ))
                     .await;
                     Step::Done
+                }
+                Wake::CheckParked => {
+                    let expected = segment
+                        .message_calls
+                        .iter()
+                        .map(|call| call.call_id.clone())
+                        .collect::<Vec<_>>();
+                    let released = self
+                        .core
+                        .fail_unexpected_parked(&expected, UNEXPECTED_CALL_GRACE);
+                    if released > 0 {
+                        warn!(
+                            released,
+                            "answered Claude Code tool calls that never reached Codex with an error"
+                        );
+                    }
+                    Step::Continue
                 }
                 Wake::Event(ChildEvent::Closed) => self.on_exit(&mut segment).await,
                 Wake::Event(ChildEvent::Line(value)) => self.on_line(value, &mut segment).await,
@@ -796,16 +841,20 @@ impl Driver {
                     }
                 }
                 ResponseEvent::Completed { .. } => {
-                    if stop_reason.as_deref() == Some("tool_use") {
-                        if segment.message_calls.is_empty() {
-                            continue;
-                        }
+                    // Claude Code runs every complete tool_use block, whatever the stop reason
+                    // (for example `max_tokens` after a later block was cut off), so forwarded
+                    // calls always go back to Codex now.
+                    if !segment.message_calls.is_empty() {
                         self.inner.outstanding = std::mem::take(&mut segment.message_calls);
                         if !self.forward(event, segment).await {
                             return self.consumer_gone().await;
                         }
                         self.persist().await;
                         return Step::Done;
+                    }
+                    if stop_reason.as_deref() == Some("tool_use") {
+                        // Only tools Codex does not provide; Claude Code answers those itself.
+                        continue;
                     }
                     segment.held_completion = Some(event);
                 }
@@ -883,6 +932,7 @@ impl Driver {
         if !init_seen && !segment.forwarded_any && self.fallback.is_some() {
             return self.run_fallback().await;
         }
+        forget_unstarted_session(&mut self.inner);
         self.fail(ApiError::Stream(format!(
             "Claude Code exited before the turn finished ({description})"
         )))

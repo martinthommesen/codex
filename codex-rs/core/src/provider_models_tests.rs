@@ -63,21 +63,37 @@ async fn anthropic_connection_follows_configured_key_variable() {
         .get(ANTHROPIC_PROVIDER_ID)
         .expect("built-in anthropic provider")
         .clone();
-    provider.env_key = Some("CODEX_TEST_UNSET_ANTHROPIC_VAR_91c2".to_string());
-    // A configured but unset key variable falls through to the Codex store, which is empty.
     let auth_manager = AuthManager::from_auth_for_testing_with_home(
         codex_login::CodexAuth::from_api_key("sk-openai-test"),
         codex_home.path().to_path_buf(),
     );
-    let not_connected = provider_connection(
-        ANTHROPIC_PROVIDER_ID,
-        &provider,
-        Some(auth_manager.as_ref()),
-        codex_home.path(),
-    );
+    let check = |provider: &ModelProviderInfo| {
+        provider_connection(
+            ANTHROPIC_PROVIDER_ID,
+            provider,
+            Some(auth_manager.as_ref()),
+            codex_home.path(),
+        )
+    };
     assert!(
-        matches!(not_connected, ProviderConnection::NotConnected { ref remedy } if remedy.contains("codex login --provider anthropic")),
-        "{not_connected:?}"
+        matches!(check(&provider), ProviderConnection::NotConnected { ref remedy } if remedy.contains("codex login --provider anthropic")),
+        "an empty store is not connected"
+    );
+
+    auth_manager
+        .anthropic_auth_config()
+        .save_api_key("sk-ant-api03-provider-models-test-key")
+        .expect("store key");
+    assert_eq!(check(&provider), ProviderConnection::Connected);
+
+    // A configured key variable is the only key requests would use, so the stored key does not
+    // make the provider connected while that variable is unset.
+    provider.env_key = Some("CODEX_TEST_UNSET_ANTHROPIC_VAR_91c2".to_string());
+    assert_eq!(
+        check(&provider),
+        ProviderConnection::NotConnected {
+            remedy: "set the CODEX_TEST_UNSET_ANTHROPIC_VAR_91c2 environment variable".to_string(),
+        }
     );
 }
 

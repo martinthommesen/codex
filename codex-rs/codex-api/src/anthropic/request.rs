@@ -123,7 +123,7 @@ pub fn build_anthropic_request(
     let mut notes = translated_tools.unsupported.clone();
 
     let mut history = translate_history(input, options.strip_thinking);
-    notes.extend(history.notes.drain(..));
+    notes.append(&mut history.notes);
     if translated_tools.tools.is_empty() && history_has_tool_blocks(&history.messages) {
         // Requests without tool declarations (for example local compaction) cannot carry
         // tool_use/tool_result blocks, so the transcript is rendered as text instead.

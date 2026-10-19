@@ -145,3 +145,40 @@ fn freeform_wording_is_removed_from_wrapped_tools() {
     assert!(!description.contains("FREEFORM"));
     assert!(description.contains("start: x"));
 }
+
+#[test]
+fn top_level_schema_composition_is_flattened_and_reported() {
+    let translated = translate_tools(&[json!({
+        "type": "function",
+        "name": "fetch",
+        "description": "Fetch a resource.",
+        "parameters": {
+            "type": "object",
+            "properties": {"timeout": {"type": "number"}},
+            "anyOf": [
+                {"properties": {"path": {"type": "string"}}, "required": ["path"]},
+                {"properties": {"url": {"type": "string"}}, "required": ["url"]}
+            ]
+        }
+    })]);
+    let tool = &translated.tools[0];
+    assert_eq!(
+        tool.input_schema,
+        json!({
+            "type": "object",
+            "properties": {
+                "timeout": {"type": "number"},
+                "path": {"type": "string"},
+                "url": {"type": "string"}
+            }
+        })
+    );
+    let description = &tool.description;
+    assert!(
+        description.starts_with("Fetch a resource."),
+        "{description}"
+    );
+    assert!(description.contains("\"anyOf\""), "{description}");
+    assert_eq!(translated.unsupported.len(), 1);
+    assert!(translated.unsupported[0].contains("`fetch`"));
+}

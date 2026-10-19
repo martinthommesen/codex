@@ -102,6 +102,20 @@ const CLAUDE_MODELS: &[ClaudeModelSpec] = &[
         visibility: ModelVisibility::Hide,
     },
     ClaudeModelSpec {
+        slug: "claude-opus-4-5",
+        display_name: "Claude Opus 4.5",
+        description: "Claude Opus 4.5 (200K context).",
+        default_effort: ReasoningEffort::Medium,
+        visibility: ModelVisibility::Hide,
+    },
+    ClaudeModelSpec {
+        slug: "claude-sonnet-4-5",
+        display_name: "Claude Sonnet 4.5",
+        description: "Claude Sonnet 4.5 (200K context).",
+        default_effort: ReasoningEffort::Medium,
+        visibility: ModelVisibility::Hide,
+    },
+    ClaudeModelSpec {
         slug: "claude-haiku-4-5",
         display_name: "Claude Haiku 4.5",
         description: "Previous Haiku release (200K context).",

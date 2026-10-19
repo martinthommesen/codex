@@ -18,6 +18,8 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
 use std::sync::MutexGuard;
+use std::time::Duration;
+use std::time::Instant;
 use tokio::io::AsyncBufReadExt;
 use tokio::io::AsyncRead;
 use tokio::io::AsyncWrite;
@@ -38,6 +40,7 @@ const METHOD_NOT_FOUND: i64 = -32601;
 const INVALID_PARAMS: i64 = -32602;
 /// Unix socket paths must stay well below the platform `sun_path` limit.
 const MAX_SOCKET_PATH_LEN: usize = 100;
+const UNEXPECTED_CALL_MESSAGE: &str = "Codex did not receive this tool call from Claude Code, so it was not run. Call the tool again.";
 
 /// Codex tools as exposed through the bridge.
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -117,6 +120,7 @@ struct ParkedCall {
     request_id: Value,
     tool_use_id: Option<String>,
     mcp_name: String,
+    parked_at: Instant,
 }
 
 #[derive(Debug)]
@@ -191,6 +195,30 @@ impl BridgeCore {
                 result,
             }),
         }
+    }
+
+    /// Answers, with an error, calls parked longer than `grace` whose `tool_use_id` is not in
+    /// `expected` (calls Codex will run). Returns how many were answered.
+    pub(crate) fn fail_unexpected_parked(&self, expected: &[String], grace: Duration) -> usize {
+        let mut state = self.lock();
+        let (stale, kept): (Vec<_>, Vec<_>) = std::mem::take(&mut state.parked)
+            .into_iter()
+            .partition(|call| {
+                call.parked_at.elapsed() >= grace
+                    && !call
+                        .tool_use_id
+                        .as_ref()
+                        .is_some_and(|id| expected.contains(id))
+            });
+        state.parked = kept;
+        for call in &stale {
+            respond(
+                &state,
+                call,
+                crate::history::error_tool_result(UNEXPECTED_CALL_MESSAGE),
+            );
+        }
+        stale.len()
     }
 
     /// Fails every parked call with `message` and drops prepared answers.
@@ -343,6 +371,7 @@ impl BridgeCore {
             request_id: id,
             tool_use_id,
             mcp_name: mcp_name.to_string(),
+            parked_at: Instant::now(),
         });
         None
     }

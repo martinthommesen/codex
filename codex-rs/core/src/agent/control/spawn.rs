@@ -34,6 +34,7 @@ use codex_context_fragments::set_annotated_content;
 use codex_context_fragments::to_annotated_content;
 use codex_features::Feature;
 use codex_history::ResponseItemEnvelope;
+use codex_model_provider_info::WireApi;
 use codex_prompts::ResolvedModelMessages;
 use codex_protocol::error::AgentErrorContext;
 use codex_protocol::intersect_effective_permission_profiles;
@@ -463,6 +464,7 @@ impl LocalAgentControl {
         if let Some(model) = stored_model {
             config.model = Some(model);
         }
+        mark_mixed_provider_resume(&mut config, &stored_model_provider);
         if config.model_provider_id != stored_model_provider {
             config.model_provider = config
                 .model_providers
@@ -474,6 +476,8 @@ impl LocalAgentControl {
                     ))
                 })?;
             config.model_provider_id = stored_model_provider;
+            config.agent_default_subagent_model = None;
+            config.agent_default_subagent_reasoning_effort = None;
         }
         let parent_thread_id = owner_thread_id
             .or_else(|| initial_history.get_resumed_parent_thread_id())
@@ -1426,7 +1430,7 @@ impl LocalAgentControl {
 
     async fn resume_single_agent_from_rollout(
         &self,
-        config: Config,
+        mut config: Config,
         thread_id: ThreadId,
         session_source: SessionSource,
     ) -> CodexResult<(ThreadId, MultiAgentVersion)> {
@@ -1438,6 +1442,37 @@ impl LocalAgentControl {
                 include_history: false,
             })
             .await?;
+        if !stored_thread.model_provider.is_empty() {
+            mark_mixed_provider_resume(&mut config, &stored_thread.model_provider);
+        }
+        if !stored_thread.model_provider.is_empty()
+            && stored_thread.model_provider != config.model_provider_id
+        {
+            // A child spawned on another provider resumes there; the parent's model and tuning
+            // belong to the parent's provider.
+            config.model_provider = config
+                .model_providers
+                .get(&stored_thread.model_provider)
+                .cloned()
+                .ok_or_else(|| {
+                    CodexErr::InvalidRequest(format!(
+                        "Model provider `{}` not found",
+                        stored_thread.model_provider
+                    ))
+                })?;
+            config
+                .model_provider_id
+                .clone_from(&stored_thread.model_provider);
+            config.model.clone_from(&stored_thread.model);
+            config
+                .model_reasoning_effort
+                .clone_from(&stored_thread.reasoning_effort);
+            config.model_verbosity = None;
+            config.model_context_window = None;
+            config.model_auto_compact_token_limit = None;
+            config.agent_default_subagent_model = None;
+            config.agent_default_subagent_reasoning_effort = None;
+        }
         let resumed_agent_path = stored_thread
             .agent_path
             .as_deref()
@@ -1537,5 +1572,17 @@ impl LocalAgentControl {
         .await;
 
         Ok((resumed_thread.thread_id, multi_agent_version))
+    }
+}
+
+/// A resumed child whose parent runs Claude, or that runs on another provider than its parent,
+/// keeps collaboration messages in plaintext exactly as it did when it was spawned.
+fn mark_mixed_provider_resume(config: &mut Config, stored_model_provider: &str) {
+    let parent_runs_claude = matches!(
+        config.model_provider.wire_api,
+        WireApi::AnthropicMessages | WireApi::ClaudeCode
+    );
+    if parent_runs_claude || config.model_provider_id != stored_model_provider {
+        config.plaintext_collaboration_messages = true;
     }
 }

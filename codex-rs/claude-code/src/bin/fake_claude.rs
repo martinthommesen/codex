@@ -9,6 +9,9 @@
 //! - `[hang]`: stream a partial answer and wait (exits when interrupted);
 //! - anything else: reply with `echo: <text>`.
 //!
+//! Marker files in the working directory simulate failures: `fake-claude-fail-resume` makes
+//! `--resume` fail, and `fake-claude-crash-before-init` makes a new session exit during startup.
+//!
 //! Session processes record what they observe in `fake-claude-record.jsonl` in their working
 //! directory; `auth status --json` prints `$FAKE_CLAUDE_AUTH_JSON`.
 
@@ -27,13 +30,18 @@ use tokio::io::WriteHalf;
 const RECORD_FILE: &str = "fake-claude-record.jsonl";
 /// When this file exists in the working directory, `--resume` fails like a missing session.
 const FAIL_RESUME_FILE: &str = "fake-claude-fail-resume";
+/// When this file exists in the working directory, a new session exits before `system/init`.
+const CRASH_BEFORE_INIT_FILE: &str = "fake-claude-crash-before-init";
 /// JSON printed by `auth status --json`.
 const AUTH_JSON_ENV: &str = "FAKE_CLAUDE_AUTH_JSON";
+/// When set, `auth` commands append what they observe to this file.
+const AUTH_RECORD_ENV: &str = "FAKE_CLAUDE_AUTH_RECORD";
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args.first().map(String::as_str) == Some("auth") {
+        record_auth(&args);
         auth_status();
     }
     let code = match run(&args).await {
@@ -44,6 +52,28 @@ async fn main() {
         }
     };
     std::process::exit(code);
+}
+
+fn record_auth(args: &[String]) {
+    let Some(path) = std::env::var_os(AUTH_RECORD_ENV) else {
+        return;
+    };
+    let entry = json!({
+        "event": "auth",
+        "argv": args,
+        "anthropic_api_key_present": std::env::var_os("ANTHROPIC_API_KEY").is_some(),
+        "anthropic_auth_token_present": std::env::var_os("ANTHROPIC_AUTH_TOKEN").is_some(),
+        "openai_api_key_present": std::env::var_os("OPENAI_API_KEY").is_some(),
+        "codex_api_key_present": std::env::var_os("CODEX_API_KEY").is_some(),
+        "oauth_token_present": std::env::var_os("CLAUDE_CODE_OAUTH_TOKEN").is_some(),
+    });
+    if let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+    {
+        let _ = writeln!(file, "{entry}");
+    }
 }
 
 fn auth_status() -> ! {
@@ -153,6 +183,11 @@ async fn run(args: &[String]) -> std::io::Result<()> {
         "enable_tool_search": std::env::var("ENABLE_TOOL_SEARCH").ok(),
         "cwd": std::env::current_dir()?.display().to_string(),
     }));
+
+    if !resumed && std::path::Path::new(CRASH_BEFORE_INIT_FILE).exists() {
+        eprintln!("fake claude crashed during startup");
+        std::process::exit(1);
+    }
 
     if resumed && std::path::Path::new(FAIL_RESUME_FILE).exists() {
         emit(json!({

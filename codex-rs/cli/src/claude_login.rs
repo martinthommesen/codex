@@ -9,6 +9,7 @@ use std::path::PathBuf;
 
 use codex_claude_code::ClaudeCodeAuthStatus;
 use codex_claude_code::ClaudeCodeError;
+use codex_claude_code::claude_code_auth_login;
 use codex_claude_code::claude_code_auth_status;
 use codex_claude_code::resolve_claude_command;
 use codex_core::config::Config;
@@ -16,6 +17,7 @@ use codex_core::provider_models::CLAUDE_CODE_CONNECTED_MARKER;
 use codex_login::AnthropicAuthConfig;
 use codex_login::AnthropicCredentialSource;
 use codex_model_provider_info::ANTHROPIC_API_KEY_ENV_VAR;
+use codex_model_provider_info::ANTHROPIC_PROVIDER_ID;
 
 /// Provider selected with `--provider` on login/logout/status.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum)]
@@ -77,14 +79,9 @@ pub async fn login_claude_code(config: &Config) -> Result<String, String> {
         .map_err(describe_claude_code_error)?;
     if !status.logged_in {
         eprintln!("Claude Code is not signed in. Starting `claude auth login`...");
-        let exit = tokio::process::Command::new(&command)
-            .args(["auth", "login"])
-            .stdin(std::process::Stdio::inherit())
-            .stdout(std::process::Stdio::inherit())
-            .stderr(std::process::Stdio::inherit())
-            .status()
+        let exit = claude_code_auth_login(&command)
             .await
-            .map_err(|err| format!("Failed to run `claude auth login`: {err}"))?;
+            .map_err(describe_claude_code_error)?;
         if !exit.success() {
             return Err("`claude auth login` did not complete successfully.".to_string());
         }
@@ -94,6 +91,13 @@ pub async fn login_claude_code(config: &Config) -> Result<String, String> {
         if !status.logged_in {
             return Err("Claude Code is still not signed in.".to_string());
         }
+    }
+    if !status.usable_in_codex() {
+        return Err(format!(
+            "Claude Code cannot be connected: {}. Sign in with `claude auth login`, or use an \
+Anthropic API key with `codex login --provider anthropic --with-api-key`.",
+            status.describe()
+        ));
     }
     let marker = marker_path(&config.codex_home);
     if let Some(parent) = marker.parent() {
@@ -167,6 +171,30 @@ unchanged; run `claude auth logout` to sign out of Claude Code itself."
 
 /// Status line for the Anthropic API provider; `Ok(true)` when a key is available.
 pub fn anthropic_status(config: &Config) -> (bool, String) {
+    // A configured `env_key` replaces the stored key and ANTHROPIC_API_KEY for requests.
+    if let Some(var) = config
+        .model_providers
+        .get(ANTHROPIC_PROVIDER_ID)
+        .and_then(|provider| provider.env_key.as_deref())
+    {
+        let present = std::env::var(var)
+            .ok()
+            .is_some_and(|value| !value.trim().is_empty());
+        return if present {
+            (
+                true,
+                format!("Anthropic API: API key from {var} (model_providers.anthropic.env_key)"),
+            )
+        } else {
+            (
+                false,
+                format!(
+                    "Anthropic API: {var} is not set (model_providers.anthropic.env_key replaces the \
+stored key)"
+                ),
+            )
+        };
+    }
     match anthropic_auth_config(config).resolve() {
         Ok(Some(credential)) => {
             let source = match credential.source() {
@@ -204,6 +232,12 @@ pub async fn claude_code_status(config: &Config) -> (bool, String) {
 }
 
 fn describe_claude_code_status(connected: bool, status: &ClaudeCodeAuthStatus) -> (bool, String) {
+    if status.logged_in && !status.usable_in_codex() {
+        return (
+            false,
+            format!("Claude Code: not usable in Codex ({})", status.describe()),
+        );
+    }
     match (connected, status.logged_in) {
         (true, true) => (
             true,

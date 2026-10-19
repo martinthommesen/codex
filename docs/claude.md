@@ -14,12 +14,21 @@ from each other and from your ChatGPT/OpenAI login.
 | `anthropic`   | An Anthropic API key (Claude Console)                  | Codex calls the Claude Messages API (`POST /v1/messages`) directly                      | API usage on your Console org    |
 | `claude-code` | Your own Claude Code sign-in, e.g. a Claude subscription | Codex runs the official, unmodified `claude` CLI and lets it make the model requests | Whatever your Claude Code login uses |
 
-Why two providers: Anthropic's terms let developers who build products on Claude use **API keys**.
-Third-party tools may not use claude.ai subscription credentials to call the API themselves. Codex
-therefore never reads, copies, or forwards Claude Code credentials. With `claude-code`, the
-official Claude Code CLI uses your sign-in to talk to Anthropic, and Codex only exchanges prompts
-and tool results with that process. If you want to call the API directly, use `anthropic` with an
-API key. Codex never quietly turns one kind of login into the other.
+Why two providers: Anthropic's
+[legal and compliance page](https://code.claude.com/docs/en/legal-and-compliance#authentication-and-credential-use)
+tells developers who build on Claude to use **API keys**. It also says third-party developers may
+not "route requests through Free, Pro, or Max plan credentials on behalf of their users" or
+"collect, store, or intermediate Claude.ai credentials or session tokens". The same page allows
+"an end user ... signing in to the unmodified Claude Code binary with their own Claude
+subscription". So Codex never reads, copies or forwards Claude Code credentials, and it never calls
+Anthropic endpoints with them. With `claude-code`, the official Claude Code CLI uses your sign-in
+to talk to Anthropic, and Codex only exchanges prompts and tool results with that process. If you
+want to call the API directly, use `anthropic` with an API key. Codex never quietly turns one kind
+of login into the other.
+
+Max and Team plans include monthly Claude Platform API credits
+([details](https://support.claude.com/en/articles/17154008-monthly-api-credits-for-max-and-team-plans)).
+Spend them with a Console API key through the `anthropic` provider.
 
 ### Anthropic API key (`anthropic`)
 
@@ -53,8 +62,11 @@ codex logout --provider claude-code    # disconnects Codex only
 - `codex login --provider claude-code` checks `claude auth status`. If you are not signed in, it
   runs `claude auth login` in your terminal. When that succeeds, Codex records a non-secret marker,
   `$CODEX_HOME/claude-code/connected.json`, that says this provider is connected.
-- `codex logout --provider claude-code` removes only that marker. To sign out of Claude Code itself,
-  run `claude auth logout`.
+- `codex logout --provider claude-code` removes only that marker, so agents can no longer spawn
+  sub-agents on `claude-code`. Selecting `claude-code` as the main provider still runs `claude` with
+  its own sign-in. To sign out of Claude Code itself, run `claude auth logout`.
+- An `apiKeyHelper` sign-in is not accepted, because Codex starts Claude Code without your settings
+  files and the helper would never run.
 - Claude Code keeps its own credentials, for example in `~/.claude/.credentials.json` or the macOS
   Keychain. Codex does not read them.
 - When Codex starts `claude`, it removes `ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN` and the other
@@ -63,6 +75,14 @@ codex logout --provider claude-code    # disconnects Codex only
   `--setting-sources ""` so your Claude Code hooks, plugins and permission settings do not apply
   inside Codex.
 - Set `CODEX_CLAUDE_CODE_PATH` to use a `claude` executable that is not on `PATH`.
+- Codex never passes `--bare`, because bare mode ignores your subscription sign-in. Claude Code's
+  docs say bare mode will become the default for `claude -p` in a future release. If that happens
+  before Codex adds a way to opt out, this provider stops using your subscription.
+- Billing is Anthropic's call. Its Help Center
+  ([log in article](https://support.claude.com/en/articles/13189465-log-in-to-your-claude-account))
+  says it may bill use from third-party tools to usage credits instead of plan limits, and that
+  "advertised usage limits ... assume ordinary, individual usage". Codex does not hide that the
+  requests come from Codex.
 
 ### Status, logout, and isolation
 
@@ -103,8 +123,10 @@ If you switch to a Claude provider without picking a model, Codex uses `claude-o
 
 Bundled Claude models: `claude-opus-5-5`, `claude-sonnet-5-5`, `claude-haiku-5-5` and
 `claude-fable-5-1`. Older models are hidden from the picker but still accepted: `claude-opus-5`,
-`claude-sonnet-5`, `claude-opus-4-8`, `claude-opus-4-7`, `claude-opus-4-6`, `claude-sonnet-4-6` and
-`claude-haiku-4-5`. Other `claude-*` names work too and are treated like current models.
+`claude-sonnet-5`, `claude-opus-4-8`, `claude-opus-4-7`, `claude-opus-4-6`, `claude-sonnet-4-6`,
+`claude-opus-4-5`, `claude-sonnet-4-5` and `claude-haiku-4-5`. Other `claude-*` names are sent as
+given, but Codex has no metadata for them: it warns and uses generic defaults for the context
+window and reasoning levels.
 
 ### Reasoning effort
 
@@ -120,6 +142,10 @@ Bundled Claude models: `claude-opus-5-5`, `claude-sonnet-5-5`, `claude-haiku-5-5
 Whenever Codex changes a requested setting, it shows a warning in the transcript. It never drops
 one silently.
 
+With `claude-code`, only the adaptive column applies, passed to Claude Code as `--effort`. Claude
+Code cannot be given a thinking budget or told to turn thinking off, so on 4.5-and-older models,
+and for `none`, Codex warns and Claude Code uses its default thinking.
+
 ### Overriding the providers
 
 The built-in providers can be customized under `[model_providers]`:
@@ -127,7 +153,7 @@ The built-in providers can be customized under `[model_providers]`:
 ```toml
 [model_providers.anthropic]
 base_url = "https://api.anthropic.com/v1"   # e.g. a gateway that speaks the Messages API
-env_key = "MY_ANTHROPIC_KEY"                # read the key from a different variable
+env_key = "MY_ANTHROPIC_KEY"                # use only this variable (replaces the stored key)
 http_headers = { "anthropic-beta" = "..." }
 request_max_retries = 4
 stream_idle_timeout_ms = 300000
@@ -163,8 +189,9 @@ Rules:
 - Spawning on a provider that is not connected fails with the command to connect it.
 - A child's provider and model affect only that child. The parent and its siblings keep theirs.
   Settings tied to one provider are reset for a child on a different provider: `model_verbosity`,
-  `model_context_window`, `model_auto_compact_token_limit`, and any role or
-  `agents.default_subagent_model` override.
+  `model_context_window`, `model_auto_compact_token_limit`, and the `agents.default_subagent_model`
+  and `agents.default_subagent_reasoning_effort` defaults. An agent role still applies. If the role
+  pins a model that the child's provider does not serve, the spawn is rejected.
 - Sandbox, approval policy, permission profile, working directory and exec policy are inherited
   exactly as they are for children on the same provider. Every provider runs its tool calls through
   the same Codex tool runtime.
@@ -186,7 +213,7 @@ same way ordinary tool arguments do.
 | -------------------------------------------- | :---------: | :-----------: | ----- |
 | Streaming text and thinking summaries         | ✅ | ✅ | Thinking is shown as a reasoning summary |
 | Shell / unified exec, `apply_patch`, MCP tools, dynamic tools | ✅ | ✅ | Codex runs every tool under its sandbox and approval policy. `claude-code` has its built-in tools turned off and reaches Codex tools over a local MCP bridge |
-| Parallel tool calls                           | ✅ | ✅ | Controlled by the model's `parallel_tool_calls` setting |
+| Parallel tool calls                           | ✅ | ✅ | Always allowed for `anthropic`; Claude Code decides for `claude-code` |
 | Images in input                               | ✅ | ✅ | |
 | Cancellation (Esc / interrupt)                | ✅ | ✅ | `claude-code` interrupts the CLI and keeps its session |
 | Resume and fork                               | ✅ | ✅ | History is replayed from the Codex rollout. Thinking blocks are replayed with their signatures |
@@ -204,9 +231,12 @@ same way ordinary tool arguments do.
   `codex -c model_provider=anthropic resume` (or use a Claude profile) to list Claude sessions.
   `codex resume <SESSION_ID>` works for any session and reopens it with the provider it was
   recorded on.
-- **First run:** the TUI's onboarding screen is for ChatGPT sign-in only. If you start Codex with a
-  Claude provider before connecting it, the first turn fails with the exact
-  `codex login --provider …` command to run.
+- **First run:** the TUI's onboarding screen is for ChatGPT sign-in only. With `anthropic` and no
+  key, the first turn fails with the `codex login --provider anthropic --with-api-key` command.
+  With `claude-code`, the main agent uses whatever sign-in the `claude` CLI has. If it is signed
+  out, the turn fails with Claude Code's message plus a hint to run `claude auth login` and
+  `codex login --provider claude-code`. The connection marker controls only whether sub-agents may
+  be spawned on `claude-code`.
 - **Switching providers mid-thread:** a thread stays on one provider. When a history moves between
   providers, as with forks and resumes, Codex drops reasoning that the other provider cannot verify
   (OpenAI encrypted reasoning, Claude thinking signatures) and keeps everything else.

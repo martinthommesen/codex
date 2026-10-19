@@ -167,6 +167,13 @@ enum BlockState {
     Ignored,
 }
 
+#[derive(Debug)]
+struct HeldToolCall {
+    id: String,
+    name: String,
+    input: Value,
+}
+
 /// Stateful translator for one streamed message.
 #[derive(Debug)]
 pub struct AnthropicStreamTranslator {
@@ -178,6 +185,8 @@ pub struct AnthropicStreamTranslator {
     blocks: BTreeMap<usize, BlockState>,
     /// Finished text whose phase depends on what the model does next.
     pending_text: Option<String>,
+    /// Tool calls whose input may have been cut off; released once the stop reason is known.
+    held_tool_calls: Vec<HeldToolCall>,
     produced_output: bool,
     completed: bool,
 }
@@ -192,6 +201,7 @@ impl AnthropicStreamTranslator {
             stop_details: None,
             blocks: BTreeMap::new(),
             pending_text: None,
+            held_tool_calls: Vec::new(),
             produced_output: false,
             completed: false,
         }
@@ -248,6 +258,7 @@ impl AnthropicStreamTranslator {
             AnthropicStreamEvent::MessageDelta { delta, usage } => {
                 if delta.stop_reason.is_some() {
                     self.stop_reason = delta.stop_reason;
+                    self.release_held_tool_calls(&mut out);
                 }
                 if let Some(stop_reason) = self.stop_reason.as_deref() {
                     let phase = if stop_reason == "tool_use" || stop_reason == "pause_turn" {
@@ -270,6 +281,7 @@ impl AnthropicStreamTranslator {
                 for index in open {
                     self.stop_block(index, &mut out);
                 }
+                self.release_held_tool_calls(&mut out);
                 self.flush_pending_text(Some(MessagePhase::FinalAnswer), &mut out);
                 out.push(self.completion()?);
                 self.completed = true;
@@ -429,30 +441,56 @@ impl AnthropicStreamTranslator {
                 input_json,
                 initial_input,
             } => {
-                let input = if input_json.trim().is_empty() {
+                // Blocks close before `message_delta` reports the stop reason, so input that is
+                // empty or unparseable may have been cut off by `max_tokens`; hold it until then.
+                let held = if input_json.trim().is_empty() {
                     match initial_input {
                         Value::Object(map) => Value::Object(map),
                         _ => Value::Object(serde_json::Map::new()),
                     }
                 } else {
                     match serde_json::from_str::<Value>(&input_json) {
-                        Ok(value) => value,
-                        Err(err) => {
-                            if self.stop_reason.as_deref() == Some("max_tokens") {
-                                warn!("dropping truncated Anthropic tool call {id}: {err}");
-                                return;
-                            }
-                            // Let the tool router report malformed arguments to the model.
-                            Value::String(input_json)
+                        Ok(value) => {
+                            self.produced_output = true;
+                            out.push(ResponseEvent::OutputItemDone(
+                                self.tool_call_item(id, &name, value),
+                            ));
+                            return;
                         }
+                        // The tool router reports malformed arguments to the model.
+                        Err(_) => Value::String(input_json),
                     }
                 };
-                self.produced_output = true;
-                out.push(ResponseEvent::OutputItemDone(
-                    self.tool_call_item(id, &name, input),
-                ));
+                self.held_tool_calls.push(HeldToolCall {
+                    id,
+                    name,
+                    input: held,
+                });
+                if self.stop_reason.is_some() {
+                    self.release_held_tool_calls(out);
+                }
             }
             BlockState::Ignored => {}
+        }
+    }
+
+    /// Emits held tool calls, or drops them when the output was cut off.
+    fn release_held_tool_calls(&mut self, out: &mut Vec<ResponseEvent>) {
+        let held = std::mem::take(&mut self.held_tool_calls);
+        if matches!(self.stop_reason.as_deref(), Some("max_tokens" | "refusal")) {
+            for call in held {
+                warn!(
+                    "dropping Anthropic tool call {} cut off by stop_reason {:?}",
+                    call.id, self.stop_reason
+                );
+            }
+            return;
+        }
+        for call in held {
+            self.produced_output = true;
+            out.push(ResponseEvent::OutputItemDone(
+                self.tool_call_item(call.id, &call.name, call.input),
+            ));
         }
     }
 

@@ -307,3 +307,36 @@ async fn changing_tools_notifies_initialized_clients() {
         json!({"jsonrpc": "2.0", "method": "notifications/tools/list_changed"})
     );
 }
+
+#[tokio::test]
+async fn calls_codex_never_received_are_released_after_the_grace_period() {
+    let core = Arc::new(BridgeCore::default());
+    core.set_tools(shell_registry());
+    let mut client = Client::connect(&core);
+    client.initialize().await;
+
+    client.send(call(1, "shell", Some("toolu_expected"))).await;
+    client.send(call(2, "shell", Some("toolu_unknown"))).await;
+    client.assert_silent().await;
+    assert_eq!(core.parked_count(), 2);
+
+    // Within the grace period nothing is released.
+    assert_eq!(
+        core.fail_unexpected_parked(&[], Duration::from_secs(3600)),
+        0
+    );
+    // Afterwards only the call Codex does not know about is answered.
+    assert_eq!(
+        core.fail_unexpected_parked(&["toolu_expected".to_string()], Duration::ZERO),
+        1
+    );
+    let response = client.recv().await;
+    assert_eq!(
+        (
+            response["id"].clone(),
+            response["result"]["isError"].clone()
+        ),
+        (json!(2), json!(true))
+    );
+    assert_eq!(core.parked_count(), 1);
+}
