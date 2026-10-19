@@ -330,11 +330,12 @@ fn set_feature(config: &mut Config, feature: Feature, enabled: bool) -> Result<(
 /// default, then another mode, whichever requirements allow first.
 pub(crate) fn enabled_web_search_mode(config: &Config) -> Option<WebSearchMode> {
     // Another layer may have disabled search, so keep the user's own choice instead of resetting it.
+    // A selected profile layers over the main config.toml.
     let user_mode = config
         .config_layer_stack
-        .get_active_user_layer()
-        .and_then(|layer| layer.config.get("web_search"))
-        .and_then(|mode| mode.clone().try_into::<WebSearchMode>().ok())
+        .effective_user_config()
+        .and_then(|user_config| user_config.get("web_search").cloned())
+        .and_then(|mode| mode.try_into::<WebSearchMode>().ok())
         .filter(|mode| *mode != WebSearchMode::Disabled);
     user_mode
         .into_iter()

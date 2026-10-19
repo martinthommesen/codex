@@ -1946,6 +1946,18 @@ fn approvals_reviewer_override_from_config(
     Some(config.approvals_reviewer.into())
 }
 
+/// The launch key behind the `web_search` this TUI sends with every new thread, if it sends one:
+/// `web_search` itself or the legacy search feature that decided it.
+pub(crate) fn forwarded_web_search_key(
+    config: &Config,
+    thread_params_mode: ThreadParamsMode,
+) -> Option<String> {
+    let origins = config.config_layer_stack.origins();
+    let effective = config.config_layer_stack.effective_config();
+    web_search::launch_web_search(config, thread_params_mode, &effective, &origins)
+        .map(|(key, _)| key)
+}
+
 /// The config overrides this TUI sends with every new thread.
 pub(crate) fn config_request_overrides_from_config(
     config: &Config,

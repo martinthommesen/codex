@@ -257,25 +257,64 @@ fn launch_table_keeps_a_structured_feature_enabled() {
 }
 
 #[test]
-fn legacy_search_features_in_a_profile_are_named_as_the_profile() {
-    let launch_origins = HashMap::from([(
-        "features.web_search_request".to_string(),
-        codex_config::ConfigLayerMetadata {
-            name: codex_config::ConfigLayerSource::User {
-                file: user_file("work.config.toml"),
-                profile: Some("work".to_string()),
-            },
-            version: "1".to_string(),
+fn forwarded_web_search_is_named_by_its_launch_key() {
+    let profile_origin = codex_config::ConfigLayerMetadata {
+        name: codex_config::ConfigLayerSource::User {
+            file: user_file("work.config.toml"),
+            profile: Some("work".to_string()),
         },
-    )]);
+        version: "1".to_string(),
+    };
+    let launch_origins =
+        HashMap::from([("features.web_search_request".to_string(), profile_origin)]);
+    let source = launch_source_key("web_search", Some("features.web_search_request"));
 
+    assert_eq!(source, "features.web_search_request");
     assert_eq!(
-        OverrideLayer::launch(launch_origin(&launch_origins, "web_search")),
+        OverrideLayer::launch(launch_origins.get(source)),
         OverrideLayer::Profile
     );
     assert_eq!(
-        OverrideLayer::launch(launch_origin(&launch_origins, "features.apps")),
-        OverrideLayer::CommandLine
+        launch_source_key("features.apps", Some("features.web_search_request")),
+        "features.apps"
+    );
+}
+
+#[test]
+fn local_user_files_do_not_choose_a_remote_web_search_mode() {
+    let user_config_path = user_file("config.toml");
+    let stack = codex_config::ConfigLayerStack::default()
+        .with_user_config(
+            &user_config_path,
+            toml::from_str("web_search = \"live\"").expect("valid toml"),
+        )
+        .expect("user layer");
+
+    assert_eq!(
+        without_user_layers(&stack)
+            .effective_user_config()
+            .and_then(|user_config| user_config.get("web_search").cloned()),
+        None
+    );
+}
+
+#[test]
+fn override_notice_prefers_the_named_key_over_the_server_message() {
+    let (notice, _) = save_notice(
+        SettingsSwitch::Skills,
+        /*enabled*/ true,
+        SwitchState::Off,
+        SwitchState::On,
+        SaveCheck {
+            overridden: Some("Overridden by session flags".to_string()),
+            unverified: None,
+            winner: Some((OverrideLayer::CommandLine, "features.skills".to_string())),
+        },
+    );
+
+    assert_eq!(
+        notice,
+        "Skills saved, but it is overridden: a command-line flag for this Codex session still sets `features.skills`"
     );
 }
 
@@ -317,5 +356,37 @@ fn remote_web_search_follows_the_app_servers_requirements() {
     assert!(!constrain_web_search(
         &mut effective_config,
         Some(&disabled_only)
+    ));
+}
+
+#[test]
+fn replaced_server_feature_flags_are_detected_in_both_directions() {
+    let session_flags = || origin(ApiSource::SessionFlags);
+    let origins = |key: &str| {
+        HashMap::from([(
+            key.to_string(),
+            serde_json::from_value(session_flags()).expect("valid origin"),
+        )])
+    };
+    let launch_overrides =
+        HashMap::from([("features".to_string(), serde_json::json!({ "goals": true }))]);
+
+    // `--enable multi_agent_v2` on the server can hide `agents.enabled = false` below it.
+    assert!(server_feature_flags_replaced(
+        SettingsSwitch::Subagents,
+        Some(&launch_overrides),
+        &origins("features.multi_agent_v2.enabled"),
+    ));
+    // Keys outside `[features]` still reach new threads.
+    assert!(!server_feature_flags_replaced(
+        SettingsSwitch::Subagents,
+        Some(&launch_overrides),
+        &origins("agents.enabled"),
+    ));
+    // Without a forwarded table the server's flags stay in place.
+    assert!(!server_feature_flags_replaced(
+        SettingsSwitch::Subagents,
+        /*launch_overrides*/ None,
+        &origins("features.multi_agent_v2.enabled"),
     ));
 }

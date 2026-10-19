@@ -26,6 +26,19 @@ pub(super) fn apply_launch_override(
             overrides.remove("features");
         }
     }
+    if let Some((_, mode)) = launch_web_search(config, thread_params_mode, effective, origins) {
+        overrides.insert("web_search".to_string(), mode);
+    }
+}
+
+/// The `web_search` mode this TUI forwards to new threads, with the launch key it comes from:
+/// `web_search` itself, or the legacy search feature that decided it.
+pub(super) fn launch_web_search(
+    config: &Config,
+    thread_params_mode: ThreadParamsMode,
+    effective: &toml::Value,
+    origins: &HashMap<String, ConfigLayerMetadata>,
+) -> Option<(String, serde_json::Value)> {
     let is_launch = |key: &str| {
         origins.get(key).is_some_and(|origin| {
             matches!(
@@ -40,14 +53,10 @@ pub(super) fn apply_launch_override(
     };
     // A canonical setting always takes precedence, even when its origin is implicit.
     if let Some(value) = effective.get("web_search") {
-        if is_launch("web_search") {
-            overrides.insert("web_search".to_string(), serde_json::json!(value));
-        }
-        return;
+        return is_launch("web_search")
+            .then(|| ("web_search".to_string(), serde_json::json!(value)));
     }
-    let Some(features) = effective.get("features").and_then(toml::Value::as_table) else {
-        return;
-    };
+    let features = effective.get("features").and_then(toml::Value::as_table)?;
     let request_key = if features.contains_key("web_search_request") {
         "web_search_request"
     } else {
@@ -70,28 +79,30 @@ pub(super) fn apply_launch_override(
         Some(choice) => choice,
         None => {
             if thread_params_mode == ThreadParamsMode::Embedded && (cached || live) {
-                return;
+                return None;
             }
             // Explicitly disabling all legacy search features falls back to cached search.
-            let Some(key) = ["web_search_cached", request_key].into_iter().find(|key| {
+            let key = ["web_search_cached", request_key].into_iter().find(|key| {
                 features.get(*key).and_then(toml::Value::as_bool) == Some(false)
                     && is_launch(&format!("features.{key}"))
-            }) else {
-                return;
-            };
+            })?;
             (key, "cached")
         }
     };
     // Remote servers enforce their own search-mode requirements on this raw choice.
-    if is_launch(&format!("features.{key}"))
-        || (mode == "live"
-            && features
-                .get("web_search_cached")
-                .and_then(toml::Value::as_bool)
-                == Some(false)
-            && is_launch("features.web_search_cached"))
+    let key = format!("features.{key}");
+    if is_launch(&key) {
+        Some((key, mode.into()))
+    } else if mode == "live"
+        && features
+            .get("web_search_cached")
+            .and_then(toml::Value::as_bool)
+            == Some(false)
+        && is_launch("features.web_search_cached")
     {
-        overrides.insert("web_search".to_string(), mode.into());
+        Some(("features.web_search_cached".to_string(), mode.into()))
+    } else {
+        None
     }
 }
 

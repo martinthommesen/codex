@@ -23,10 +23,10 @@ impl App {
         enabled: bool,
     ) {
         let label = switch.label();
+        let remote_web_search =
+            switch == SettingsSwitch::WebSearch && app_server.uses_remote_workspace();
         // Remote threads follow the app server's web search requirements, not this machine's.
-        let remote_web_search_modes = if switch == SettingsSwitch::WebSearch
-            && app_server.uses_remote_workspace()
-        {
+        let remote_web_search_modes = if remote_web_search {
             match read_web_search_modes(app_server).await {
                 Ok(modes) => Some(modes),
                 Err(err) => {
@@ -42,8 +42,12 @@ impl App {
                 web_search_constraint(modes.as_deref(), self.config.web_search_mode.value());
         }
         // Stage first so values pinned by requirements fail before anything is written.
-        let edits = switch.edits(enabled, &self.config);
         let mut next_config = self.config.clone();
+        if remote_web_search {
+            // This machine's config files do not decide the mode a remote server writes.
+            next_config.config_layer_stack = without_user_layers(&next_config.config_layer_stack);
+        }
+        let edits = switch.edits(enabled, &next_config);
         if let Err(err) = switch.apply(&mut next_config, enabled) {
             tracing::warn!(error = %err, switch = label, "settings switch rejected by requirements");
             self.report_settings_save(
@@ -69,7 +73,7 @@ impl App {
                 return;
             }
         };
-        let overridden = (response.status == WriteStatus::OkOverridden)
+        let mut overridden = (response.status == WriteStatus::OkOverridden)
             .then(|| overridden_write_message(&response).to_string());
         // The server only checks user-level layers for overrides, so a trusted project, a profile,
         // this TUI's launch flags or a legacy alias in another layer can still win. Resolve what
@@ -92,17 +96,25 @@ impl App {
                             &self.config,
                             app_server.thread_params_mode(),
                         );
-                    // thread/start replaces the server's own `[features]` launch flags with this
-                    // TUI's table, so what they leave behind is not visible in config/read.
-                    let server_flags_replaced = launch_overrides
-                        .as_ref()
-                        .is_some_and(|overrides| overrides.contains_key("features"))
-                        && effective_config.origins.iter().any(|(key, origin)| {
-                            matches!(
-                                origin.name,
-                                codex_app_server_protocol::ConfigLayerSource::SessionFlags
-                            ) && decides_switch(switch, enabled, key)
-                        });
+                    let server_flags_replaced = server_feature_flags_replaced(
+                        switch,
+                        launch_overrides.as_ref(),
+                        &effective_config.origins,
+                    );
+                    if server_flags_replaced
+                        && response
+                            .overridden_metadata
+                            .as_ref()
+                            .is_some_and(|metadata| {
+                                matches!(
+                                    metadata.overriding_layer.name,
+                                    codex_app_server_protocol::ConfigLayerSource::SessionFlags
+                                )
+                            })
+                    {
+                        // Those flags do not reach new threads either, so they cannot override.
+                        overridden = None;
+                    }
                     let flagged =
                         overlay_launch_overrides(&mut effective_config, launch_overrides.as_ref());
                     let requirements_disallow =
@@ -111,6 +123,10 @@ impl App {
                         });
                     adopt_effective_switch_state(&mut self.config, switch, &effective_config);
                     let launch_origins = self.config.config_layer_stack.origins();
+                    let web_search_source = crate::app_server_session::forwarded_web_search_key(
+                        &self.config,
+                        app_server.thread_params_mode(),
+                    );
                     let flag_precedence =
                         codex_app_server_protocol::ConfigLayerSource::SessionFlags.precedence();
                     winner = switch_override_layer(
@@ -125,11 +141,22 @@ impl App {
                                 (key.as_str(), origin.name.precedence(), layer)
                             })
                             .chain(flagged.iter().map(|key| {
-                                let layer =
-                                    OverrideLayer::launch(launch_origin(&launch_origins, key));
+                                let source = launch_source_key(key, web_search_source.as_deref());
+                                let layer = OverrideLayer::launch(launch_origins.get(source));
                                 (key.as_str(), flag_precedence, Some(layer))
                             })),
                     )
+                    .map(|(layer, key)| {
+                        // Name the launch key the user set, such as a legacy search feature.
+                        let launched = flagged.contains(&key)
+                            && matches!(layer, OverrideLayer::CommandLine | OverrideLayer::Profile);
+                        let key = if launched {
+                            launch_source_key(&key, web_search_source.as_deref()).to_string()
+                        } else {
+                            key
+                        };
+                        (layer, key)
+                    })
                     .or_else(|| {
                         requirements_disallow
                             .then(|| (OverrideLayer::Requirements, "web_search".to_string()))
@@ -239,10 +266,12 @@ fn save_notice(
             SaveOutcome::Saved,
         );
     }
-    let reason = check.overridden.unwrap_or_else(|| match check.winner {
-        Some((layer, key)) => layer.describe(&key),
-        None => "another config file still sets it".to_string(),
-    });
+    // The local answer names the key; the app server's message is the fallback.
+    let reason = match (check.winner, check.overridden) {
+        (Some((layer, key)), _) => layer.describe(&key),
+        (None, Some(message)) => message,
+        (None, None) => "another config file still sets it".to_string(),
+    };
     tracing::warn!(
         reason,
         switch = label,
@@ -442,26 +471,49 @@ fn constrain_web_search(
     true
 }
 
-/// Where this TUI's forwarded value for `key` came from. A forwarded `web_search` can come from the
-/// legacy search features instead of the key itself.
-fn launch_origin<'a>(
-    launch_origins: &'a HashMap<String, codex_config::ConfigLayerMetadata>,
-    key: &str,
-) -> Option<&'a codex_config::ConfigLayerMetadata> {
-    launch_origins.get(key).or_else(|| {
-        (key == "web_search")
-            .then(|| {
-                [
-                    "features.web_search_cached",
-                    "features.web_search_request",
-                    "features.web_search",
-                ]
-                .into_iter()
-                .filter_map(|legacy_key| launch_origins.get(legacy_key))
-                .max_by_key(|origin| origin.name.precedence())
-            })
-            .flatten()
-    })
+/// Whether the app server's own `[features]` launch flags decide `switch`. thread/start replaces
+/// them with the table this TUI sends, so what they leave behind is not visible in config/read.
+fn server_feature_flags_replaced(
+    switch: SettingsSwitch,
+    launch_overrides: Option<&HashMap<String, serde_json::Value>>,
+    origins: &HashMap<String, codex_app_server_protocol::ConfigLayerMetadata>,
+) -> bool {
+    launch_overrides.is_some_and(|overrides| overrides.contains_key("features"))
+        && origins.iter().any(|(key, origin)| {
+            matches!(
+                origin.name,
+                codex_app_server_protocol::ConfigLayerSource::SessionFlags
+            ) && key.starts_with("features.")
+                // A flag that agrees with the save can still hide a layer that opposes it.
+                && (decides_switch(switch, /*enabled*/ true, key)
+                    || decides_switch(switch, /*enabled*/ false, key))
+        })
+}
+
+/// The launch key behind this TUI's forwarded value for `key`. A forwarded `web_search` can come
+/// from a legacy search feature (`web_search_source`) instead of the key itself.
+fn launch_source_key<'a>(key: &'a str, web_search_source: Option<&'a str>) -> &'a str {
+    match web_search_source {
+        Some(source) if key == "web_search" => source,
+        _ => key,
+    }
+}
+
+/// `stack` without this machine's user config files.
+fn without_user_layers(stack: &codex_config::ConfigLayerStack) -> codex_config::ConfigLayerStack {
+    let user_files = stack
+        .layers_low_to_high()
+        .filter_map(|layer| match &layer.name {
+            codex_config::ConfigLayerSource::User { file, .. } => Some(file.clone()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    user_files
+        .iter()
+        .try_fold(stack.clone(), |stack, file| {
+            stack.with_user_config(file, toml::Value::Table(toml::Table::new()))
+        })
+        .unwrap_or_else(|_| stack.clone())
 }
 
 /// The kind of config layer that still decides a switch after a save.

@@ -50,8 +50,8 @@ impl App {
             return;
         };
 
-        // Queued input waits until the summary closes.
         self.chat_widget.show_goal_summary(goal);
+        self.chat_widget.maybe_send_next_queued_input();
     }
 
     pub(super) async fn maybe_prompt_resume_paused_goal_after_resume(
