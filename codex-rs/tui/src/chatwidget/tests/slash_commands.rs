@@ -3149,6 +3149,12 @@ async fn commands_for_disabled_features_point_to_settings() {
             SlashCommand::Init,
             "AGENTS.md is turned off",
         ),
+        (
+            Feature::Plugins,
+            SlashCommand::Plugins,
+            "Plugins are turned off.",
+        ),
+        (Feature::Apps, SlashCommand::Apps, "Apps are turned off."),
     ] {
         chat.set_feature_enabled(feature, /*enabled*/ false);
         chat.dispatch_command(command);
@@ -4032,4 +4038,44 @@ async fn owned_copy_guard_defers_queued_input_until_released() {
         chat.maybe_send_next_queued_input();
         assert!(chat.input_queue.queued_user_messages.is_empty());
     }
+}
+
+#[tokio::test]
+async fn config_reloaded_from_disk_updates_settings_gated_state() {
+    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+    let mut reloaded = chat.config.clone();
+    // Another Codex turned these off in /settings.
+    for feature in [Feature::Plugins, Feature::Apps, Feature::Skills] {
+        reloaded
+            .features
+            .set_enabled(feature, /*enabled*/ false)
+            .expect("not pinned");
+    }
+    reloaded.agents_enabled = false;
+    reloaded
+        .web_search_mode
+        .set(codex_protocol::config_types::WebSearchMode::Disabled)
+        .expect("disabled is allowed");
+
+    chat.sync_plugin_mentions_config(&reloaded);
+
+    let flags = chat.builtin_command_flags();
+    assert_eq!(
+        (
+            flags.plugins_command_enabled,
+            flags.feature_commands.plugins,
+            flags.feature_commands.apps,
+            flags.feature_commands.skills,
+            chat.config.agents_enabled,
+            chat.config.web_search_mode.value(),
+        ),
+        (
+            false,
+            false,
+            false,
+            false,
+            false,
+            codex_protocol::config_types::WebSearchMode::Disabled
+        )
+    );
 }

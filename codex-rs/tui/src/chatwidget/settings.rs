@@ -152,7 +152,11 @@ impl ChatWidget {
         }
         if matches!(
             feature,
-            Feature::Skills | Feature::CodexHooks | Feature::AgentsMd
+            Feature::Skills
+                | Feature::CodexHooks
+                | Feature::AgentsMd
+                | Feature::Plugins
+                | Feature::Apps
         ) {
             self.sync_feature_commands();
         }

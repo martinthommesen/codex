@@ -62,6 +62,8 @@ pub(crate) struct FeatureCommandFlags {
     pub(crate) skills: bool,
     pub(crate) hooks: bool,
     pub(crate) init: bool,
+    pub(crate) plugins: bool,
+    pub(crate) apps: bool,
 }
 
 impl FeatureCommandFlags {
@@ -69,6 +71,8 @@ impl FeatureCommandFlags {
         skills: true,
         hooks: true,
         init: true,
+        plugins: true,
+        apps: true,
     };
 
     pub(crate) fn from_features(features: &Features) -> Self {
@@ -76,6 +80,8 @@ impl FeatureCommandFlags {
             skills: features.enabled(Feature::Skills),
             hooks: features.enabled(Feature::CodexHooks),
             init: features.enabled(Feature::AgentsMd),
+            plugins: features.enabled(Feature::Plugins),
+            apps: features.enabled(Feature::Apps),
         }
     }
 
@@ -84,6 +90,8 @@ impl FeatureCommandFlags {
             SlashCommand::Skills => self.skills,
             SlashCommand::Hooks => self.hooks,
             SlashCommand::Init => self.init,
+            SlashCommand::Plugins => self.plugins,
+            SlashCommand::Apps => self.apps,
             _ => true,
         }
     }
@@ -94,6 +102,8 @@ impl FeatureCommandFlags {
             SlashCommand::Skills,
             SlashCommand::Hooks,
             SlashCommand::Init,
+            SlashCommand::Plugins,
+            SlashCommand::Apps,
         ]
         .into_iter()
         .filter(move |cmd| !self.allows(*cmd))
@@ -181,6 +191,9 @@ pub(crate) fn find_builtin_command(name: &str, flags: BuiltinCommandFlags) -> Op
         daybreak_command_description: Some(""),
         side_conversation_active: false,
         goal_command_enabled: true,
+        // Apps also need a ChatGPT account; only the feature switch is explained on dispatch.
+        connectors_enabled: flags.connectors_enabled || !flags.feature_commands.apps,
+        plugins_command_enabled: true,
         feature_commands: FeatureCommandFlags::ALL,
         ..flags
     })
@@ -354,7 +367,11 @@ mod tests {
             skills: false,
             hooks: false,
             init: false,
+            plugins: false,
+            apps: false,
         };
+        flags.plugins_command_enabled = false;
+        flags.connectors_enabled = false;
         let visible = builtins_for_input(flags)
             .into_iter()
             .map(|(_, cmd)| cmd)
@@ -363,6 +380,8 @@ mod tests {
             SlashCommand::Skills,
             SlashCommand::Hooks,
             SlashCommand::Init,
+            SlashCommand::Plugins,
+            SlashCommand::Apps,
         ] {
             assert!(!visible.contains(&cmd), "{cmd:?} should be hidden");
             assert_eq!(find_builtin_command(cmd.command(), flags), Some(cmd));

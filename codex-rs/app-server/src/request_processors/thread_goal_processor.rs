@@ -87,11 +87,21 @@ impl ThreadGoalRequestProcessor {
     }
 
     /// Goals follow each thread's own config, so saved changes reach new threads without a server
-    /// restart. Threads that are not loaded fall back to the server's startup config.
+    /// restart. Threads that are not loaded follow the latest saved config.
     async fn goals_enabled_for_thread(&self, thread_id: ThreadId) -> bool {
-        match self.thread_manager.get_thread(thread_id).await {
-            Ok(thread) => thread.config().await.features.enabled(Feature::Goals),
-            Err(_) => self.config.features.enabled(Feature::Goals),
+        if let Ok(thread) = self.thread_manager.get_thread(thread_id).await {
+            return thread.config().await.features.enabled(Feature::Goals);
+        }
+        match self
+            .config_manager
+            .load_latest_config(/*fallback_cwd*/ None)
+            .await
+        {
+            Ok(config) => config.features.enabled(Feature::Goals),
+            Err(err) => {
+                warn!("failed to load config for a goal request on {thread_id}: {err}");
+                self.config.features.enabled(Feature::Goals)
+            }
         }
     }
 

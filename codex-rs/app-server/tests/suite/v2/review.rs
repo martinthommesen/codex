@@ -137,6 +137,55 @@ async fn review_start_rejects_detached_delivery_when_skills_are_off() -> Result<
     Ok(())
 }
 
+#[tokio::test]
+async fn review_start_rejects_detached_delivery_when_bundled_skills_are_off() -> Result<()> {
+    let server = create_mock_responses_server_repeating_assistant("Done").await;
+    let codex_home = TempDir::new()?;
+    MockResponsesConfig::new(&server.uri())
+        .with_provider_name("Mock provider")
+        .disable_feature(Feature::ShellSnapshot)
+        .with_extra_config("[skills.bundled]\nenabled = false\n")
+        .write(codex_home.path())?;
+
+    let mut mcp = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .build_initialized()
+        .await?;
+    let ThreadStartResponse { thread, .. } = mcp
+        .start_thread(ThreadStartParams {
+            model: Some("mock-model".to_string()),
+            history_mode: Some(ThreadHistoryMode::Legacy),
+            ..Default::default()
+        })
+        .await?;
+
+    let review_id = mcp
+        .send_review_start_request(ReviewStartParams {
+            thread_id: thread.id,
+            delivery: Some(ReviewDelivery::Detached),
+            target: ReviewTarget::Custom {
+                instructions: "detached review".to_string(),
+            },
+        })
+        .await?;
+    let review_err: JSONRPCError = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_error_message(RequestId::Integer(review_id)),
+    )
+    .await??;
+    assert_eq!(review_err.error.code, INVALID_REQUEST_ERROR_CODE);
+    assert!(
+        review_err
+            .error
+            .message
+            .contains("bundled skills are turned off"),
+        "unexpected error: {}",
+        review_err.error.message
+    );
+
+    Ok(())
+}
+
 #[test_case(None; "omitted_delivery")]
 #[test_case(Some(json!(null)); "null_delivery")]
 #[test_case(Some(json!("inline")); "inline_delivery")]

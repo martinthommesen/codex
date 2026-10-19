@@ -398,6 +398,8 @@ mod tests {
             skills: false,
             hooks: false,
             init: false,
+            plugins: false,
+            apps: false,
         };
         let tips = resolved_tooltips(/*keymap*/ None).collect::<Vec<_>>();
         for command in ["/skills", "/hooks", "/init"] {

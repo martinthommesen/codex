@@ -63,10 +63,11 @@ pub(super) enum PluginsCacheState {
 impl ChatWidget {
     pub(crate) fn add_plugins_output(&mut self) {
         if !self.config.features.enabled(Feature::Plugins) {
-            self.add_info_message(
-                "Plugins are disabled.".to_string(),
-                Some("Enable the plugins feature to use /plugins.".to_string()),
+            let hint = self.turn_back_on_hint(
+                crate::settings_panel::SettingsSwitch::PluginsAndApps,
+                "Turn them back on in /settings.",
             );
+            self.add_info_message("Plugins are turned off.".to_string(), Some(hint));
             return;
         }
 

@@ -1951,15 +1951,32 @@ impl ChatWidget {
     }
 
     pub(crate) fn sync_plugin_mentions_config(&mut self, config: &Config) {
-        let skills_were_enabled = self.config.features.enabled(Feature::Skills);
+        let changed = |before: &Config, feature: Feature| {
+            before.features.enabled(feature) != config.features.enabled(feature)
+        };
+        let skills_changed = changed(&self.config, Feature::Skills);
+        let plugins_changed = changed(&self.config, Feature::Plugins);
+        let apps_changed = changed(&self.config, Feature::Apps);
         self.config.features = config.features.clone();
         self.config.config_layer_stack = config.config_layer_stack.clone();
         self.config.memories = config.memories.clone();
-        self.sync_mentions_v2_enabled();
         // `/settings` in another Codex can change these on disk.
+        self.config.agents_enabled = config.agents_enabled;
+        self.config.web_search_mode = config.web_search_mode.clone();
+        self.sync_mentions_v2_enabled();
         self.sync_feature_commands();
         self.sync_goal_command_enabled();
-        if self.config.features.enabled(Feature::Skills) != skills_were_enabled {
+        self.sync_plugins_command_enabled();
+        self.bottom_pane
+            .set_connectors_enabled(self.connectors_enabled());
+        if plugins_changed {
+            self.refresh_plugin_mentions();
+        }
+        if apps_changed {
+            self.refresh_connector_mentions(/*force_refresh*/ false);
+        }
+        // Plugin-provided skills appear or disappear with their plugins.
+        if skills_changed || plugins_changed {
             self.refresh_skills_for_current_cwd(/*force_reload*/ true);
         }
     }
