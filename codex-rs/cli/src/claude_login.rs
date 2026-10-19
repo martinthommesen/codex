@@ -62,10 +62,27 @@ pub fn login_anthropic_with_api_key(config: &Config, api_key: &str) -> Result<St
         .flatten()
         .map(|credential| credential.masked())
         .unwrap_or_else(|| "***".to_string());
+    let stored =
+        format!("Stored Anthropic API key ({masked}). Your ChatGPT/OpenAI login is unchanged.");
+    if let Some(var) = anthropic_env_key(config) {
+        let (_, status) = anthropic_status(config);
+        return Ok(format!(
+            "{stored}\nNote: model_providers.anthropic.env_key is set, so the `anthropic` provider \
+sends {var} instead of this key; remove env_key to use it. {status}."
+        ));
+    }
     Ok(format!(
-        "Stored Anthropic API key ({masked}). Your ChatGPT/OpenAI login is unchanged.\n\
+        "{stored}\n\
 Use it with `-c model_provider=anthropic` (or `model_provider = \"anthropic\"` in config.toml)."
     ))
+}
+
+/// The variable a configured `model_providers.anthropic.env_key` names; it replaces the stored key.
+fn anthropic_env_key(config: &Config) -> Option<&str> {
+    config
+        .model_providers
+        .get(ANTHROPIC_PROVIDER_ID)
+        .and_then(|provider| provider.env_key.as_deref())
 }
 
 /// Connects the official Claude Code CLI, running its own sign-in if needed.
@@ -172,11 +189,7 @@ unchanged; run `claude auth logout` to sign out of Claude Code itself."
 /// Status line for the Anthropic API provider; `Ok(true)` when a key is available.
 pub fn anthropic_status(config: &Config) -> (bool, String) {
     // A configured `env_key` replaces the stored key and ANTHROPIC_API_KEY for requests.
-    if let Some(var) = config
-        .model_providers
-        .get(ANTHROPIC_PROVIDER_ID)
-        .and_then(|provider| provider.env_key.as_deref())
-    {
+    if let Some(var) = anthropic_env_key(config) {
         let present = std::env::var(var)
             .ok()
             .is_some_and(|value| !value.trim().is_empty());

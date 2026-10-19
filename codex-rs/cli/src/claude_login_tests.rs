@@ -115,3 +115,33 @@ fn claude_code_status_descriptions() {
         "{message}"
     );
 }
+
+#[tokio::test]
+async fn anthropic_login_reports_that_a_configured_env_key_replaces_the_stored_key() {
+    let codex_home = TempDir::new().expect("tempdir");
+    let mut config = file_store_config(&codex_home).await;
+    // Never set, so the test does not depend on or change the environment.
+    let var = "CODEX_TEST_ANTHROPIC_ENV_KEY_NEVER_SET";
+    config
+        .model_providers
+        .get_mut(ANTHROPIC_PROVIDER_ID)
+        .expect("built-in anthropic provider")
+        .env_key = Some(var.to_string());
+
+    let message = login_anthropic_with_api_key(&config, "sk-ant-api03-test-key-abcdefghij")
+        .expect("store Anthropic key");
+
+    assert!(
+        message.contains("model_providers.anthropic.env_key"),
+        "{message}"
+    );
+    assert!(message.contains(&format!("{var} is not set")), "{message}");
+    assert!(!message.contains("Use it with"), "{message}");
+    assert!(!message.contains("test-key-abcdefghij"), "{message}");
+    // The key is still stored for anthropic_messages providers without env_key.
+    let credential = anthropic_auth_config(&config)
+        .resolve_with_env(|_| None)
+        .expect("resolve")
+        .expect("stored key");
+    assert_eq!(credential.source(), AnthropicCredentialSource::Stored);
+}

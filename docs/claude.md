@@ -222,6 +222,7 @@ same way ordinary tool arguments do.
 | Token usage                                   | ✅ | ✅ | Cache reads count as cached input |
 | Local auto-compaction                         | ✅ | ✅ | Remote (server-side) compaction is not available |
 | Structured output (`--output-schema`)         | ✅ | ❌ | `claude-code` warns and ignores the schema |
+| Memory generation (`features.memories`)       | ✅ | ❌ | Extraction and consolidation are skipped on `claude-code`; existing memories are still read |
 | Hosted web search, image generation, tool search | ❌ | ❌ | These tools are left out for Claude models |
 | `model_verbosity`, service tiers, reasoning summary `concise`/`detailed` | ❌ | ❌ | Codex warns and ignores them |
 | Rate-limit and credits display                | ❌ | ❌ | Anthropic rate-limit headers are not shown yet |
@@ -241,6 +242,9 @@ same way ordinary tool arguments do.
   sub-agent spawned afterwards fails on its first turn with the same hint.
 - **Realtime conversations:** realtime voice sessions use OpenAI's realtime API and are refused
   while the thread runs on a Claude provider.
+- **Memories on `claude-code`:** memory extraction and consolidation do not run while the thread
+  uses `claude-code`, so background jobs never spend your Claude plan. Use `anthropic` or OpenAI to
+  generate memories.
 - **Switching providers mid-thread:** a thread stays on one provider. When a history moves between
   providers, as with forks and resumes, Codex drops reasoning that the other provider cannot verify
   (OpenAI encrypted reasoning, Claude thinking signatures) and keeps everything else.

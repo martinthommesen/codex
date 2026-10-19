@@ -1305,6 +1305,11 @@ impl ModelClient {
     }
 
     pub(crate) async fn prewarm_auth(&self) -> Result<()> {
+        // Claude Code turns run through its CLI (`stream_claude_code`), with no HTTP endpoint or
+        // Codex-held credential to resolve.
+        if self.state.provider.info().is_claude_code() {
+            return Ok(());
+        }
         self.current_client_setup(ClientRouting::Workspace)
             .await
             .map(|_| ())
