@@ -567,3 +567,36 @@ fn a_project_alias_the_server_flag_hid_still_wins() {
         Feature::MemoryTool
     ));
 }
+
+#[test]
+fn a_feature_the_server_resolved_with_its_own_flags_is_read_from_its_layer() {
+    let written = user_file("config.toml");
+    // config/read reports `memories` as the server resolved it, with its own `memory_tool = false`
+    // flag, but new threads from this TUI never get that flag.
+    let mut effective_config = config_read(serde_json::json!({
+        "config": { "features": { "memories": false, "memory_tool": false } },
+        "origins": {
+            "features.memories": origin(ApiSource::User { file: written.clone(), profile: None }),
+            "features.memory_tool": origin(ApiSource::SessionFlags),
+        },
+        "layers": [
+            layer(ApiSource::SessionFlags, serde_json::json!({ "features": { "memory_tool": false } })),
+            layer(ApiSource::User { file: written, profile: None }, serde_json::json!({
+                "features": { "memories": true },
+            })),
+        ],
+    }));
+
+    let resolution = resolve_with_launch_features(
+        SettingsSwitch::Memories,
+        /*enabled*/ true,
+        &mut effective_config,
+        serde_json::json!({ "goals": true }),
+    );
+
+    assert_eq!(resolution.unverified, None);
+    assert!(feature_enabled_from_effective_config(
+        &effective_config,
+        Feature::MemoryTool
+    ));
+}

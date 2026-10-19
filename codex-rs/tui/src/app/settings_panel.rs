@@ -523,7 +523,7 @@ fn drop_replaced_server_features(effective_config: &mut ConfigReadResponse) -> b
         .additional
         .entry("features".to_string())
         .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
-    for key in replaced {
+    for key in &replaced {
         // Layers come highest first, and no layer above the server's flags sets these keys.
         let fallback = layers
             .iter()
@@ -534,10 +534,10 @@ fn drop_replaced_server_features(effective_config: &mut ConfigReadResponse) -> b
                         codex_app_server_protocol::ConfigLayerSource::SessionFlags
                     )
             })
-            .find_map(|layer| value_at(&layer.config, &key).map(|value| (layer, value.clone())));
+            .find_map(|layer| value_at(&layer.config, key).map(|value| (layer, value.clone())));
         let path = key
             .strip_prefix("features.")
-            .unwrap_or(&key)
+            .unwrap_or(key)
             .split('.')
             .collect::<Vec<_>>();
         match fallback {
@@ -553,8 +553,35 @@ fn drop_replaced_server_features(effective_config: &mut ConfigReadResponse) -> b
             }
             None => {
                 remove_feature_value(features, &path);
-                effective_config.origins.remove(&key);
+                effective_config.origins.remove(key.as_str());
             }
+        }
+    }
+    // config/read reports some features as the server resolved them, its own flags and legacy
+    // aliases included, so re-derive each feature a replaced flag set from the layer that set its
+    // canonical key, or drop it when none did.
+    let touched = replaced
+        .iter()
+        .filter_map(|key| {
+            let name = key.strip_prefix("features.")?.split('.').next()?;
+            codex_features::feature_for_key(name)
+        })
+        .filter(|feature| !codex_config::is_structured_feature_path(&["features", feature.key()]))
+        .collect::<HashSet<_>>();
+    for feature in touched {
+        let key = format!("features.{}", feature.key());
+        let set_by = effective_config.origins.get(&key).and_then(|origin| {
+            layers
+                .iter()
+                .find(|layer| layer.name == origin.name)
+                .and_then(|layer| value_at(&layer.config, &key))
+        });
+        match set_by {
+            Some(value) => set_feature_value(features, &[feature.key()], value.clone()),
+            None if !effective_config.origins.contains_key(&key) => {
+                remove_feature_value(features, &[feature.key()]);
+            }
+            None => {}
         }
     }
     true
