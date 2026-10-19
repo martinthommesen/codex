@@ -33,23 +33,13 @@ async fn claude_code_requires_explicit_connection() {
         .expect("built-in claude-code provider")
         .clone();
     assert!(matches!(
-        provider_connection(
-            CLAUDE_CODE_PROVIDER_ID,
-            &provider,
-            /*auth_manager*/ None,
-            codex_home.path()
-        ),
+        provider_connection(&provider, /*auth_manager*/ None, codex_home.path()),
         ProviderConnection::NotConnected { .. }
     ));
 
     mark_claude_code_connected(&codex_home);
     assert_eq!(
-        provider_connection(
-            CLAUDE_CODE_PROVIDER_ID,
-            &provider,
-            /*auth_manager*/ None,
-            codex_home.path()
-        ),
+        provider_connection(&provider, /*auth_manager*/ None, codex_home.path()),
         ProviderConnection::Connected
     );
 }
@@ -68,15 +58,10 @@ async fn anthropic_connection_follows_configured_key_variable() {
         codex_home.path().to_path_buf(),
     );
     let check = |provider: &ModelProviderInfo| {
-        provider_connection(
-            ANTHROPIC_PROVIDER_ID,
-            provider,
-            Some(auth_manager.as_ref()),
-            codex_home.path(),
-        )
+        provider_connection(provider, Some(auth_manager.as_ref()), codex_home.path())
     };
     assert!(
-        matches!(check(&provider), ProviderConnection::NotConnected { ref remedy } if remedy.contains("codex login --provider anthropic")),
+        matches!(check(&provider), ProviderConnection::NotConnected { ref remedy } if remedy.contains("codex login --provider anthropic --with-api-key")),
         "an empty store is not connected"
     );
 

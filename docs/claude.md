@@ -119,7 +119,9 @@ model_provider = "claude-code"
 model = "claude-sonnet-5-5"
 ```
 
-If you switch to a Claude provider without picking a model, Codex uses `claude-opus-5-5`.
+If you switch to a Claude provider without picking a model, Codex uses `claude-opus-5-5`. Claude
+providers always use the bundled Claude catalog; `model_catalog_json` applies only to OpenAI and
+other Responses API providers, including when it is set through managed requirements.
 
 Bundled Claude models: `claude-opus-5-5`, `claude-sonnet-5-5`, `claude-haiku-5-5` and
 `claude-fable-5-1`. Older models are hidden from the picker but still accepted: `claude-opus-5`,

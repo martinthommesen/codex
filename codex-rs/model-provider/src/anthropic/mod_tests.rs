@@ -114,15 +114,52 @@ async fn claude_code_provider_has_no_http_endpoint_or_credentials() {
 
 #[tokio::test]
 async fn claude_providers_serve_the_claude_catalog() {
-    let provider = ClaudeCodeModelProvider::new(ModelProviderInfo::create_claude_code_provider());
-    let manager = provider.models_manager_without_cache(/*config_model_catalog*/ None);
-    let catalog = manager
-        .raw_model_catalog(
-            codex_models_manager::manager::RefreshStrategy::Offline,
-            codex_http_client::HttpClientFactory::new(
-                codex_http_client::OutboundProxyPolicy::ReqwestDefault,
-            ),
+    use codex_models_manager::manager::RefreshStrategy;
+
+    let http = || {
+        codex_http_client::HttpClientFactory::new(
+            codex_http_client::OutboundProxyPolicy::ReqwestDefault,
         )
-        .await;
-    assert_eq!(catalog, claude_model_catalog());
+    };
+    // A configured `model_catalog_json` with OpenAI entries must not replace the Claude catalog.
+    let openai_catalog = ModelsResponse {
+        models: vec![codex_models_manager::model_info::model_info_from_slug(
+            "gpt-5.5",
+        )],
+    };
+    let codex_home = tempfile::tempdir().expect("tempdir");
+    let providers: Vec<Box<dyn ModelProvider>> = vec![
+        Box::new(AnthropicModelProvider::new(
+            ModelProviderInfo::create_anthropic_provider(),
+            /*auth_manager*/ None,
+        )),
+        Box::new(ClaudeCodeModelProvider::new(
+            ModelProviderInfo::create_claude_code_provider(),
+        )),
+    ];
+    for provider in &providers {
+        for config_model_catalog in [None, Some(openai_catalog.clone())] {
+            for manager in [
+                provider.models_manager(
+                    codex_home.path().to_path_buf(),
+                    config_model_catalog.clone(),
+                ),
+                provider.models_manager_without_cache(config_model_catalog.clone()),
+            ] {
+                let catalog = manager
+                    .raw_model_catalog(RefreshStrategy::Offline, http())
+                    .await;
+                assert_eq!(catalog, claude_model_catalog());
+                let default_model = manager
+                    .get_default_model(
+                        &None,
+                        /*allow_provider_model_fallback*/ true,
+                        RefreshStrategy::Offline,
+                        http(),
+                    )
+                    .await;
+                assert_eq!(default_model, DEFAULT_CLAUDE_MODEL);
+            }
+        }
+    }
 }

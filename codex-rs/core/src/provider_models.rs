@@ -72,14 +72,10 @@ impl ProviderModelsRegistry {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         Arc::clone(managers.entry(provider_id.to_string()).or_insert_with(|| {
             let provider = &config.model_provider;
-            // A configured catalog describes OpenAI-style models; Claude providers ship their own.
-            let config_model_catalog = match provider.wire_api {
-                WireApi::Responses => config.model_catalog.clone(),
-                WireApi::AnthropicMessages | WireApi::ClaudeCode => None,
-            };
-            // Secondary catalogs never write the root provider's on-disk cache.
+            // Secondary catalogs never write the root provider's on-disk cache. Claude providers
+            // ignore the configured catalog and serve their own.
             let manager = create_model_provider(provider.clone(), self.auth_manager.clone())
-                .models_manager_without_cache(config_model_catalog);
+                .models_manager_without_cache(config.model_catalog.clone());
             manager.set_api_key_model_discovery_enabled(
                 config.features.enabled(Feature::ApiKeyModelDiscovery),
             );
@@ -108,7 +104,6 @@ pub(crate) enum ProviderConnection {
 /// `codex login --provider claude-code`: Codex never reads Claude Code's sign-in, and a signed-out
 /// CLI fails its first turn with a `claude auth login` hint.
 pub(crate) fn provider_connection(
-    provider_id: &str,
     provider: &ModelProviderInfo,
     auth_manager: Option<&AuthManager>,
     codex_home: &std::path::Path,
@@ -142,11 +137,11 @@ pub(crate) fn provider_connection(
             if has_key {
                 ProviderConnection::Connected
             } else {
+                // Every anthropic_messages provider shares the Anthropic key store, whatever its id.
                 ProviderConnection::NotConnected {
-                    remedy: format!(
-                        "store an Anthropic API key with `codex login --provider {provider_id}` \
-or set ANTHROPIC_API_KEY"
-                    ),
+                    remedy: "store an Anthropic API key with `codex login --provider anthropic \
+--with-api-key` (the key on stdin) or set ANTHROPIC_API_KEY"
+                        .to_string(),
                 }
             }
         }
@@ -214,7 +209,7 @@ pub(crate) fn spawn_provider_options(
         let Some(provider) = config.model_providers.get(candidate) else {
             continue;
         };
-        if provider_connection(candidate, provider, auth_manager, &config.codex_home)
+        if provider_connection(provider, auth_manager, &config.codex_home)
             != ProviderConnection::Connected
         {
             continue;

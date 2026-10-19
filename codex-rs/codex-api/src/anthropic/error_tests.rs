@@ -41,9 +41,14 @@ fn maps_http_errors() {
         401,
         r#"{"type":"error","error":{"type":"authentication_error","message":"invalid x-api-key"}}"#,
     )) {
-        ApiError::InvalidRequest { message } => {
-            assert!(message.contains("codex login --provider anthropic"));
-        }
+        ApiError::InvalidRequest { message } => assert_eq!(
+            message,
+            "Anthropic authentication failed: invalid x-api-key. Run `codex login status \
+--provider anthropic` to see which key Codex sends. A stored key takes precedence over \
+ANTHROPIC_API_KEY: replace it with `codex login --provider anthropic --with-api-key` (the key on \
+stdin) or remove it with `codex logout --provider anthropic`. If the provider sets `env_key` or a \
+gateway token, fix that credential instead."
+        ),
         other => panic!("unexpected {other:?}"),
     }
 }

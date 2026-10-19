@@ -60,10 +60,13 @@ fn claude_capabilities() -> ProviderCapabilities {
     }
 }
 
-fn claude_models_manager(config_model_catalog: Option<ModelsResponse>) -> SharedModelsManager {
-    let catalog = config_model_catalog.unwrap_or_else(claude_model_catalog);
+/// Claude providers always serve the bundled Claude catalog. A configured `model_catalog_json`
+/// describes OpenAI-shaped models, and its entries would replace the Claude defaults (model,
+/// context window, reasoning levels) that the Claude transports rely on.
+fn claude_models_manager() -> SharedModelsManager {
     Arc::new(StaticModelsManager::new(
-        /*auth_manager*/ None, catalog,
+        /*auth_manager*/ None,
+        claude_model_catalog(),
     ))
 }
 
@@ -195,16 +198,16 @@ impl ModelProvider for AnthropicModelProvider {
     fn models_manager(
         &self,
         _codex_home: PathBuf,
-        config_model_catalog: Option<ModelsResponse>,
+        _config_model_catalog: Option<ModelsResponse>,
     ) -> SharedModelsManager {
-        claude_models_manager(config_model_catalog)
+        claude_models_manager()
     }
 
     fn models_manager_without_cache(
         &self,
-        config_model_catalog: Option<ModelsResponse>,
+        _config_model_catalog: Option<ModelsResponse>,
     ) -> SharedModelsManager {
-        claude_models_manager(config_model_catalog)
+        claude_models_manager()
     }
 }
 
@@ -281,16 +284,16 @@ impl ModelProvider for ClaudeCodeModelProvider {
     fn models_manager(
         &self,
         _codex_home: PathBuf,
-        config_model_catalog: Option<ModelsResponse>,
+        _config_model_catalog: Option<ModelsResponse>,
     ) -> SharedModelsManager {
-        claude_models_manager(config_model_catalog)
+        claude_models_manager()
     }
 
     fn models_manager_without_cache(
         &self,
-        config_model_catalog: Option<ModelsResponse>,
+        _config_model_catalog: Option<ModelsResponse>,
     ) -> SharedModelsManager {
-        claude_models_manager(config_model_catalog)
+        claude_models_manager()
     }
 }
 

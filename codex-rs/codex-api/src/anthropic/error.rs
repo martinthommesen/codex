@@ -70,8 +70,11 @@ pub fn map_anthropic_transport_error(err: ApiError) -> ApiError {
         // Authentication and permission failures will not succeed on retry.
         401 => ApiError::InvalidRequest {
             message: format!(
-                "Anthropic authentication failed: {message}. Run `codex login --provider anthropic` \
-to store a valid API key, or set ANTHROPIC_API_KEY."
+                "Anthropic authentication failed: {message}. Run `codex login status --provider \
+anthropic` to see which key Codex sends. A stored key takes precedence over ANTHROPIC_API_KEY: \
+replace it with `codex login --provider anthropic --with-api-key` (the key on stdin) or remove it \
+with `codex logout --provider anthropic`. If the provider sets `env_key` or a gateway token, fix \
+that credential instead."
             ),
         },
         403 => ApiError::InvalidRequest {

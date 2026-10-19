@@ -244,7 +244,6 @@ fn apply_requested_spawn_agent_provider(
         return Ok(false);
     }
     if let ProviderConnection::NotConnected { remedy } = provider_connection(
-        provider_id,
         &provider,
         Some(session.services.auth_manager.as_ref()),
         &config.codex_home,
