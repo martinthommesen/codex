@@ -3042,7 +3042,7 @@ async fn saved_goals_switch_keeps_running_session_goal_controls() {
 }
 
 #[tokio::test]
-async fn saved_skills_switch_hides_command_and_refreshes_skill_list() {
+async fn saved_skills_switch_leaves_the_running_session_surfaces() {
     let (mut chat, _rx, mut op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
     let mut saved = chat.config_ref().clone();
     crate::settings_panel::SettingsSwitch::Skills
@@ -3051,17 +3051,86 @@ async fn saved_skills_switch_hides_command_and_refreshes_skill_list() {
 
     chat.apply_settings_switch(crate::settings_panel::SettingsSwitch::Skills, &saved);
 
-    assert!(!chat.config_ref().features.enabled(Feature::Skills));
-    assert!(!chat.builtin_command_flags().feature_commands.skills);
-    let expected_cwd = chat.config_ref().cwd.to_path_buf();
-    assert_matches!(
-        op_rx.try_recv(),
-        Ok(Op::ListSkills { cwds, force_reload: true }) if cwds == vec![expected_cwd]
-    );
+    // The running session still has skills, so /skills stays and nothing is re-listed.
+    assert!(chat.config_ref().features.enabled(Feature::Skills));
+    chat.bottom_pane
+        .set_composer_text("/sk".to_string(), Vec::new(), Vec::new());
+    let popup = render_bottom_popup(&chat, /*width*/ 80);
+    assert!(popup.contains("/skills"), "got {popup:?}");
+    assert!(op_rx.try_recv().is_err(), "expected no skills refresh");
+}
+
+#[tokio::test]
+async fn session_with_skills_off_hides_skills_command_and_listed_skills() {
+    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+    let cwd = chat.config_ref().cwd.to_path_buf();
+    let response: codex_app_server_protocol::SkillsListResponse =
+        serde_json::from_value(serde_json::json!({
+            "data": [{
+                "cwd": cwd,
+                "skills": [{
+                    "name": "demo",
+                    "description": "Demo skill",
+                    "path": cwd.join("demo/SKILL.md"),
+                    "scope": "user",
+                    "enabled": true,
+                    "pluginId": null,
+                }],
+                "errors": [],
+            }],
+        }))
+        .expect("valid skills list response");
+    chat.set_skills_from_response(&response);
+    assert_eq!(chat.skills_all.len(), 1);
+
+    chat.set_feature_enabled(Feature::Skills, /*enabled*/ false);
+    chat.bottom_pane
+        .set_composer_text("/sk".to_string(), Vec::new(), Vec::new());
+    let popup = render_bottom_popup(&chat, /*width*/ 80);
+    assert!(!popup.contains("/skills"), "got {popup:?}");
+    // skills/list follows the saved config, so a session with skills off ignores what it lists.
+    chat.set_skills_from_response(&response);
+    assert!(chat.skills_all.is_empty());
+}
+
+#[tokio::test]
+async fn queued_disabled_feature_commands_keep_draining_the_queue() {
+    let (mut chat, mut rx, mut op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+    chat.thread_id = Some(ThreadId::new());
+    for feature in [Feature::AgentsMd, Feature::Skills, Feature::CodexHooks] {
+        chat.set_feature_enabled(feature, /*enabled*/ false);
+    }
+    for command in ["/init", "/skills", "/hooks"] {
+        let drain = chat.submit_queued_slash_prompt(UserMessage::from(command).into());
+        assert_matches!(
+            drain,
+            QueueDrain::Continue,
+            "{command} should not stop the queue"
+        );
+    }
+    drain_insert_history(&mut rx);
+
+    handle_turn_started(&mut chat, "turn-1");
+    queue_composer_text_with_tab(&mut chat, "/init");
+    queue_composer_text_with_tab(&mut chat, "add tests after init");
+    complete_turn_with_message(&mut chat, "turn-1", Some("done"));
+
     assert!(
-        op_rx.try_recv().is_err(),
-        "expected a single skills refresh"
+        drain_insert_history(&mut rx)
+            .iter()
+            .any(|lines| lines_to_single_string(lines).contains("AGENTS.md is turned off"))
     );
+    match next_submit_op(&mut op_rx) {
+        Op::UserTurn { items, .. } => assert_eq!(
+            items,
+            vec![UserInput::Text {
+                text: "add tests after init".to_string(),
+                text_elements: Vec::new(),
+            }]
+        ),
+        other => panic!("expected the message queued after /init, got {other:?}"),
+    }
+    assert!(chat.input_queue.queued_user_messages.is_empty());
 }
 
 #[tokio::test]

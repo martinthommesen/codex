@@ -369,11 +369,7 @@ impl ChatWidget {
     }
 
     pub(super) fn feature_command_flags(&self) -> FeatureCommandFlags {
-        FeatureCommandFlags {
-            skills: self.config.features.enabled(Feature::Skills),
-            hooks: self.config.features.enabled(Feature::CodexHooks),
-            init: self.config.features.enabled(Feature::AgentsMd),
-        }
+        FeatureCommandFlags::from_features(&self.config.features)
     }
 
     pub(super) fn sync_feature_commands(&mut self) {

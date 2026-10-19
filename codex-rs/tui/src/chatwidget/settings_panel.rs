@@ -45,8 +45,9 @@ impl ChatWidget {
 
     /// Adopt a saved switch and refresh the TUI surfaces it gates.
     pub(crate) fn apply_settings_switch(&mut self, switch: SettingsSwitch, config: &Config) {
-        if switch == SettingsSwitch::Goals {
-            // The running session keeps pursuing its goal, so keep its status and /goal controls.
+        if switch.session_static() {
+            // The running session keeps its skills, hooks, AGENTS.md and goal, so keep the
+            // commands, mentions and goal controls that match it.
             return;
         }
         // Flip features first so their change-driven refreshes see the previous value.

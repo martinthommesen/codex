@@ -9,6 +9,8 @@ use codex_utils_fuzzy_match::fuzzy_match;
 
 use crate::slash_command::SlashCommand;
 use crate::slash_command::built_in_slash_commands;
+use codex_features::Feature;
+use codex_features::Features;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct ServiceTierCommand {
@@ -69,13 +71,32 @@ impl FeatureCommandFlags {
         init: true,
     };
 
-    fn allows(self, cmd: SlashCommand) -> bool {
+    pub(crate) fn from_features(features: &Features) -> Self {
+        Self {
+            skills: features.enabled(Feature::Skills),
+            hooks: features.enabled(Feature::CodexHooks),
+            init: features.enabled(Feature::AgentsMd),
+        }
+    }
+
+    pub(crate) fn allows(self, cmd: SlashCommand) -> bool {
         match cmd {
             SlashCommand::Skills => self.skills,
             SlashCommand::Hooks => self.hooks,
             SlashCommand::Init => self.init,
             _ => true,
         }
+    }
+
+    /// Commands these flags hide.
+    pub(crate) fn hidden_commands(self) -> impl Iterator<Item = SlashCommand> {
+        [
+            SlashCommand::Skills,
+            SlashCommand::Hooks,
+            SlashCommand::Init,
+        ]
+        .into_iter()
+        .filter(move |cmd| !self.allows(*cmd))
     }
 }
 

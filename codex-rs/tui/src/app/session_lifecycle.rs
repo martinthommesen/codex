@@ -726,10 +726,12 @@ impl App {
         snapshot: ThreadEventSnapshot,
         resume_restored_queue: bool,
     ) -> Result<()> {
+        // The thread is already running, so it keeps the session-static switches it started with
+        // even when /settings has saved different values for new sessions.
+        let mut config = self.config.clone();
+        crate::settings_panel::adopt_session_static(&mut config, self.chat_widget.config_ref());
         let init = self.chatwidget_init_for_forked_or_resumed_thread(
-            tui,
-            self.config.clone(),
-            /*initial_user_message*/ None,
+            tui, config, /*initial_user_message*/ None,
         );
         self.replace_chat_widget(ChatWidget::new_with_app_event(init));
         self.chat_widget

@@ -1,6 +1,7 @@
 //! Session headers, onboarding guidance, and transcript cards.
 
 use super::*;
+use crate::bottom_pane::slash_commands::FeatureCommandFlags;
 use crate::line_truncation::line_width;
 use crate::line_truncation::truncate_line_with_ellipsis_if_overflow;
 use crate::style::accent_color;
@@ -257,7 +258,13 @@ pub(crate) fn new_session_info(
     } else {
         if local_settings.tui.show_tooltips
             && let Some(tooltips) = tooltip_override
-                .or_else(|| tooltips::get_tooltip(auth_plan, &local_settings.tui.keymap))
+                .or_else(|| {
+                    tooltips::get_tooltip(
+                        auth_plan,
+                        &local_settings.tui.keymap,
+                        FeatureCommandFlags::from_features(&config.features),
+                    )
+                })
                 .map(|tip| TooltipHistoryCell::new(tip, &config.cwd))
         {
             parts.push(Box::new(tooltips));

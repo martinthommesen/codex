@@ -41,3 +41,34 @@ fn disabled_sections_retract_listed_catalogs_once() {
         );
     }
 }
+
+#[test]
+fn disabled_sections_retract_catalogs_found_only_in_history() {
+    let catalog = format!(
+        "{SKILLS_INSTRUCTIONS_OPEN_TAG}\n## Skills\n- demo: Demo skill\n{SKILLS_INSTRUCTIONS_CLOSE_TAG}"
+    );
+    let sections = disabled_skills_world_state_sections();
+    assert!(
+        sections
+            .iter()
+            .all(|section| section.matches_legacy_fragment("developer", &catalog))
+    );
+    assert!(
+        !sections
+            .iter()
+            .any(|section| section.matches_legacy_fragment("user", &catalog))
+    );
+
+    // Without a saved snapshot the harness reports Unknown, which still gets one notice.
+    let rendered = sections
+        .iter()
+        .map(|section| section.render_diff(PreviousWorldStateSection::Unknown).1)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        rendered
+            .iter()
+            .filter(|fragment| fragment.is_some())
+            .count(),
+        1
+    );
+}

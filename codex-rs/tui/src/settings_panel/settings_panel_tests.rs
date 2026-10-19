@@ -162,6 +162,13 @@ fn search_finds_switches_by_keyword_across_groups() {
     insta::assert_snapshot!("settings_search", render(&panel, /*width*/ 130));
     panel.handle_key_event(KeyCode::Enter.into());
     assert_eq!(expect_save(&mut rx), (SettingsSwitch::PluginsAndApps, true));
+
+    // A match outside the first tab maps through the full list, not the tab's rows.
+    let (mut panel, mut rx) = self::panel(mixed_statuses());
+    panel.handle_key_event(KeyCode::Char('/').into());
+    assert!(panel.handle_paste("memory".to_string()));
+    panel.handle_key_event(KeyCode::Enter.into());
+    assert_eq!(expect_save(&mut rx), (SettingsSwitch::Memories, true));
 }
 
 #[tokio::test]
@@ -294,19 +301,95 @@ async fn pinned_features_lock_only_the_blocked_direction() {
     )
     .expect("pins are valid");
 
-    let statuses = statuses(&config);
-    let plugins = statuses[0];
-    assert_eq!(plugins.state, SwitchState::Partial);
-    // Apps cannot turn on, but plugins can still turn off.
-    assert_eq!(plugins.target, Some(false));
-    assert!(plugins.managed());
-    let skills = statuses[1];
-    assert_eq!(skills.state, SwitchState::On);
-    assert_eq!(skills.target, None);
+    let status_of = |config: &Config, switch: SettingsSwitch| {
+        statuses(config)
+            .into_iter()
+            .find(|status| status.switch == switch)
+            .expect("every switch has a status")
+    };
+    let plugins = SettingsSwitch::PluginsAndApps;
+
+    // Apps cannot turn on, but plugins can still turn off and back on.
+    assert_eq!(
+        status_of(&config, plugins),
+        SwitchStatus {
+            switch: plugins,
+            state: SwitchState::Partial,
+            target: Some(false),
+        }
+    );
+    assert!(status_of(&config, plugins).managed());
+    plugins
+        .apply(&mut config, /*enabled*/ false)
+        .expect("plugins can turn off");
+    assert_eq!(
+        status_of(&config, plugins),
+        SwitchStatus {
+            switch: plugins,
+            state: SwitchState::Off,
+            target: Some(true),
+        }
+    );
+    assert!(
+        plugins
+            .edits(/*enabled*/ true, &config)
+            .into_iter()
+            .map(|edit| (edit.key_path, edit.value))
+            .eq([("features.plugins".to_string(), json!(true))]),
+        "the pinned apps key is not written"
+    );
+    plugins
+        .apply(&mut config, /*enabled*/ true)
+        .expect("plugins can turn back on");
+    assert_eq!(
+        status_of(&config, plugins),
+        SwitchStatus {
+            switch: plugins,
+            state: SwitchState::Partial,
+            target: Some(false),
+        }
+    );
+
+    // A switch whose only key is pinned cannot change in either direction.
+    assert_eq!(
+        status_of(&config, SettingsSwitch::Skills),
+        SwitchStatus {
+            switch: SettingsSwitch::Skills,
+            state: SwitchState::On,
+            target: None,
+        }
+    );
     assert!(
         SettingsSwitch::Skills
             .apply(&mut config, /*enabled*/ false)
             .is_err()
+    );
+}
+
+#[tokio::test]
+async fn adopt_session_static_copies_only_switches_read_at_session_start() {
+    let (_codex_home, mut running) = test_config().await;
+    let mut saved = running.clone();
+    for switch in SettingsSwitch::ALL {
+        switch
+            .apply(&mut saved, /*enabled*/ false)
+            .expect("no switch is pinned");
+    }
+    let before = SettingsSwitch::ALL.map(|switch| switch.state(&running));
+
+    adopt_session_static(&mut running, &saved);
+
+    assert_eq!(
+        SettingsSwitch::ALL.map(|switch| (switch, switch.state(&running))),
+        std::array::from_fn(|index| {
+            let switch = SettingsSwitch::ALL[index];
+            let state = if switch.session_static() {
+                SwitchState::Off
+            } else {
+                before[index]
+            };
+            (switch, state)
+        })
     );
 }
 

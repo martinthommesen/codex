@@ -6,6 +6,9 @@
 
 use super::*;
 use codex_config::ConfigLayerSource;
+use codex_features::FeatureConfigSource;
+use codex_features::FeatureOverrides;
+use codex_features::Features;
 
 async fn build_config_on_runtime_worker(
     builder: ConfigBuilder,
@@ -1387,10 +1390,16 @@ pub(super) fn feature_enabled_from_effective_config(
         .additional
         .get("features")
         .and_then(features_toml_from_json);
-    root_features
-        .as_ref()
-        .and_then(|features| features.entries().get(feature.key()).copied())
-        .unwrap_or_else(|| feature.default_enabled())
+    // Resolve legacy aliases and structured tables the same way config loading does.
+    Features::from_sources(
+        FeatureConfigSource {
+            features: root_features.as_ref(),
+            ..Default::default()
+        },
+        FeatureConfigSource::default(),
+        FeatureOverrides::default(),
+    )
+    .enabled(feature)
 }
 
 fn approvals_reviewer_from_effective_config(
@@ -2136,6 +2145,35 @@ theme = "dracula"
         assert_eq!(
             app.chat_widget.local_settings.tui.pet.as_deref(),
             Some(crate::pets::DISABLED_PET_ID)
+        );
+    }
+
+    #[test]
+    fn effective_feature_readback_resolves_legacy_aliases_and_tables() {
+        let response: ConfigReadResponse = serde_json::from_value(serde_json::json!({
+            "config": {
+                "features": {
+                    "apps": true,
+                    "connectors": false,
+                    "multi_agent_v2": { "enabled": true },
+                },
+            },
+            "origins": {},
+        }))
+        .expect("valid config read response");
+
+        // `connectors` is the legacy alias for apps and sorts after it, so it wins on load.
+        assert!(!feature_enabled_from_effective_config(
+            &response,
+            Feature::Apps
+        ));
+        assert!(feature_enabled_from_effective_config(
+            &response,
+            Feature::MultiAgentV2
+        ));
+        assert_eq!(
+            feature_enabled_from_effective_config(&response, Feature::Plugins),
+            Feature::Plugins.default_enabled()
         );
     }
 }

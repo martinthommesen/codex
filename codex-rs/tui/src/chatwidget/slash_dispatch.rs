@@ -1363,6 +1363,10 @@ impl ChatWidget {
                     QueueDrain::Continue
                 }
             }
+            // A command whose feature is off only prints why, so later queued input can go out.
+            SlashCommand::Init if !self.feature_command_flags().init => QueueDrain::Continue,
+            SlashCommand::Skills if !self.feature_command_flags().skills => QueueDrain::Continue,
+            SlashCommand::Hooks if !self.feature_command_flags().hooks => QueueDrain::Continue,
             SlashCommand::Feedback
             | SlashCommand::Warnings
             | SlashCommand::Export

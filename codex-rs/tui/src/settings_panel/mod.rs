@@ -1,9 +1,10 @@
 //! Catalog of whole-feature kill switches shown by `/settings`.
 //!
 //! Each switch maps to server-owned config keys, so saves go through the app server instead of the
-//! local TUI preferences used by `/config`. Running sessions keep the features they started with;
-//! saved switches reach new sessions, while TUI-only surfaces (slash commands, mentions) update
-//! immediately.
+//! local TUI preferences used by `/config`. Running sessions keep the features they started with,
+//! and saved switches reach new sessions. Switches the running session reads only at startup
+//! (`session_static`) also leave its TUI surfaces alone, so `/skills`, `$` skills, `/hooks`,
+//! `/init` and goal controls keep matching what that session can do.
 
 mod input;
 mod render;
@@ -108,7 +109,20 @@ impl SettingsSwitch {
         }
     }
 
-    /// Feature flags this switch writes. Their TUI-side gating updates as soon as a save lands.
+    /// Whether the running session reads this switch only when it starts. Saves for these leave the
+    /// running session's TUI surfaces unchanged until `/new`.
+    pub(crate) fn session_static(self) -> bool {
+        match self {
+            Self::Skills | Self::Hooks | Self::AgentsMd | Self::Goals => true,
+            Self::PluginsAndApps
+            | Self::Memories
+            | Self::Subagents
+            | Self::WebSearch
+            | Self::ImageGeneration => false,
+        }
+    }
+
+    /// Feature flags this switch writes.
     pub(crate) fn features(self) -> &'static [Feature] {
         match self {
             Self::PluginsAndApps => &[Feature::Plugins, Feature::Apps],
@@ -150,10 +164,24 @@ impl SettingsSwitch {
         SwitchState::from_values(&values)
     }
 
-    /// Turns the switch fully on or off in `config`, rejecting values pinned by requirements.
+    /// Turns the switch on or off in `config`. Keys that requirements pin to the other value keep
+    /// it, as long as another key still changes; otherwise the switch is rejected as managed.
     pub(crate) fn apply(self, config: &mut Config, enabled: bool) -> Result<(), String> {
+        let mut changed = false;
+        let mut pinned = None;
         for feature in self.features() {
-            set_feature(config, *feature, enabled)?;
+            if config.features.enabled(*feature) == enabled {
+                continue;
+            }
+            match set_feature(config, *feature, enabled) {
+                Ok(()) => changed = true,
+                Err(err) => pinned = pinned.or(Some(err)),
+            }
+        }
+        if let Some(err) = pinned
+            && !changed
+        {
+            return Err(err);
         }
         match self {
             Self::Subagents => {
@@ -218,10 +246,14 @@ impl SettingsSwitch {
         }
     }
 
-    /// Explicit values for every key, so runtime enablement and legacy aliases cannot win.
+    /// Explicit values for every key, so runtime enablement and legacy aliases cannot win. Keys
+    /// that requirements pin to the other value are left alone.
     pub(crate) fn edits(self, enabled: bool, config: &Config) -> Vec<ConfigEdit> {
         let mut edits = Vec::new();
         for feature in self.features() {
+            if set_feature(&mut config.clone(), *feature, enabled).is_err() {
+                continue;
+            }
             edits.push(feature_edit(*feature, enabled));
             edits.extend(
                 legacy_keys_for_feature(*feature)
@@ -293,6 +325,15 @@ pub(crate) fn enabled_web_search_mode(config: &Config) -> Option<WebSearchMode> 
     .find(|mode| config.web_search_mode.can_set(mode).is_ok())
 }
 
+/// Copies the session-static switches from `source`, leaving every other setting in `target`.
+pub(crate) fn adopt_session_static(target: &mut Config, source: &Config) {
+    for switch in SettingsSwitch::ALL {
+        if switch.session_static() {
+            switch.adopt(target, source);
+        }
+    }
+}
+
 /// Combined state of the keys behind one switch.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum SwitchState {
@@ -346,7 +387,7 @@ pub(crate) fn statuses(config: &Config) -> Vec<SwitchStatus> {
             let state = switch.state(config);
             let can_apply = |enabled| switch.apply(&mut config.clone(), enabled).is_ok();
             let preferred = state.toggled();
-            // A partial switch with a key pinned off can still turn everything else off.
+            // When a pinned key blocks turning a partial switch on, it can still turn the rest off.
             let target = if can_apply(preferred) {
                 Some(preferred)
             } else if state == SwitchState::Partial && can_apply(!preferred) {

@@ -3043,6 +3043,60 @@ async fn disabled_extension_contributes_no_skill_context_or_requirements() -> Te
     Ok(())
 }
 
+#[tokio::test]
+async fn disabled_extension_registers_no_skill_tools_or_cloud_discovery() -> TestResult {
+    for enabled in [true, false] {
+        let list_calls = Arc::new(AtomicUsize::new(0));
+        let providers = SkillProviders::new().with_cloud_provider(Arc::new(StaticSkillProvider {
+            catalog: SkillCatalog {
+                entries: vec![test_entry(
+                    SkillSourceKind::Cloud,
+                    "codex_apps",
+                    "cloud/demo",
+                    "skill://cloud/demo/SKILL.md",
+                )],
+                warnings: Vec::new(),
+            },
+            read_requests: Arc::new(Mutex::new(Vec::new())),
+            list_calls: Some(Arc::clone(&list_calls)),
+            fail_first_list: false,
+        }));
+        let mut builder = ExtensionRegistryBuilder::new();
+        install_with_providers(&mut builder, providers, move |config: &TestConfig| {
+            SkillsExtensionConfig {
+                enabled,
+                ..skills_extension_config(config)
+            }
+        });
+        let registry = builder.build();
+        let session_store = ExtensionData::new("session");
+        let thread_store = ExtensionData::new("thread");
+        registry.thread_lifecycle_contributors()[0]
+            .on_thread_start(ThreadStartInput {
+                config: &default_config(),
+                session_source: &SessionSource::Cli,
+                persistent_thread_state_available: true,
+                environments: &[],
+                mcp_resource_client: None,
+                extension_metrics: None,
+                session_store: &session_store,
+                thread_store: &thread_store,
+            })
+            .await;
+        start_registered_turn(&registry, &session_store, &thread_store, "turn-1").await;
+
+        let tools = registry.tool_contributors()[0].tools(&session_store, &thread_store);
+        assert_eq!(tools.is_empty(), !enabled, "enabled={enabled}");
+        assert_eq!(
+            list_calls.load(Ordering::Relaxed) == 0,
+            !enabled,
+            "enabled={enabled}"
+        );
+    }
+
+    Ok(())
+}
+
 #[derive(Clone)]
 struct StaticSkillProvider {
     catalog: SkillCatalog,

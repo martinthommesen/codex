@@ -111,11 +111,7 @@ pub(crate) fn executor_skills_world_state_section(
                 ).with_metadata(ContentItemMetadata::skills())),
             )
     })
-    .with_legacy_matcher(|role, text| {
-        role == "developer"
-            && text.trim_start().starts_with(SKILLS_INSTRUCTIONS_OPEN_TAG)
-            && text.trim_end().ends_with(SKILLS_INSTRUCTIONS_CLOSE_TAG)
-    });
+    .with_legacy_matcher(is_skills_fragment);
     // A short availability update is valid only while the actual catalog remains in history.
     match retained_body {
         Some(body) => contribution.with_retained_fragment_matcher(move |role, text| {
@@ -242,8 +238,17 @@ pub(crate) fn disabled_skills_world_state_sections() -> Vec<WorldStateSectionCon
             });
             (Some(json!({ "disabled": true })), fragment)
         })
+        // History from before skills had saved state still holds catalogs worth retracting.
+        .with_legacy_matcher(is_skills_fragment)
     })
     .collect()
+}
+
+/// A developer message holding a skills catalog or skills update.
+fn is_skills_fragment(role: &str, text: &str) -> bool {
+    role == "developer"
+        && text.trim_start().starts_with(SKILLS_INSTRUCTIONS_OPEN_TAG)
+        && text.trim_end().ends_with(SKILLS_INSTRUCTIONS_CLOSE_TAG)
 }
 
 pub(crate) fn host_skills_world_state_section(

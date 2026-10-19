@@ -48,32 +48,49 @@ impl App {
                 return;
             }
         };
-        let (notice, outcome) = if response.status == WriteStatus::OkOverridden {
-            let message = overridden_write_message(&response).to_string();
-            tracing::warn!(
-                message,
-                switch = label,
-                "settings switch save was overridden"
-            );
-            if let Some(effective_config) = self
-                .read_effective_config_after_overridden_write(app_server, "Settings changes")
-                .await
-            {
+        let overridden = (response.status == WriteStatus::OkOverridden)
+            .then(|| overridden_write_message(&response).to_string());
+        // The server only checks user-level layers for overrides, so a trusted project, a profile
+        // or a legacy alias in another layer can still win. Read back what this cwd resolves to.
+        let cwd = self.chat_widget.config_ref().cwd.display().to_string();
+        match crate::config_update::read_effective_config(app_server.request_handle(), cwd).await {
+            Ok(effective_config) => {
                 adopt_effective_switch_state(&mut self.config, switch, &effective_config);
             }
-            (
-                format!("{label} saved, but it is overridden: {message}"),
-                SaveOutcome::Failed,
-            )
-        } else {
-            switch.adopt(&mut self.config, &next_config);
+            Err(err) => {
+                tracing::warn!(error = %err, switch = label, "failed to read config after a settings save");
+                if overridden.is_none() {
+                    switch.adopt(&mut self.config, &next_config);
+                }
+            }
+        }
+        let (notice, outcome) = if switch.state(&self.config) == switch.state(&next_config) {
             (
                 crate::settings_panel::saved_notice(switch, enabled),
                 SaveOutcome::Saved,
             )
+        } else {
+            let reason = overridden
+                .unwrap_or_else(|| "another config file still sets it for this folder".to_string());
+            tracing::warn!(
+                reason,
+                switch = label,
+                "settings switch save was overridden"
+            );
+            (
+                format!("{label} saved, but it is overridden: {reason}"),
+                SaveOutcome::Failed,
+            )
         };
         self.chat_widget.apply_settings_switch(switch, &self.config);
         self.report_settings_save(notice, outcome);
+    }
+
+    /// Takes a chat widget's config while keeping the session-static switches `/settings` saved
+    /// for new sessions, which the running widget deliberately does not adopt.
+    pub(super) fn adopt_widget_config(&mut self, config: Config) {
+        let saved = std::mem::replace(&mut self.config, config);
+        crate::settings_panel::adopt_session_static(&mut self.config, &saved);
     }
 
     /// Shows the notice in the panel, or in the transcript when the panel was already closed.
@@ -92,7 +109,7 @@ impl App {
     }
 }
 
-/// Mirrors the server's effective values after a higher-priority layer overrode a save.
+/// Mirrors the effective values this folder resolves to after a save.
 fn adopt_effective_switch_state(
     config: &mut Config,
     switch: SettingsSwitch,
@@ -104,7 +121,7 @@ fn adopt_effective_switch_state(
             tracing::warn!(
                 error = %err,
                 feature = feature.key(),
-                "failed to sync effective feature state after an overridden settings save"
+                "failed to sync effective feature state after a settings save"
             );
         }
     };
@@ -131,7 +148,7 @@ fn adopt_effective_switch_state(
             if let Err(err) = config.web_search_mode.set(mode) {
                 tracing::warn!(
                     error = %err,
-                    "failed to sync effective web search mode after an overridden settings save"
+                    "failed to sync effective web search mode after a settings save"
                 );
             }
         }

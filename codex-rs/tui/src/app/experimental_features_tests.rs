@@ -98,18 +98,22 @@ async fn experimental_features_use_selected_server_profile_and_preserve_task_set
     app.enable_feature_for_new_threads(&mut tui, &server, Feature::Collab)
         .await;
     insta::assert_snapshot!("subagents_enable_notice", notice_text(&app));
-    std::fs::write(
-        &selected,
-        format!(
-            "{}memory_tool = false\n",
-            std::fs::read_to_string(&selected)?
-        ),
-    )?;
+    // Set the legacy key in place; the Subagents save may have appended other tables.
+    let mut profile: toml::Table = toml::from_str(&std::fs::read_to_string(&selected)?)?;
+    profile
+        .entry("features")
+        .or_insert_with(|| toml::Value::Table(toml::Table::new()))
+        .as_table_mut()
+        .expect("features is a table")
+        .insert("memory_tool".to_string(), toml::Value::Boolean(false));
+    std::fs::write(&selected, toml::to_string(&profile)?)?;
     app.enable_feature_for_new_threads(&mut tui, &server, Feature::MemoryTool)
         .await;
     insta::assert_snapshot!("memories_enable_notice", notice_text(&app));
     let saved: toml::Value = toml::from_str(&std::fs::read_to_string(&selected)?)?;
     assert_eq!(saved["features"]["multi_agent"].as_bool(), Some(true));
+    // `/settings` turns subagents off through `agents.enabled` too.
+    assert_eq!(saved["agents"]["enabled"].as_bool(), Some(true));
     assert_eq!(saved["features"]["memories"].as_bool(), Some(true));
     assert_eq!(saved["features"]["memory_tool"].as_bool(), Some(true));
     assert_eq!(

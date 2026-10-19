@@ -398,8 +398,14 @@ impl McpManager {
             Default::default()
         };
         let loaded_plugins = loaded_plugins.without_plugins(disabled_plugin_ids);
-        let plugins_available =
-            !selected_plugins.is_empty() || !loaded_plugins.capability_summaries().is_empty();
+        // A plugin that only bundles skills offers nothing usable while skills are off.
+        let skills_enabled = config.features.enabled(Feature::Skills);
+        let plugins_available = !selected_plugins.is_empty()
+            || loaded_plugins.capability_summaries().iter().any(|summary| {
+                (skills_enabled && summary.has_skills)
+                    || !summary.mcp_server_names.is_empty()
+                    || !summary.app_connector_ids.is_empty()
+            });
         let mut mcp_config = config
             .to_mcp_config_with_loaded_plugins(&loaded_plugins, selected_plugin_registrations);
         let mut catalog = mcp_config.mcp_server_catalog.to_builder();

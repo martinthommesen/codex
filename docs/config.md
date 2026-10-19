@@ -20,17 +20,17 @@ Run `/settings` in the TUI to switch entire features on or off. Each switch
 writes explicit values to your user `config.toml`. Running sessions keep the
 features they started with, so changes apply to new sessions (`/new`).
 
-| Switch           | Keys written                                       |
-| ---------------- | -------------------------------------------------- |
-| Plugins & apps   | `features.plugins`, `features.apps`                |
-| Skills           | `features.skills`                                  |
-| Hooks            | `features.hooks`                                   |
-| AGENTS.md        | `features.agents_md`                               |
-| Memories         | `features.memories`                                |
-| Subagents        | `features.multi_agent`, `agents.enabled`           |
-| Web search       | `web_search` (`"disabled"`, or an allowed mode)    |
-| Image generation | `features.image_generation`                        |
-| Goals            | `features.goals`                                   |
+| Switch           | Keys written                                    |
+| ---------------- | ----------------------------------------------- |
+| Plugins & apps   | `features.plugins`, `features.apps`             |
+| Skills           | `features.skills`                               |
+| Hooks            | `features.hooks`                                |
+| AGENTS.md        | `features.agents_md`                            |
+| Memories         | `features.memories`                             |
+| Subagents        | `features.multi_agent`, `agents.enabled`        |
+| Web search       | `web_search` (`"disabled"`, or an allowed mode) |
+| Image generation | `features.image_generation`                     |
+| Goals            | `features.goals`                                |
 
 `features.skills = false` stops skill discovery from every source (repository,
 user, system, plugin, and cloud skills), leaves skills out of model context,
@@ -40,7 +40,12 @@ host application are still used.
 
 Turning Subagents off also writes `features.multi_agent_v2 = false`, which
 otherwise overrides `agents.enabled`. Saving a switch also removes legacy
-aliases for the same feature (such as `features.connectors`) so they cannot
-override it. Values pinned in `requirements.toml` show as managed and cannot be
-changed from `/settings`. A profile or a trusted project's `.codex/config.toml`
-can still override the user value.
+aliases for the same feature (such as `features.connectors`) from your user
+`config.toml`. Values pinned in `requirements.toml` show as managed and are left
+unchanged. Another config layer, such as a profile, a trusted project's
+`.codex/config.toml`, or a legacy alias in a system config, can still override
+the user value; `/settings` then reports the save as overridden.
+
+Skills, hooks, AGENTS.md, and goals are read when a session starts, so the
+running session keeps its `/skills`, `$` skill mentions, `/hooks`, `/init`, and
+goal controls until you start a new one.
