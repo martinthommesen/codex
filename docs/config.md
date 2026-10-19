@@ -46,7 +46,8 @@ aliases for the same feature (such as `features.connectors`) from your user
 unchanged. Another config layer, such as a command-line flag, a trusted
 project's `.codex/config.toml`, a legacy alias in your main `config.toml` while
 a profile is selected, or a managed config, can still override the saved value;
-`/settings` then reports the save as overridden and names that layer.
+`/settings` then reports the save as overridden and names that layer and the
+key it sets.
 
 A running session keeps the skills, hooks, AGENTS.md, and goals it started
 with, but the TUI's `/skills`, `$` mentions, `/hooks`, and `/init` follow the

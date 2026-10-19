@@ -326,15 +326,24 @@ fn set_feature(config: &mut Config, feature: Feature, enabled: bool) -> Result<(
     Ok(())
 }
 
-/// The mode an unset `web_search` resolves to: the default when allowed, else another allowed one.
+/// The mode turning web search on writes: the mode the user's own config file sets, then the
+/// default, then another mode, whichever requirements allow first.
 pub(crate) fn enabled_web_search_mode(config: &Config) -> Option<WebSearchMode> {
-    [
-        WebSearchMode::Cached,
-        WebSearchMode::Indexed,
-        WebSearchMode::Live,
-    ]
-    .into_iter()
-    .find(|mode| config.web_search_mode.can_set(mode).is_ok())
+    // Another layer may have disabled search, so keep the user's own choice instead of resetting it.
+    let user_mode = config
+        .config_layer_stack
+        .get_active_user_layer()
+        .and_then(|layer| layer.config.get("web_search"))
+        .and_then(|mode| mode.clone().try_into::<WebSearchMode>().ok())
+        .filter(|mode| *mode != WebSearchMode::Disabled);
+    user_mode
+        .into_iter()
+        .chain([
+            WebSearchMode::Cached,
+            WebSearchMode::Indexed,
+            WebSearchMode::Live,
+        ])
+        .find(|mode| config.web_search_mode.can_set(mode).is_ok())
 }
 
 /// Combined state of the keys behind one switch.

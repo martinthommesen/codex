@@ -5,9 +5,11 @@ use super::config_persistence::overridden_write_message;
 use super::*;
 use crate::config_update::format_config_error;
 use crate::settings_panel::SettingsSwitch;
+use crate::settings_panel::SwitchState;
 use codex_protocol::config_types::WebSearchMode;
 
 /// How a settings save ended, which decides where its notice can be shown.
+#[derive(Debug, PartialEq, Eq)]
 enum SaveOutcome {
     Saved,
     Failed,
@@ -54,8 +56,8 @@ impl App {
         // this TUI's launch flags or a legacy alias in another layer can still win. Resolve what
         // new sessions will actually get.
         let written = &response.file_path;
-        let mut winning_layer = None;
-        let resolved = if app_server.uses_remote_workspace() {
+        let mut winner = None;
+        let unverified = if app_server.uses_remote_workspace() {
             // New remote sessions start where /new starts them, not in the displayed thread's cwd.
             let cwd = app_server.remote_cwd_override().unwrap_or(Path::new("."));
             match crate::config_update::read_effective_config(
@@ -77,7 +79,7 @@ impl App {
                     let launch_origins = self.config.config_layer_stack.origins();
                     let flag_precedence =
                         codex_app_server_protocol::ConfigLayerSource::SessionFlags.precedence();
-                    winning_layer = switch_override_layer(
+                    winner = switch_override_layer(
                         switch,
                         enabled,
                         &serde_json::to_value(&effective_config.config).unwrap_or_default(),
@@ -93,11 +95,11 @@ impl App {
                                 (key.as_str(), flag_precedence, Some(layer))
                             })),
                     );
-                    true
+                    None
                 }
                 Err(err) => {
                     tracing::warn!(error = %err, switch = label, "failed to read config after a settings save");
-                    false
+                    Some(format_config_error(&err))
                 }
             }
         } else {
@@ -107,7 +109,7 @@ impl App {
                 Ok(rebuilt) => {
                     switch.adopt(&mut self.config, &rebuilt);
                     let layers = &rebuilt.config_layer_stack;
-                    winning_layer = switch_override_layer(
+                    winner = switch_override_layer(
                         switch,
                         enabled,
                         &serde_json::to_value(layers.effective_config()).unwrap_or_default(),
@@ -119,39 +121,28 @@ impl App {
                             )
                         }),
                     );
-                    true
+                    None
                 }
                 Err(err) => {
                     tracing::warn!(error = %err, switch = label, "failed to rebuild config after a settings save");
-                    false
+                    Some(format_config_error(&err))
                 }
             }
         };
-        if !resolved && overridden.is_none() {
+        if unverified.is_some() && overridden.is_none() {
             switch.adopt(&mut self.config, &next_config);
         }
-        let (notice, outcome) = if switch.state(&self.config) == switch.state(&next_config) {
-            (
-                crate::settings_panel::saved_notice(switch, enabled, switch.state(&self.config)),
-                SaveOutcome::Saved,
-            )
-        } else {
-            let reason = overridden.unwrap_or_else(|| {
-                winning_layer
-                    .unwrap_or(OverrideLayer::Other)
-                    .describe()
-                    .to_string()
-            });
-            tracing::warn!(
-                reason,
-                switch = label,
-                "settings switch save was overridden"
-            );
-            (
-                format!("{label} saved, but it is overridden: {reason}"),
-                SaveOutcome::Failed,
-            )
-        };
+        let (notice, outcome) = save_notice(
+            switch,
+            enabled,
+            switch.state(&self.config),
+            switch.state(&next_config),
+            SaveCheck {
+                overridden,
+                unverified,
+                winner,
+            },
+        );
         self.chat_widget.apply_settings_switch(switch, &self.config);
         self.report_settings_save(notice, outcome);
     }
@@ -170,6 +161,55 @@ impl App {
             SaveOutcome::Failed => self.chat_widget.add_error_message(notice),
         }
     }
+}
+
+/// What a save's check against new sessions found.
+struct SaveCheck {
+    /// The app server's own override message, when it reported one.
+    overridden: Option<String>,
+    /// Why new sessions could not be checked, when they could not.
+    unverified: Option<String>,
+    /// The layer and key that still win, when another layer overrides the save.
+    winner: Option<(OverrideLayer, String)>,
+}
+
+/// The notice for a written save. `resolved` is the switch's state for new sessions and
+/// `requested` the state the save staged.
+fn save_notice(
+    switch: SettingsSwitch,
+    enabled: bool,
+    resolved: SwitchState,
+    requested: SwitchState,
+    check: SaveCheck,
+) -> (String, SaveOutcome) {
+    let label = switch.label();
+    if resolved == requested {
+        if let Some(err) = check.unverified {
+            return (
+                format!(
+                    "{label} saved, but /settings could not check what new sessions will get: {err}"
+                ),
+                SaveOutcome::Failed,
+            );
+        }
+        return (
+            crate::settings_panel::saved_notice(switch, enabled, resolved),
+            SaveOutcome::Saved,
+        );
+    }
+    let reason = check.overridden.unwrap_or_else(|| match check.winner {
+        Some((layer, key)) => layer.describe(&key),
+        None => "another config file still sets it".to_string(),
+    });
+    tracing::warn!(
+        reason,
+        switch = label,
+        "settings switch save was overridden"
+    );
+    (
+        format!("{label} saved, but it is overridden: {reason}"),
+        SaveOutcome::Failed,
+    )
 }
 
 /// Applies the launch choices this TUI sends with every new thread on top of what a remote app
@@ -307,33 +347,41 @@ impl OverrideLayer {
         }
     }
 
-    fn describe(self) -> &'static str {
+    fn describe(self, key: &str) -> String {
         match self {
-            Self::CommandLine => "a command-line flag for this Codex session still sets it",
-            Self::Project => "this project's .codex/config.toml still sets it",
-            Self::Profile => "the selected profile still sets it",
-            Self::BaseUser => "your main config.toml still sets it",
-            Self::Managed => "a managed config still sets it",
-            Self::Other => "another config file still sets it",
+            Self::CommandLine => {
+                format!("a command-line flag for this Codex session still sets `{key}`")
+            }
+            Self::Project => format!("this project's .codex/config.toml still sets `{key}`"),
+            Self::Profile => format!("the selected profile still sets `{key}`"),
+            // `/settings` writes only the selected profile, so the user has to edit this file.
+            Self::BaseUser => format!(
+                "your main config.toml still sets `{key}`; remove it there, since /settings only writes the selected profile"
+            ),
+            Self::Managed => format!("a managed config still sets `{key}`"),
+            Self::Other => format!("another config file still sets `{key}`"),
         }
     }
 }
 
 /// The highest-precedence layer, other than the file `/settings` wrote, whose resolved value still
-/// keeps the switch from reaching `enabled`.
+/// keeps the switch from reaching `enabled`, with the key it sets.
 fn switch_override_layer<'a>(
     switch: SettingsSwitch,
     enabled: bool,
     values: &serde_json::Value,
     origins: impl Iterator<Item = (&'a str, i16, Option<OverrideLayer>)>,
-) -> Option<OverrideLayer> {
+) -> Option<(OverrideLayer, String)> {
     origins
         .filter(|(key, ..)| {
             value_at(values, key).is_some_and(|value| opposes_save(switch, enabled, key, value))
         })
-        .filter_map(|(_, precedence, layer)| Some((precedence, layer?)))
-        .max_by_key(|(precedence, _)| *precedence)
-        .map(|(_, layer)| layer)
+        .filter_map(|(key, precedence, layer)| Some((precedence, key, layer?)))
+        // Ties break on the key so the notice does not depend on map order.
+        .max_by(|(a_precedence, a_key, _), (b_precedence, b_key, _)| {
+            a_precedence.cmp(b_precedence).then(b_key.cmp(a_key))
+        })
+        .map(|(_, key, layer)| (layer, key.to_string()))
 }
 
 /// Whether `key` resolving to `value` keeps the switch from reaching `enabled`.

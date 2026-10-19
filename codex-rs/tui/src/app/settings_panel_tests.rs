@@ -20,7 +20,7 @@ fn remote_override(
     enabled: bool,
     effective_config: &ConfigReadResponse,
     written: &AbsolutePathBuf,
-) -> Option<OverrideLayer> {
+) -> Option<(OverrideLayer, String)> {
     switch_override_layer(
         switch,
         enabled,
@@ -119,7 +119,7 @@ fn override_names_the_layer_that_opposes_the_save() {
             &effective_config,
             &written,
         ),
-        Some(OverrideLayer::Project)
+        Some((OverrideLayer::Project, "agents.enabled".to_string()))
     );
 }
 
@@ -151,6 +151,52 @@ fn override_under_a_profile_blames_the_main_config() {
             &effective_config,
             &profile,
         ),
-        Some(OverrideLayer::BaseUser)
+        Some((OverrideLayer::BaseUser, "features.connectors".to_string()))
+    );
+}
+
+#[test]
+fn override_notice_names_the_key_to_remove() {
+    let (notice, outcome) = save_notice(
+        SettingsSwitch::PluginsAndApps,
+        /*enabled*/ false,
+        SwitchState::Partial,
+        SwitchState::Off,
+        SaveCheck {
+            overridden: None,
+            unverified: None,
+            winner: Some((OverrideLayer::BaseUser, "features.connectors".to_string())),
+        },
+    );
+
+    assert_eq!(
+        (notice.as_str(), outcome),
+        (
+            "Plugins & apps saved, but it is overridden: your main config.toml still sets `features.connectors`; remove it there, since /settings only writes the selected profile",
+            SaveOutcome::Failed,
+        )
+    );
+}
+
+#[test]
+fn unchecked_save_is_not_reported_as_a_plain_success() {
+    let (notice, outcome) = save_notice(
+        SettingsSwitch::Skills,
+        /*enabled*/ false,
+        SwitchState::Off,
+        SwitchState::Off,
+        SaveCheck {
+            overridden: None,
+            unverified: Some("config/read failed in TUI".to_string()),
+            winner: None,
+        },
+    );
+
+    assert_eq!(
+        (notice.as_str(), outcome),
+        (
+            "Skills saved, but /settings could not check what new sessions will get: config/read failed in TUI",
+            SaveOutcome::Failed,
+        )
     );
 }

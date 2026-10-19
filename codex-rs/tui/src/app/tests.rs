@@ -3904,6 +3904,85 @@ async fn save_settings_switch_writes_explicit_values_and_updates_live_state() ->
 }
 
 #[tokio::test]
+async fn save_settings_switch_under_a_profile_writes_the_profile_and_names_the_main_config_alias()
+-> Result<()> {
+    let (mut app, mut app_event_rx, _op_rx) = make_test_app_with_channels().await;
+    let codex_home = tempdir()?;
+    app.config.codex_home = codex_home.path().to_path_buf().abs();
+    // The legacy alias lives in the main config.toml, which /settings does not write under a
+    // profile.
+    std::fs::write(
+        codex_home.path().join("config.toml"),
+        "[features]\nconnectors = true\n",
+    )?;
+    let profile_config = codex_home.path().join("work.config.toml");
+    std::fs::write(&profile_config, "")?;
+    app.loader_overrides = LoaderOverrides {
+        user_config_path: Some(profile_config.abs()),
+        user_config_profile: Some("work".parse()?),
+        ..LoaderOverrides::without_managed_config_for_tests()
+    };
+    let mut target = crate::AppServerTarget::Embedded;
+    let mut state_db = crate::init_state_db_for_app_server_target(&app.config, &target).await?;
+    let client = Box::pin(crate::start_app_server(
+        &mut target,
+        codex_arg0::Arg0DispatchPaths::default(),
+        app.config.clone(),
+        Vec::new(),
+        app.loader_overrides.clone(),
+        /*strict_config*/ false,
+        CloudConfigBundleLoader::default(),
+        codex_feedback::CodexFeedback::new(),
+        /*log_db*/ None,
+        &mut state_db,
+        Arc::new(EnvironmentManager::default_for_tests()),
+        Default::default(),
+    ))
+    .await?;
+    let mut app_server = AppServerSession::new(
+        crate::backend_id::BackendId::new(),
+        client,
+        target.thread_params_mode(),
+    )
+    .with_local_codex_home(&app.config.codex_home);
+    while app_event_rx.try_recv().is_ok() {}
+
+    app.save_settings_switch(
+        &mut app_server,
+        crate::settings_panel::SettingsSwitch::PluginsAndApps,
+        /*enabled*/ false,
+    )
+    .await;
+
+    let profile: toml::Value = toml::from_str(&std::fs::read_to_string(&profile_config)?)?;
+    assert_eq!(profile["features"]["plugins"].as_bool(), Some(false));
+    assert_eq!(profile["features"]["apps"].as_bool(), Some(false));
+    assert_eq!(
+        std::fs::read_to_string(codex_home.path().join("config.toml"))?,
+        "[features]\nconnectors = true\n"
+    );
+    // New sessions still get apps from the alias, so the panel keeps showing them on.
+    assert!(app.config.features.enabled(Feature::Apps));
+    assert!(!app.config.features.enabled(Feature::Plugins));
+    let notices = std::iter::from_fn(|| app_event_rx.try_recv().ok())
+        .filter_map(|event| match event {
+            AppEvent::InsertHistoryCell(cell) => {
+                Some(lines_to_single_string(&cell.display_lines(/*width*/ 400)))
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        notices.iter().any(|notice| notice.contains(
+            "Plugins & apps saved, but it is overridden: your main config.toml still sets `features.connectors`"
+        )),
+        "{notices:?}"
+    );
+    app_server.shutdown().await?;
+    Ok(())
+}
+
+#[tokio::test]
 async fn update_feature_flags_disabling_guardian_clears_review_policy_and_restores_default()
 -> Result<()> {
     let (mut app, mut app_event_rx, mut op_rx) = make_test_app_with_channels().await;

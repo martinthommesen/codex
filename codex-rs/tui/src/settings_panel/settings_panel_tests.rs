@@ -405,6 +405,36 @@ async fn web_search_turns_on_with_a_mode_requirements_allow() {
 }
 
 #[tokio::test]
+async fn web_search_turns_back_on_with_the_users_own_mode() {
+    let (codex_home, mut config) = test_config().await;
+    let user_config_path = codex_utils_absolute_path::AbsolutePathBuf::from_absolute_path(
+        codex_home.path().join("config.toml"),
+    )
+    .expect("absolute path");
+    config.config_layer_stack = config
+        .config_layer_stack
+        .with_user_config(
+            &user_config_path,
+            toml::from_str("web_search = \"live\"").expect("valid toml"),
+        )
+        .expect("user layer");
+    // Another layer turned search off; turning it on keeps the user's live choice.
+    config
+        .web_search_mode
+        .set(WebSearchMode::Disabled)
+        .expect("disabled is allowed");
+
+    assert_eq!(
+        SettingsSwitch::WebSearch
+            .edits(/*enabled*/ true, &config)
+            .into_iter()
+            .map(|edit| (edit.key_path, edit.value))
+            .collect::<Vec<_>>(),
+        vec![("web_search".to_string(), json!("live"))]
+    );
+}
+
+#[tokio::test]
 async fn subagents_switch_also_turns_off_multi_agent_v2() {
     let (_codex_home, mut config) = test_config().await;
     config
