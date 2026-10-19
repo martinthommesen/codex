@@ -473,11 +473,12 @@ fn resolve_remote_save(
         .into_iter()
         .map(str::to_string)
         .collect::<Vec<_>>();
-    let server_override_stands = !(!replaced_keys(&HashSet::new()).is_empty()
-        && matches!(
+    // The server's own flags do not reach new threads, so an override they cause does not stand.
+    let server_override_stands = replaced_keys(&HashSet::new()).is_empty()
+        || !matches!(
             server_override,
             Some(codex_app_server_protocol::ConfigLayerSource::SessionFlags)
-        ));
+        );
     let requirements_disallow = launch
         .web_search_modes
         .is_some_and(|modes| constrain_web_search(effective_config, modes.as_deref()));
