@@ -50,6 +50,77 @@ async fn provider_requirements_resolve_bedrock_overrides(provider_id: &str) -> R
     Ok(())
 }
 
+#[tokio::test]
+async fn provider_requirements_resolve_claude_oauth_retry_overrides() -> Result<()> {
+    let home = tempdir()?;
+    let requirements =
+        "model_provider = 'claude-oauth'\n[model_providers.claude-oauth]\nrequest_max_retries = 2";
+    let manager = ConfigManager::new_for_tests(
+        home.path().to_path_buf(),
+        Vec::new(),
+        LoaderOverrides::without_managed_config_for_tests(),
+        CloudConfigBundleFixture::loader_with_enterprise_requirement(requirements),
+    );
+    let current = manager.load_latest_config(None).await?;
+    assert!(current.model_provider.is_claude_oauth());
+    assert_eq!(current.model_provider.request_max_retries, Some(2));
+    manager.check_thread_model_provider(&current).await?;
+    let changed = ConfigManager::new_for_tests(
+        home.path().to_path_buf(),
+        Vec::new(),
+        LoaderOverrides::without_managed_config_for_tests(),
+        CloudConfigBundleFixture::loader_with_enterprise_requirement(
+            requirements.replace("= 2", "= 3"),
+        ),
+    );
+    assert_eq!(
+        changed
+            .check_thread_model_provider(&current)
+            .await
+            .expect_err("changed managed retry policy")
+            .kind(),
+        std::io::ErrorKind::PermissionDenied
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn provider_requirements_resolve_anthropic_partial_overrides() -> Result<()> {
+    let home = tempdir()?;
+    let requirements = "model_provider = 'anthropic'\n[model_providers.anthropic]\nbase_url = 'https://gw.example/v1'";
+    let manager = ConfigManager::new_for_tests(
+        home.path().to_path_buf(),
+        Vec::new(),
+        LoaderOverrides::without_managed_config_for_tests(),
+        CloudConfigBundleFixture::loader_with_enterprise_requirement(requirements),
+    );
+    let current = manager.load_latest_config(None).await?;
+    assert!(current.model_provider.is_anthropic());
+    assert_eq!(
+        current.model_provider.base_url.as_deref(),
+        Some("https://gw.example/v1")
+    );
+    // The merged built-in must compare equal to the merged requirement, not the raw entry.
+    manager.check_thread_model_provider(&current).await?;
+    let changed = ConfigManager::new_for_tests(
+        home.path().to_path_buf(),
+        Vec::new(),
+        LoaderOverrides::without_managed_config_for_tests(),
+        CloudConfigBundleFixture::loader_with_enterprise_requirement(
+            requirements.replace("gw.example", "other.example"),
+        ),
+    );
+    assert_eq!(
+        changed
+            .check_thread_model_provider(&current)
+            .await
+            .expect_err("changed managed endpoint")
+            .kind(),
+        std::io::ErrorKind::PermissionDenied
+    );
+    Ok(())
+}
+
 struct UnavailableThreadConfig;
 
 impl ThreadConfigLoader for UnavailableThreadConfig {

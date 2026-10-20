@@ -102,12 +102,14 @@ async fn handle_spawn_agent(
             version: SpawnConfigVersion::V1,
             full_history_fork: args.fork_context,
             role_name,
+            model_provider: args.model_provider.as_deref(),
             model: args.model.as_deref(),
             reasoning_effort: args.reasoning_effort.clone(),
         },
     )
     .await
     .map_err(FunctionCallError::RespondToModel)?;
+    let mark_plaintext_tree = prepared.mark_plaintext_tree;
     let config = prepared.config;
     let fork_mode = args.fork_context.then_some(SpawnAgentForkMode::FullHistory);
     let result = session
@@ -150,6 +152,13 @@ async fn handle_spawn_agent(
             );
             collab_spawn_error(err)
         });
+    if mark_plaintext_tree && result.is_ok() {
+        // Only a started child makes the tree mixed; see `thread_spawn::spawn`.
+        session
+            .services
+            .local_agent_runtime
+            .mark_plaintext_collaboration_messages();
+    }
     let (new_thread_id, status) = match &result {
         Ok((spawned_agent, _)) => (Some(spawned_agent.thread_id), spawned_agent.status.clone()),
         Err(_) => (None, AgentStatus::NotFound),
@@ -221,6 +230,7 @@ struct SpawnAgentArgs {
     message: Option<String>,
     items: Option<Vec<UserInput>>,
     agent_type: Option<String>,
+    model_provider: Option<String>,
     model: Option<String>,
     reasoning_effort: Option<ReasoningEffort>,
     #[serde(default)]

@@ -19,8 +19,12 @@ use tracing::warn;
 
 /// Starts the asynchronous startup memory pipeline for an eligible root session.
 ///
-/// The pipeline is skipped for ephemeral sessions, disabled feature flags, and
-/// subagent sessions.
+/// The pipeline is skipped for ephemeral sessions, disabled feature flags,
+/// subagent sessions, and Claude Code and Claude OAuth sessions. Claude Code would
+/// run its CLI in the background on the user's Claude plan, cannot return the
+/// strict JSON stage one needs, and keeps per-thread state that the live session
+/// also uses. Claude OAuth would likewise spend the user's Claude subscription on
+/// background jobs.
 pub fn start_memories_startup_task(
     thread_manager: Arc<ThreadManager>,
     auth_manager: Arc<AuthManager>,
@@ -33,6 +37,8 @@ pub fn start_memories_startup_task(
     if config.ephemeral
         || !config.features.enabled(Feature::MemoryTool)
         || source.is_non_root_agent()
+        || config.model_provider.is_claude_code()
+        || config.model_provider.is_claude_oauth()
     {
         return;
     }

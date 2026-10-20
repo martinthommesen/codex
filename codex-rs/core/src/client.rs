@@ -26,6 +26,7 @@
 //! fails, normal stream retry/fallback logic handles recovery on the same turn.
 
 use std::collections::HashMap;
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
 use std::sync::OnceLock;
@@ -34,6 +35,13 @@ use std::sync::atomic::Ordering;
 
 #[path = "client_tool_metadata.rs"]
 mod tool_metadata;
+
+#[path = "client_anthropic.rs"]
+mod anthropic_messages;
+
+#[path = "client_claude_code.rs"]
+mod claude_code;
+pub(crate) use claude_code::ClaudeCodeContext;
 
 use crate::CodexResponsesHeaders;
 use crate::tools::ExecutedToolCalls;
@@ -221,6 +229,15 @@ struct ModelClientState {
     cached_websocket_session: StdMutex<WebsocketSession>,
     /// Last full tool list used for sampling, retained across turns and connection resets.
     last_inference_tools: StdMutex<Option<Arc<[ToolSpec]>>>,
+    /// Warnings about unsupported settings already shown for Claude providers.
+    claude_warnings_emitted: anthropic_messages::ClaudeWarningsEmitted,
+    /// Set once Anthropic rejected replayed thinking; later requests in this session omit
+    /// replayed thinking and `block_binding`.
+    claude_strip_thinking: AtomicBool,
+    /// Successfully completed OAuth responses for this account and Codex conversation only.
+    claude_oauth_continuity: anthropic_messages::ClaudeOAuthContinuityState,
+    /// Claude Code CLI process bridge, created on first use by the `claude-code` provider.
+    claude_code_session: OnceLock<Arc<codex_claude_code::ClaudeCodeSession>>,
 }
 
 enum ClientRouting {
@@ -277,6 +294,7 @@ pub struct ModelClient {
     executed_tool_calls: Option<ExecutedToolCalls>,
     // Resolved once when the session is created, like other session feature flags.
     api_key_cyber_access_programs: cyber_access_program::ApiKeyCyberAccessPrograms,
+    claude_code_context: Option<Arc<ClaudeCodeContext>>,
 }
 
 /// A turn-scoped streaming session created from a [`ModelClient`].
@@ -599,6 +617,10 @@ impl ModelClient {
                 agent_identity_session_fallback: AgentIdentitySessionFallback::default(),
                 cached_websocket_session: StdMutex::new(WebsocketSession::default()),
                 last_inference_tools: StdMutex::new(None),
+                claude_warnings_emitted: StdMutex::new(HashSet::new()),
+                claude_strip_thinking: AtomicBool::new(false),
+                claude_oauth_continuity: anthropic_messages::ClaudeOAuthContinuityState::default(),
+                claude_code_session: OnceLock::new(),
             }),
             agent_identity_policy,
             prompt_cache_key_override: None,
@@ -610,6 +632,7 @@ impl ModelClient {
             executed_tool_calls: None,
             api_key_cyber_access_programs:
                 cyber_access_program::ApiKeyCyberAccessPrograms::UnsupportedProvider,
+            claude_code_context: None,
         }
     }
 
@@ -964,6 +987,9 @@ impl ModelClient {
         include_internal: bool,
     ) -> Result<ResponsesApiRequest> {
         let mut input = prompt.get_formatted_input_for_request(model_info);
+        // Claude thinking signatures are only meaningful to Anthropic; replaying them to a
+        // Responses provider would fail to decrypt, so they are dropped from the request copy.
+        input.retain(|item| !codex_api::anthropic::is_anthropic_reasoning_item(item));
         if !self.reasoning_effort_override_enabled(model_info) {
             // Unsupported models and disabled overrides must also accept saved history.
             // Filter only the request copy; persisted history remains unchanged.
@@ -1286,6 +1312,11 @@ impl ModelClient {
     }
 
     pub(crate) async fn prewarm_auth(&self) -> Result<()> {
+        // Claude Code turns run through its CLI (`stream_claude_code`), with no HTTP endpoint or
+        // Codex-held credential to resolve.
+        if self.state.provider.info().is_claude_code() {
+            return Ok(());
+        }
         self.current_client_setup(ClientRouting::Workspace)
             .await
             .map(|_| ())
@@ -2413,6 +2444,32 @@ impl ModelClientSession {
                         inference_trace,
                     )
                     .await
+            }
+            WireApi::AnthropicMessages | WireApi::ClaudeOAuth => {
+                self.stream_anthropic_messages(
+                    prompt,
+                    model_info,
+                    session_telemetry,
+                    effort,
+                    summary,
+                    service_tier,
+                    responses_metadata,
+                    inference_trace,
+                )
+                .await
+            }
+            WireApi::ClaudeCode => {
+                self.stream_claude_code(
+                    prompt,
+                    model_info,
+                    session_telemetry,
+                    effort,
+                    summary,
+                    service_tier,
+                    responses_metadata,
+                    inference_trace,
+                )
+                .await
             }
         }
     }

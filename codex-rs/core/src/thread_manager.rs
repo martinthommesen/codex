@@ -24,6 +24,7 @@ use crate::current_time::TimeProvider;
 use crate::environment_selection::TurnEnvironmentSnapshot;
 use crate::environment_selection::default_thread_environment_requests;
 use crate::mcp::McpManager;
+use crate::provider_models::ProviderModelsRegistry;
 use crate::rollout::truncation;
 use crate::session::ForkPersistence;
 use crate::session::GitEnrichmentPolicy;
@@ -429,6 +430,8 @@ pub(crate) struct ThreadManagerState {
     agent_control_factory: Option<AgentControlFactory>,
     auth_manager: Arc<AuthManager>,
     models_manager: SharedModelsManager,
+    /// Model catalogs for every provider used by threads of this manager.
+    pub(crate) provider_models: Arc<ProviderModelsRegistry>,
     git_root_discovery: Arc<GitRootDiscovery>,
     environment_manager: Arc<EnvironmentManager>,
     starting_mcp_runtimes: std::sync::Mutex<Vec<std::sync::Weak<AtomicBool>>>,
@@ -586,6 +589,11 @@ impl ThreadManager {
             } else {
                 Arc::new(DisabledCodeModeSessionProvider)
             };
+        let provider_models = Arc::new(ProviderModelsRegistry::new(
+            config.model_provider_id.clone(),
+            Arc::clone(&models_manager),
+            Some(Arc::clone(&auth_manager)),
+        ));
         Self {
             state: Arc::new(ThreadManagerState {
                 threads: Arc::new(RwLock::new(HashMap::new())),
@@ -594,6 +602,7 @@ impl ThreadManager {
                 thread_id_generator: default_thread_id_generator(),
                 agent_control_factory: None,
                 models_manager,
+                provider_models,
                 git_root_discovery: Arc::default(),
                 environment_manager,
                 starting_mcp_runtimes: std::sync::Mutex::new(Vec::new()),
@@ -774,6 +783,8 @@ impl ThreadManager {
             state_db.clone(),
         ));
         let agent_graph_store = local_agent_graph_store_from_state_db(state_db.as_ref());
+        let test_models_manager = create_model_provider(provider, Some(auth_manager.clone()))
+            .models_manager(codex_home, /*config_model_catalog*/ None);
         Self {
             state: Arc::new(ThreadManagerState {
                 threads: Arc::new(RwLock::new(HashMap::new())),
@@ -781,8 +792,8 @@ impl ThreadManager {
                 thread_created_tx,
                 thread_id_generator: default_thread_id_generator(),
                 agent_control_factory: None,
-                models_manager: create_model_provider(provider, Some(auth_manager.clone()))
-                    .models_manager(codex_home, /*config_model_catalog*/ None),
+                models_manager: Arc::clone(&test_models_manager),
+                provider_models: Arc::new(ProviderModelsRegistry::single(test_models_manager)),
                 git_root_discovery: Arc::default(),
                 environment_manager,
                 starting_mcp_runtimes: std::sync::Mutex::new(Vec::new()),
@@ -2335,6 +2346,8 @@ impl ThreadManagerState {
         };
         let attachment_source =
             forked_from_thread_id.filter(|_| matches!(&initial_history, InitialHistory::Forked(_)));
+        // Each thread resolves model metadata through its own provider's catalog.
+        let models_manager = self.provider_models.for_config(&config);
         let spawn_result = Session::spawn(SessionSpawnArgs {
             startup,
             config,
@@ -2342,7 +2355,7 @@ impl ThreadManagerState {
             instructions,
             installation_id: self.installation_id.clone(),
             auth_manager,
-            models_manager: Arc::clone(&self.models_manager),
+            models_manager,
             git_root_discovery: Arc::clone(&self.git_root_discovery),
             environment_manager: Arc::clone(&self.environment_manager),
             skills_service: Arc::clone(&self.skills_service),

@@ -107,8 +107,11 @@ impl TurnCostWorker {
             config.otel.metrics_exporter,
             OtelExporterKind::OtlpHttp { .. } | OtelExporterKind::OtlpGrpc { .. }
         );
+        // Turn costs come from OpenAI-compatible endpoints; Claude providers have none, and
+        // probing would retry forever (claude-code) or resend the Anthropic key every poll.
         if !(has_otel_log_exporter || has_otel_metrics_exporter)
             || config.model_provider.is_amazon_bedrock()
+            || config.model_provider.wire_api.is_claude()
         {
             return None;
         }

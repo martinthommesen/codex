@@ -6,7 +6,7 @@ pub(crate) mod realtime_websocket;
 pub(crate) mod responses;
 pub(crate) mod responses_websocket;
 pub(crate) mod search;
-mod session;
+pub(crate) mod session;
 
 pub use images::ImageRequestError;
 pub use images::ImagesClient;

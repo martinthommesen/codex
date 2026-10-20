@@ -28,6 +28,12 @@ impl From<AuthError> for TransportError {
 /// Header-only providers can implement `add_auth_headers`; providers that sign
 /// complete requests can override `apply_auth`.
 pub trait AuthProvider: Send + Sync {
+    /// Non-secret account/device identity for the explicitly selected experimental Claude
+    /// OAuth transport. Other providers never supply or inherit this identity.
+    fn claude_oauth_identity(&self) -> Option<ClaudeOAuthIdentity> {
+        None
+    }
+
     /// Adds any auth headers that are available without request body access.
     ///
     /// Implementations should be cheap and non-blocking. This method is also
@@ -78,6 +84,12 @@ pub type AuthHeadersFuture<'a> =
 
 /// Shared auth handle passed through API clients.
 pub type SharedAuthProvider = Arc<dyn AuthProvider>;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ClaudeOAuthIdentity {
+    pub account_uuid: String,
+    pub device_id: String,
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AgentIdentityTelemetry {

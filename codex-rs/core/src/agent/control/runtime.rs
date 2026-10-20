@@ -25,6 +25,8 @@ use std::sync::Mutex;
 use std::sync::OnceLock;
 use std::sync::PoisonError;
 use std::sync::Weak;
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::Ordering;
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
 use tokio_util::task::task_tracker::TaskTrackerToken;
@@ -193,6 +195,9 @@ pub(crate) struct LocalAgentRuntime {
     pub(super) rollout_budget: Arc<RolloutBudget>,
     /// The user-selected root routing tier, shared by the entire agent tree.
     pub(super) root_service_tier: Arc<ArcSwapOption<String>>,
+    /// Set once the tree includes a Claude agent or agents on different providers; every agent
+    /// then sends plaintext collaboration messages for the rest of the tree's life.
+    plaintext_collaboration_messages: Arc<AtomicBool>,
     /// Retains the root's opt-in instruction provider even when the root is unloaded.
     pub(super) shared_thread_instructions_provider:
         Arc<OnceLock<Arc<dyn ThreadInstructionsProvider>>>,
@@ -221,12 +226,25 @@ impl LocalAgentRuntime {
             agent_execution_limiter: Arc::default(),
             rollout_budget: Arc::default(),
             root_service_tier: Arc::new(ArcSwapOption::from(None)),
+            plaintext_collaboration_messages: Arc::default(),
             shared_thread_instructions_provider: Arc::default(),
         };
         if let Some(rollout_budget) = rollout_budget {
             runtime.rollout_budget.configure(rollout_budget);
         }
         runtime
+    }
+
+    /// Makes every agent in this tree send plaintext collaboration messages from now on.
+    pub(crate) fn mark_plaintext_collaboration_messages(&self) {
+        self.plaintext_collaboration_messages
+            .store(true, Ordering::Relaxed);
+    }
+
+    /// Whether this tree has ever included a Claude agent or agents on different providers.
+    pub(crate) fn plaintext_collaboration_messages(&self) -> bool {
+        self.plaintext_collaboration_messages
+            .load(Ordering::Relaxed)
     }
 
     /// Bind local startup to the same tree state with this session's identity.

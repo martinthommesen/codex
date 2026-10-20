@@ -41,6 +41,15 @@ const _: Option<&dyn AgentControl> = None;
 pub trait AgentControl: Send + Sync {
     fn identity(&self) -> SessionId;
 
+    /// Returns the model catalog for the provider selected by `config`, when this backend
+    /// shares per-provider catalogs across the agent tree.
+    fn models_manager_for_config(
+        &self,
+        _config: &crate::config::Config,
+    ) -> Option<codex_models_manager::manager::SharedModelsManager> {
+        None
+    }
+
     /// Resolve an ID or a name relative to the caller's captured source, without loading.
     /// The local backend lazily registers callers with no parent before resolving, including
     /// for direct IDs. Keeping resolution separate preserves tool error and analytics ordering.

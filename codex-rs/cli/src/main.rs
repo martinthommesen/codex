@@ -10,8 +10,12 @@ use codex_arg0::Arg0DispatchPaths;
 use codex_arg0::arg0_dispatch_or_else;
 use codex_chatgpt::apply_command::ApplyCommand;
 use codex_chatgpt::apply_command::run_apply_command;
+use codex_cli::LoginProvider;
 use codex_cli::read_access_token_from_stdin;
 use codex_cli::read_api_key_from_stdin;
+use codex_cli::run_login_anthropic;
+use codex_cli::run_login_claude_code;
+use codex_cli::run_login_claude_oauth;
 use codex_cli::run_login_status;
 use codex_cli::run_login_with_access_token;
 use codex_cli::run_login_with_api_key;
@@ -52,6 +56,9 @@ static ALLOCATOR: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
 #[cfg(any(target_os = "macos", target_os = "windows"))]
 mod app_cmd;
+#[cfg(test)]
+#[path = "claude_oauth_args_tests.rs"]
+mod claude_oauth_args_tests;
 mod cloud_config;
 mod daemon_install;
 mod daemon_telemetry;
@@ -518,6 +525,13 @@ struct LoginCommand {
     #[clap(skip)]
     config_overrides: CliConfigOverrides,
 
+    /// Provider to sign in to. `anthropic` stores an Anthropic API key read from stdin
+    /// (with --with-api-key); `claude-code` connects the official Claude Code CLI and its own
+    /// sign-in; `claude-oauth` explicitly opts into experimental native subscription OAuth.
+    /// Each provider's credentials are stored separately from the others.
+    #[arg(long = "provider", value_enum, global = true)]
+    provider: Option<LoginProvider>,
+
     #[arg(
         long = "with-api-key",
         help = "Read the API key from stdin (e.g. `printenv OPENAI_API_KEY | codex login --with-api-key`)"
@@ -559,6 +573,11 @@ struct LoginCommand {
 #[derive(Debug, clap::Subcommand)]
 enum LoginSubcommand {
     /// Show login status.
+    ///
+    /// Exit status: without --provider (or with `openai`), 0 only when the OpenAI login is
+    /// usable; connected Claude providers are listed but do not affect it. With `anthropic`,
+    /// `claude-code` or `claude-oauth`, 0 when that provider is usable. With `all`, 0 when at
+    /// least one provider is usable. Otherwise 1.
     Status,
 }
 
@@ -566,6 +585,11 @@ enum LoginSubcommand {
 struct LogoutCommand {
     #[clap(skip)]
     config_overrides: CliConfigOverrides,
+
+    /// Provider to sign out of (default: openai). Signing out of one provider never affects
+    /// another; `all` attempts every provider and exits non-zero if any of them fails.
+    #[arg(long = "provider", value_enum)]
+    provider: Option<LoginProvider>,
 }
 
 #[derive(Debug, Parser)]
@@ -1619,11 +1643,40 @@ async fn cli_main(
                 &mut login_cli.config_overrides,
                 root_config_overrides.clone(),
             );
-            match login_cli.action {
-                Some(LoginSubcommand::Status) => {
-                    run_login_status(login_cli.config_overrides).await;
+            match (login_cli.action, login_cli.provider) {
+                (Some(LoginSubcommand::Status), provider) => {
+                    run_login_status(login_cli.config_overrides, provider).await;
                 }
-                None => {
+                (None, Some(LoginProvider::All)) => {
+                    eprintln!(
+                        "`--provider all` is supported by `codex login status` and `codex logout`."
+                    );
+                    std::process::exit(1);
+                }
+                (None, Some(LoginProvider::Anthropic)) => {
+                    run_login_anthropic(login_cli.config_overrides, login_cli.with_api_key).await;
+                }
+                (None, Some(LoginProvider::ClaudeCode)) => {
+                    run_login_claude_code(login_cli.config_overrides).await;
+                }
+                (None, Some(LoginProvider::ClaudeOauth)) => {
+                    if login_cli.with_api_key
+                        || login_cli.with_access_token
+                        || login_cli.api_key.is_some()
+                        || login_cli.use_device_code
+                        || login_cli.issuer_base_url.is_some()
+                        || login_cli.client_id.is_some()
+                    {
+                        eprintln!(
+                            "claude-oauth requires its own interactive authorization flow. API keys, \
+access-token import, device auth, and custom OAuth endpoints/client IDs are unsupported. \
+Run `codex login --provider claude-oauth`."
+                        );
+                        std::process::exit(1);
+                    }
+                    run_login_claude_oauth(login_cli.config_overrides).await;
+                }
+                (None, Some(LoginProvider::Openai) | None) => {
                     if login_cli.with_api_key && login_cli.with_access_token {
                         eprintln!(
                             "Choose one login credential source: --with-api-key or --with-access-token."
@@ -1663,7 +1716,7 @@ async fn cli_main(
                 &mut logout_cli.config_overrides,
                 root_config_overrides.clone(),
             );
-            run_logout(logout_cli.config_overrides).await;
+            run_logout(logout_cli.config_overrides, logout_cli.provider).await;
         }
         Some(Subcommand::Completion(completion_cli)) => {
             reject_remote_mode_for_subcommand(

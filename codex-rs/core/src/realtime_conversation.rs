@@ -1352,6 +1352,15 @@ async fn prepare_realtime_start(
     params: ConversationStartParams,
 ) -> CodexResult<PreparedRealtimeConversationStart> {
     let provider = sess.provider().await;
+    // Realtime speaks OpenAI's protocol with OpenAI credentials; on a Claude provider it would send
+    // them to the Claude endpoint.
+    if provider.wire_api.is_claude() {
+        return Err(CodexErr::InvalidRequest(
+            "realtime conversations are not available with Claude providers; switch to an OpenAI \
+provider to use them"
+                .to_string(),
+        ));
+    }
     let auth_manager = sess
         .services
         .model_client

@@ -20,6 +20,7 @@ use crate::session::turn_context::TurnContext;
 use crate::session_prefix::format_inter_agent_completion_message;
 use crate::thread_manager::thread_store_from_config;
 use crate::tools::context::ToolOutput;
+use crate::tools::handlers::multi_agents_spec::SpawnAgentToolOptions;
 use crate::tools::handlers::multi_agents_v2::FollowupTaskHandler as FollowupTaskHandlerV2;
 use crate::tools::handlers::multi_agents_v2::InterruptAgentHandler;
 use crate::tools::handlers::multi_agents_v2::ListAgentsHandler as ListAgentsHandlerV2;
@@ -1189,7 +1190,7 @@ async fn multi_agent_v2_spawn_returns_path_and_send_message_accepts_relative_pat
         json!(r#"<agent name="/root/test_process" />"#),
     );
 
-    SendMessageHandlerV2
+    SendMessageHandlerV2::default()
         .handle(invocation(
             session.clone(),
             turn.clone(),
@@ -1346,7 +1347,7 @@ async fn multi_agent_v2_send_message_accepts_root_target_from_child() {
         agent_role: None,
     });
 
-    SendMessageHandlerV2
+    SendMessageHandlerV2::default()
         .handle(invocation(
             Arc::new(session),
             Arc::new(turn),
@@ -1423,7 +1424,7 @@ async fn multi_agent_v2_followup_task_rejects_root_target_from_child() {
         agent_role: None,
     });
 
-    let Err(err) = FollowupTaskHandlerV2
+    let Err(err) = FollowupTaskHandlerV2::default()
         .handle(invocation(
             Arc::new(session),
             Arc::new(turn),
@@ -1809,7 +1810,7 @@ async fn multi_agent_v2_send_message_rejects_legacy_items_field() {
         })),
     );
 
-    let Err(err) = SendMessageHandlerV2.handle(invocation).await else {
+    let Err(err) = SendMessageHandlerV2::default().handle(invocation).await else {
         panic!("legacy items field should be rejected in v2");
     };
     let FunctionCallError::RespondToModel(message) = err else {
@@ -1864,7 +1865,7 @@ async fn multi_agent_v2_send_message_rejects_interrupt_parameter() {
         })),
     );
 
-    let Err(err) = SendMessageHandlerV2.handle(invocation).await else {
+    let Err(err) = SendMessageHandlerV2::default().handle(invocation).await else {
         panic!("send_message interrupt parameter should be rejected");
     };
     let FunctionCallError::RespondToModel(message) = err else {
@@ -1953,7 +1954,7 @@ async fn multi_agent_v2_followup_task_completion_notifies_parent_on_every_turn()
         )
         .await;
 
-    FollowupTaskHandlerV2
+    FollowupTaskHandlerV2::default()
         .handle(invocation(
             session,
             turn,
@@ -2094,7 +2095,7 @@ async fn multi_agent_v2_followup_task_rejects_legacy_items_field() {
         })),
     );
 
-    let Err(err) = FollowupTaskHandlerV2.handle(invocation).await else {
+    let Err(err) = FollowupTaskHandlerV2::default().handle(invocation).await else {
         panic!("legacy items field should be rejected in v2");
     };
     let FunctionCallError::RespondToModel(message) = err else {
@@ -2254,6 +2255,193 @@ async fn multi_agent_v2_spawn_surfaces_task_name_validation_errors() {
         err,
         FunctionCallError::RespondToModel(
             "agent_name must use only lowercase letters, digits, and underscores".to_string()
+        )
+    );
+}
+
+/// A root session on the default OpenAI provider with MultiAgentV2 enabled. Keep the returned
+/// manager alive for as long as the session spawns agents.
+async fn multi_agent_v2_root_session() -> (
+    ThreadManager,
+    Arc<crate::session::session::Session>,
+    Arc<TurnContext>,
+) {
+    let (mut session, mut turn) = make_session_and_context().await;
+    let manager = thread_manager();
+    let root = manager
+        .start_thread(StartThreadOptions::new((*turn.config).clone()))
+        .await
+        .expect("root thread should start");
+    set_agent_control(&mut session, manager.agent_control());
+    session.thread_id = root.thread_id;
+    let mut config = (*turn.config).clone();
+    config
+        .features
+        .enable(Feature::MultiAgentV2)
+        .expect("test config should allow feature update");
+    set_turn_config(&mut turn, config);
+    (manager, Arc::new(session), Arc::new(turn))
+}
+
+fn plaintext_spawn_handler() -> SpawnAgentHandlerV2 {
+    SpawnAgentHandlerV2::new(
+        SpawnAgentToolOptions {
+            plaintext_messages: true,
+            ..Default::default()
+        },
+        /*description_override*/ None,
+    )
+}
+
+#[tokio::test]
+async fn multi_agent_v2_spawn_on_another_provider_asks_for_a_plaintext_task() {
+    // A padded id names the same provider, so it must reach the same resend guard.
+    for model_provider in ["ollama", " ollama "] {
+        let (_manager, session, turn) = multi_agent_v2_root_session().await;
+        let invocation = invocation(
+            Arc::clone(&session),
+            turn,
+            "spawn_agent",
+            function_payload(json!({
+                "message": "inspect this repo",
+                "task_name": "worker",
+                "model_provider": model_provider,
+                "fork_turns": "none"
+            })),
+        );
+        let Err(err) = SpawnAgentHandlerV2::default().handle(invocation).await else {
+            panic!("an encrypted task for `{model_provider}` should be sent again in plaintext");
+        };
+        assert_eq!(
+            err,
+            FunctionCallError::RespondToModel(
+                "model_provider `ollama` needs a plaintext message. Call spawn_agent again with \
+the same arguments."
+                    .to_string()
+            )
+        );
+        assert!(
+            session
+                .services
+                .local_agent_runtime
+                .plaintext_collaboration_messages()
+        );
+    }
+}
+
+#[tokio::test]
+async fn multi_agent_v2_spawn_on_disconnected_provider_keeps_tree_encrypted() {
+    let (_manager, session, turn) = multi_agent_v2_root_session().await;
+    let invocation = invocation(
+        Arc::clone(&session),
+        turn,
+        "spawn_agent",
+        function_payload(json!({
+            "message": "inspect this repo",
+            "task_name": "worker",
+            "model_provider": "claude-code",
+            "fork_turns": "none"
+        })),
+    );
+    let Err(FunctionCallError::RespondToModel(message)) =
+        SpawnAgentHandlerV2::default().handle(invocation).await
+    else {
+        panic!("a disconnected provider should be rejected");
+    };
+    assert!(
+        message.contains("model_provider `claude-code` is not connected"),
+        "{message}"
+    );
+    assert!(
+        !session
+            .services
+            .local_agent_runtime
+            .plaintext_collaboration_messages()
+    );
+}
+
+#[tokio::test]
+async fn failed_multi_agent_v2_spawn_on_another_provider_keeps_tree_encrypted() {
+    // The first call carries an encrypted task, the resend a plaintext one; neither may switch
+    // the tree when the spawn fails its other checks.
+    for (handler, encoding) in [
+        (SpawnAgentHandlerV2::default(), "encrypted"),
+        (plaintext_spawn_handler(), "plaintext"),
+    ] {
+        for (args, expected) in [
+            (
+                json!({ "task_name": "BadName" }),
+                "agent_name must use only lowercase letters, digits, and underscores",
+            ),
+            (
+                json!({ "task_name": "worker", "agent_type": "missing_role" }),
+                "unknown agent_type 'missing_role'",
+            ),
+        ] {
+            let (_manager, session, turn) = multi_agent_v2_root_session().await;
+            let mut arguments = json!({
+                "message": "inspect this repo",
+                "model_provider": "ollama",
+                "fork_turns": "none"
+            });
+            arguments
+                .as_object_mut()
+                .expect("arguments should be an object")
+                .extend(args.as_object().expect("args should be an object").clone());
+            let invocation = invocation(
+                Arc::clone(&session),
+                turn,
+                "spawn_agent",
+                function_payload(arguments),
+            );
+            let Err(err) = handler.handle(invocation).await else {
+                panic!("{encoding} spawn with {args} should be rejected");
+            };
+            assert_eq!(
+                err,
+                FunctionCallError::RespondToModel(expected.to_string()),
+                "{encoding} spawn with {args}"
+            );
+            assert!(
+                !session
+                    .services
+                    .local_agent_runtime
+                    .plaintext_collaboration_messages(),
+                "no agent started on another provider ({encoding} spawn with {args})"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn multi_agent_v2_spawn_on_another_provider_needs_its_model_catalog() {
+    let (mut session, mut turn) = make_session_and_context().await;
+    // Without its thread manager the agent backend cannot load another provider's catalog.
+    set_agent_control(&mut session, thread_manager().agent_control());
+    let mut config = (*turn.config).clone();
+    config
+        .features
+        .enable(Feature::MultiAgentV2)
+        .expect("test config should allow feature update");
+    set_turn_config(&mut turn, config);
+    let invocation = invocation(
+        Arc::new(session),
+        Arc::new(turn),
+        "spawn_agent",
+        function_payload(json!({
+            "message": "inspect this repo",
+            "task_name": "worker",
+            "model_provider": "ollama",
+            "fork_turns": "none"
+        })),
+    );
+    let Err(err) = plaintext_spawn_handler().handle(invocation).await else {
+        panic!("a provider without a catalog should be rejected");
+    };
+    assert_eq!(
+        err,
+        FunctionCallError::RespondToModel(
+            "spawn_agent cannot load the model catalog of model_provider `ollama`.".to_string()
         )
     );
 }

@@ -44,6 +44,7 @@ pub(super) async fn handle_message_string_tool(
     mode: MessageDeliveryMode,
     target: String,
     message: String,
+    plaintext_messages: bool,
     analytics: &mut ToolCallAnalytics,
 ) -> Result<FunctionToolOutput, FunctionCallError> {
     let message = message_content(message)?;
@@ -66,7 +67,13 @@ pub(super) async fn handle_message_string_tool(
             target: AgentTarget::Id(receiver_thread_id),
             resume_config,
             input: AgentInput::Message {
-                message: agent_message_from_tool(message, &source),
+                message: if plaintext_messages {
+                    // The schema had no encrypted marker, so the argument is plaintext no matter
+                    // how the provider echoed `encrypted_function_args`.
+                    AgentMessage::Plaintext(message)
+                } else {
+                    agent_message_from_tool(message, &source)
+                },
                 mode,
             },
             start_options: TurnStartOptions {

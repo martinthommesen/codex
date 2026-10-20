@@ -37,6 +37,16 @@ impl AgentControl for LocalAgentControl {
         self.session_id()
     }
 
+    fn models_manager_for_config(
+        &self,
+        config: &crate::config::Config,
+    ) -> Option<codex_models_manager::manager::SharedModelsManager> {
+        self.runtime
+            .manager
+            .upgrade()
+            .map(|state| state.provider_models.for_config(config))
+    }
+
     fn resolve<'a>(
         &'a self,
         caller: ThreadId,

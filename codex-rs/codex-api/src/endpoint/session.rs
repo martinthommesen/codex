@@ -45,6 +45,14 @@ impl<T: HttpTransport> EndpointSession<T> {
         &self.provider
     }
 
+    pub(crate) fn auth(&self) -> &SharedAuthProvider {
+        &self.auth
+    }
+
+    pub(crate) fn request_telemetry(&self) -> Option<Arc<dyn RequestTelemetry>> {
+        self.request_telemetry.clone()
+    }
+
     fn make_request(
         &self,
         method: &Method,
@@ -130,6 +138,29 @@ impl<T: HttpTransport> EndpointSession<T> {
     where
         C: Fn(&mut Request),
     {
+        self.stream_encoded_json_with_request_telemetry(
+            method,
+            path,
+            extra_headers,
+            body,
+            configure,
+            self.request_telemetry.clone(),
+        )
+        .await
+    }
+
+    pub(crate) async fn stream_encoded_json_with_request_telemetry<C>(
+        &self,
+        method: Method,
+        path: &str,
+        extra_headers: HeaderMap,
+        body: Option<EncodedJsonBody>,
+        configure: C,
+        request_telemetry: Option<Arc<dyn RequestTelemetry>>,
+    ) -> Result<StreamResponse, ApiError>
+    where
+        C: Fn(&mut Request),
+    {
         let body = body.map(RequestBody::EncodedJson);
         let mut request = self.make_request(&method, path, &extra_headers, body.as_ref());
         configure(&mut request);
@@ -138,7 +169,7 @@ impl<T: HttpTransport> EndpointSession<T> {
 
         let stream = run_with_request_telemetry(
             self.provider.retry.to_policy(),
-            self.request_telemetry.clone(),
+            request_telemetry,
             make_request,
             |req| {
                 let auth = self.auth.clone();
