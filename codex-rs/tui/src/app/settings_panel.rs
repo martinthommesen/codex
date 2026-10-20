@@ -1,6 +1,6 @@
 //! Persists `/settings` kill switches through the app server and mirrors saved values locally.
 
-use super::config_persistence::feature_enabled_from_effective_config;
+use super::config_persistence::features_from_effective_config;
 use super::config_persistence::overridden_write_message;
 use super::*;
 use crate::config_update::format_config_error;
@@ -78,75 +78,22 @@ impl App {
         // The server only checks user-level layers for overrides, so a trusted project, a profile,
         // this TUI's launch flags or a legacy alias in another layer can still win. Resolve what
         // new sessions will actually get.
-        let written = &response.file_path;
-        let mut winner = None;
-        let unverified = if app_server.uses_remote_workspace() {
-            // New remote sessions start where /new starts them, not in the displayed thread's cwd.
-            let cwd = app_server.remote_cwd_override().unwrap_or(Path::new("."));
-            match crate::config_update::read_effective_config_with_layers(
-                app_server.request_handle(),
-                cwd.display().to_string(),
+        let SaveResolution { winner, unverified } = self
+            .resolve_saved_settings(
+                app_server,
+                switch,
+                enabled,
+                &response.file_path,
+                remote_web_search_modes.as_ref().and_then(|modes| modes.as_deref()),
             )
             .await
-            {
-                Ok(mut effective_config) => {
-                    // The server cannot see the launch choices this TUI sends with each new thread.
-                    let launch_origins = self.config.config_layer_stack.origins();
-                    let launch = RemoteLaunch {
-                        overrides: crate::app_server_session::config_request_overrides_from_config(
-                            &self.config,
-                            app_server.thread_params_mode(),
-                        ),
-                        origins: &launch_origins,
-                        web_search_source: crate::app_server_session::forwarded_web_search_key(
-                            &self.config,
-                            app_server.thread_params_mode(),
-                        ),
-                        web_search_modes: remote_web_search_modes.as_ref(),
-                    };
-                    let resolution = resolve_remote_save(
-                        switch,
-                        enabled,
-                        &mut effective_config,
-                        &launch,
-                        written,
-                    );
-                    adopt_effective_switch_state(&mut self.config, switch, &effective_config);
-                    winner = resolution.winner;
-                    resolution.unverified
+            .unwrap_or_else(|err| {
+                tracing::warn!(error = %err, switch = label, "failed to resolve config after a settings save");
+                SaveResolution {
+                    winner: None,
+                    unverified: Some(format_config_error(&err)),
                 }
-                Err(err) => {
-                    tracing::warn!(error = %err, switch = label, "failed to read config after a settings save");
-                    Some(format_config_error(&err))
-                }
-            }
-        } else {
-            // The app server shares this machine's files, so build what /new will load.
-            let cwd = self.chat_widget.config_ref().cwd.to_path_buf();
-            match self.rebuild_config_for_cwd(cwd).await {
-                Ok(rebuilt) => {
-                    switch.adopt(&mut self.config, &rebuilt);
-                    let layers = &rebuilt.config_layer_stack;
-                    winner = switch_override_layer(
-                        switch,
-                        enabled,
-                        &serde_json::to_value(layers.effective_config()).unwrap_or_default(),
-                        layers.origins().iter().map(|(key, origin)| {
-                            (
-                                key.as_str(),
-                                origin.name.precedence(),
-                                OverrideLayer::from_config(&origin.name, written),
-                            )
-                        }),
-                    );
-                    None
-                }
-                Err(err) => {
-                    tracing::warn!(error = %err, switch = label, "failed to rebuild config after a settings save");
-                    Some(format_config_error(&err))
-                }
-            }
-        };
+            });
         if unverified.is_some() && overridden.is_none() {
             switch.adopt(&mut self.config, &next_config);
         }
@@ -163,6 +110,66 @@ impl App {
         );
         self.chat_widget.apply_settings_switch(switch, &self.config);
         self.report_settings_save(notice, outcome);
+    }
+
+    /// Resolves the values new sessions will load and adopts this switch's effective state.
+    async fn resolve_saved_settings(
+        &mut self,
+        app_server: &AppServerSession,
+        switch: SettingsSwitch,
+        enabled: bool,
+        written: &AbsolutePathBuf,
+        remote_web_search_modes: Option<&[WebSearchMode]>,
+    ) -> Result<SaveResolution> {
+        if app_server.uses_remote_workspace() {
+            // New remote sessions start where /new starts them, not in the displayed thread's cwd.
+            let cwd = app_server.remote_cwd_override().unwrap_or(Path::new("."));
+            let mut effective_config = crate::config_update::read_effective_config_with_layers(
+                app_server.request_handle(),
+                cwd.display().to_string(),
+            )
+            .await?;
+            // The server cannot see the launch choices this TUI sends with each new thread.
+            let launch_origins = self.config.config_layer_stack.origins();
+            let launch = RemoteLaunch {
+                overrides: crate::app_server_session::config_request_overrides_from_config(
+                    &self.config,
+                    app_server.thread_params_mode(),
+                ),
+                origins: &launch_origins,
+                web_search_source: crate::app_server_session::forwarded_web_search_key(
+                    &self.config,
+                    app_server.thread_params_mode(),
+                ),
+                web_search_modes: remote_web_search_modes,
+            };
+            let resolution =
+                resolve_remote_save(switch, enabled, &mut effective_config, &launch, written);
+            adopt_effective_switch_state(&mut self.config, switch, &effective_config);
+            return Ok(resolution);
+        }
+
+        // The app server shares this machine's files, so build what /new will load.
+        let cwd = self.chat_widget.config_ref().cwd.to_path_buf();
+        let rebuilt = self.rebuild_config_for_cwd(cwd).await?;
+        switch.adopt(&mut self.config, &rebuilt);
+        let layers = &rebuilt.config_layer_stack;
+        let winner = switch_override_layer(
+            switch,
+            enabled,
+            &serde_json::to_value(layers.effective_config()).unwrap_or_default(),
+            layers.origins().iter().map(|(key, origin)| {
+                (
+                    key.as_str(),
+                    origin.name.precedence(),
+                    OverrideLayer::from_config(&origin.name, written),
+                )
+            }),
+        );
+        Ok(SaveResolution {
+            winner,
+            unverified: None,
+        })
     }
 
     /// Shows the notice in the panel, or in the transcript when the panel was already closed.
@@ -364,14 +371,10 @@ async fn read_web_search_modes(
 
 /// The mode core falls back to when requirements reject the configured one.
 fn web_search_fallback(modes: &[WebSearchMode]) -> WebSearchMode {
-    [
-        WebSearchMode::Cached,
-        WebSearchMode::Indexed,
-        WebSearchMode::Live,
-    ]
-    .into_iter()
-    .find(|mode| modes.contains(mode))
-    .unwrap_or(WebSearchMode::Disabled)
+    crate::settings_panel::ENABLED_WEB_SEARCH_MODES
+        .into_iter()
+        .find(|mode| modes.contains(mode))
+        .unwrap_or(WebSearchMode::Disabled)
 }
 
 /// Mirrors how core constrains `web_search` to the modes requirements allow; disabled is always
@@ -427,12 +430,12 @@ struct RemoteLaunch<'a> {
     origins: &'a HashMap<String, codex_config::ConfigLayerMetadata>,
     /// The launch key behind a forwarded `web_search`.
     web_search_source: Option<String>,
-    /// The app server's allowed web search modes, when this save needs them.
-    web_search_modes: Option<&'a Option<Vec<WebSearchMode>>>,
+    /// The app server's allowed web search modes, when known and restricted.
+    web_search_modes: Option<&'a [WebSearchMode]>,
 }
 
-/// What a remote save resolves to for new threads.
-struct RemoteResolution {
+/// What a settings save resolves to for new sessions.
+struct SaveResolution {
     winner: Option<(OverrideLayer, String)>,
     unverified: Option<String>,
 }
@@ -444,7 +447,7 @@ fn resolve_remote_save(
     effective_config: &mut ConfigReadResponse,
     launch: &RemoteLaunch<'_>,
     written: &AbsolutePathBuf,
-) -> RemoteResolution {
+) -> SaveResolution {
     // thread/start replaces the app server's own `[features]` launch flags with the table this TUI
     // sends, so resolve what is left without them before adding this TUI's flags.
     let forwards_features = launch
@@ -457,9 +460,7 @@ fn resolve_remote_save(
                 .to_string()
         });
     let flagged = overlay_launch_overrides(effective_config, launch.overrides.as_ref());
-    let requirements_disallow = launch
-        .web_search_modes
-        .is_some_and(|modes| constrain_web_search(effective_config, modes.as_deref()));
+    let requirements_disallow = constrain_web_search(effective_config, launch.web_search_modes);
     let flag_precedence = codex_app_server_protocol::ConfigLayerSource::SessionFlags.precedence();
     let web_search_source = launch.web_search_source.as_deref();
     let winner = switch_override_layer(
@@ -493,7 +494,7 @@ fn resolve_remote_save(
     .or_else(|| {
         requirements_disallow.then(|| (OverrideLayer::Requirements, "web_search".to_string()))
     });
-    RemoteResolution { winner, unverified }
+    SaveResolution { winner, unverified }
 }
 
 /// Removes the app server's own `[features]` launch flags from what it read back and resolves
@@ -876,8 +877,9 @@ fn adopt_effective_switch_state(
     switch: SettingsSwitch,
     effective_config: &ConfigReadResponse,
 ) {
+    let features = features_from_effective_config(effective_config);
     let adopt_feature = |config: &mut Config, feature: Feature| {
-        let enabled = feature_enabled_from_effective_config(effective_config, feature);
+        let enabled = features.enabled(feature);
         if let Err(err) = config.features.set_enabled(feature, enabled) {
             tracing::warn!(
                 error = %err,

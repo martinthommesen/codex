@@ -51,8 +51,8 @@ fn session_flags_win_over_what_config_read_reports() {
     // The legacy `connectors` flag still turns apps on for every new thread.
     assert_eq!(
         (
-            feature_enabled_from_effective_config(&effective_config, Feature::Apps),
-            feature_enabled_from_effective_config(&effective_config, Feature::Plugins),
+            features_from_effective_config(&effective_config).enabled(Feature::Apps),
+            features_from_effective_config(&effective_config).enabled(Feature::Plugins),
         ),
         (true, false)
     );
@@ -250,10 +250,7 @@ fn launch_table_keeps_a_structured_feature_enabled() {
         effective_config.config.additional["features"]["multi_agent_v2"],
         serde_json::json!({ "enabled": true, "max_concurrent_threads_per_session": 4 })
     );
-    assert!(feature_enabled_from_effective_config(
-        &effective_config,
-        Feature::MultiAgentV2
-    ));
+    assert!(features_from_effective_config(&effective_config).enabled(Feature::MultiAgentV2));
 }
 
 #[test]
@@ -369,7 +366,7 @@ fn resolve_with_launch(
     enabled: bool,
     effective_config: &mut ConfigReadResponse,
     overrides: Option<HashMap<String, serde_json::Value>>,
-) -> RemoteResolution {
+) -> SaveResolution {
     let launch_origins = HashMap::new();
     resolve_remote_save(
         switch,
@@ -391,7 +388,7 @@ fn resolve_with_launch_features(
     enabled: bool,
     effective_config: &mut ConfigReadResponse,
     features: serde_json::Value,
-) -> RemoteResolution {
+) -> SaveResolution {
     resolve_with_launch(
         switch,
         enabled,
@@ -577,10 +574,7 @@ fn a_project_alias_the_server_flag_hid_still_wins() {
     );
 
     assert!(resolution.unverified.is_none());
-    assert!(feature_enabled_from_effective_config(
-        &effective_config,
-        Feature::MemoryTool
-    ));
+    assert!(features_from_effective_config(&effective_config).enabled(Feature::MemoryTool));
 }
 
 #[test]
@@ -610,10 +604,7 @@ fn a_feature_the_server_resolved_with_its_own_flags_is_read_from_its_layer() {
     );
 
     assert_eq!(resolution.unverified, None);
-    assert!(feature_enabled_from_effective_config(
-        &effective_config,
-        Feature::MemoryTool
-    ));
+    assert!(features_from_effective_config(&effective_config).enabled(Feature::MemoryTool));
 }
 
 #[test]

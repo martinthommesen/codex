@@ -1212,8 +1212,9 @@ impl App {
         effective_config: &ConfigReadResponse,
         feature_updates: &[(Feature, bool)],
     ) {
+        let features = features_from_effective_config(effective_config);
         for (feature, _) in feature_updates {
-            let enabled = feature_enabled_from_effective_config(effective_config, *feature);
+            let enabled = features.enabled(*feature);
             if let Err(err) = self.config.features.set_enabled(*feature, enabled) {
                 tracing::warn!(
                     error = %err,
@@ -1381,10 +1382,7 @@ pub(super) fn overridden_write_message(write_response: &ConfigWriteResponse) -> 
         .unwrap_or("the effective config is overridden by a higher-priority layer")
 }
 
-pub(super) fn feature_enabled_from_effective_config(
-    effective_config: &ConfigReadResponse,
-    feature: Feature,
-) -> bool {
+pub(super) fn features_from_effective_config(effective_config: &ConfigReadResponse) -> Features {
     let root_features = effective_config
         .config
         .additional
@@ -1399,7 +1397,6 @@ pub(super) fn feature_enabled_from_effective_config(
         FeatureConfigSource::default(),
         FeatureOverrides::default(),
     )
-    .enabled(feature)
 }
 
 fn approvals_reviewer_from_effective_config(
@@ -2177,16 +2174,11 @@ theme = "dracula"
 
         // `connectors` is the legacy alias for apps and sorts after it, so it wins on load. The
         // malformed `code_mode` entry is skipped without hiding the others.
-        assert!(!feature_enabled_from_effective_config(
-            &response,
-            Feature::Apps
-        ));
-        assert!(feature_enabled_from_effective_config(
-            &response,
-            Feature::MultiAgentV2
-        ));
+        let features = features_from_effective_config(&response);
+        assert!(!features.enabled(Feature::Apps));
+        assert!(features.enabled(Feature::MultiAgentV2));
         assert_eq!(
-            feature_enabled_from_effective_config(&response, Feature::Plugins),
+            features.enabled(Feature::Plugins),
             Feature::Plugins.default_enabled()
         );
     }
