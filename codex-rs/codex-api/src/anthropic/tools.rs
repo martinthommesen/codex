@@ -5,6 +5,7 @@
 //! are flattened, freeform (grammar) tools become JSON tools with a single `input` string,
 //! and hosted OpenAI tools are reported as unsupported instead of being silently dropped.
 
+use codex_protocol::models::ResponseItem;
 use serde::Serialize;
 use serde_json::Map;
 use serde_json::Value;
@@ -120,16 +121,7 @@ pub fn anthropic_wire_tool_name_with_limit(
         }
         _ => name.to_string(),
     };
-    let mut sanitized: String = joined
-        .chars()
-        .map(|ch| {
-            if ch.is_ascii_alphanumeric() || ch == '_' || ch == '-' {
-                ch
-            } else {
-                '_'
-            }
-        })
-        .collect();
+    let mut sanitized = sanitize_identifier(&joined);
     if sanitized.is_empty() {
         sanitized.push_str("tool");
     }
@@ -147,16 +139,7 @@ pub fn anthropic_wire_tool_name_with_limit(
 
 /// Sanitizes a tool-call id so it satisfies the Messages API `^[a-zA-Z0-9_-]+$` rule.
 pub fn anthropic_tool_use_id(call_id: &str) -> String {
-    let sanitized: String = call_id
-        .chars()
-        .map(|ch| {
-            if ch.is_ascii_alphanumeric() || ch == '_' || ch == '-' {
-                ch
-            } else {
-                '_'
-            }
-        })
-        .collect();
+    let sanitized = sanitize_identifier(call_id);
     if sanitized.is_empty() {
         return format!("toolu_{:08x}", fnv1a_32(call_id.as_bytes()));
     }
@@ -165,6 +148,19 @@ pub fn anthropic_tool_use_id(call_id: &str) -> String {
     } else {
         format!("{sanitized}_{:08x}", fnv1a_32(call_id.as_bytes()))
     }
+}
+
+fn sanitize_identifier(value: &str) -> String {
+    value
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || ch == '_' || ch == '-' {
+                ch
+            } else {
+                '_'
+            }
+        })
+        .collect()
 }
 
 fn fnv1a_32(bytes: &[u8]) -> u32 {
@@ -192,6 +188,17 @@ pub struct TranslatedTools {
     pub names: AnthropicToolNameMap,
     /// Human-readable notes about declarations that have no Anthropic equivalent.
     pub unsupported: Vec<String>,
+}
+
+/// Includes tools introduced during the conversation after the prompt's declarations.
+pub fn collect_tool_declarations(tools: &[Value], input: &[ResponseItem]) -> Vec<Value> {
+    let mut declarations = tools.to_vec();
+    for item in input {
+        if let ResponseItem::AdditionalTools { tools, .. } = item {
+            declarations.extend(tools.iter().cloned());
+        }
+    }
+    declarations
 }
 
 /// Translates Responses-API-shaped tool declarations into Anthropic tools.

@@ -440,6 +440,71 @@ async fn refresh_429_persists_retry_after_and_blocks_immediate_replay() {
 }
 
 #[tokio::test]
+async fn refresh_retries_server_errors_before_persisting_rotation() {
+    let home = tempfile::tempdir().expect("tempdir");
+    let server = MockServer::start().await;
+    let mut config = configuration(home.path(), AuthCredentialsStoreMode::Ephemeral);
+    mock_endpoints(&mut config, &server);
+    config.save(&credential(1)).expect("save");
+    let requests = std::sync::atomic::AtomicU64::new(0);
+    Mock::given(method("POST"))
+        .and(path("/token"))
+        .respond_with(move |_: &wiremock::Request| {
+            if requests.fetch_add(1, Ordering::Relaxed) < 2 {
+                ResponseTemplate::new(503)
+            } else {
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "access_token": "new-access", "refresh_token": "rotated", "expires_in": 3600
+                }))
+            }
+        })
+        .expect(3)
+        .mount(&server)
+        .await;
+    profile_mock(&server).await;
+
+    let refreshed = config
+        .resolve()
+        .await
+        .expect("refresh")
+        .expect("credential");
+    assert_eq!(refreshed.access_token(), "new-access");
+    let stored = config
+        .load_stored_credential()
+        .expect("load")
+        .expect("credential");
+    assert_eq!(stored.refresh_token, "rotated");
+    assert!(!stored.refresh_requires_login);
+}
+
+#[tokio::test]
+async fn exhausted_refresh_server_errors_persist_backoff_before_retry() {
+    let home = tempfile::tempdir().expect("tempdir");
+    let server = MockServer::start().await;
+    let mut config = configuration(home.path(), AuthCredentialsStoreMode::Ephemeral);
+    mock_endpoints(&mut config, &server);
+    config.save(&credential(1)).expect("save");
+    Mock::given(method("POST"))
+        .and(path("/token"))
+        .respond_with(ResponseTemplate::new(503))
+        .expect(3)
+        .mount(&server)
+        .await;
+
+    let error = config.resolve().await.expect_err("server failure");
+    assert!(error.to_string().contains("HTTP 503"));
+    let error = config.resolve().await.expect_err("backoff prevents replay");
+    assert!(error.to_string().contains("rate limited"));
+    let stored = config
+        .load_stored_credential()
+        .expect("load")
+        .expect("credential");
+    assert_eq!(stored.refresh_token, "sensitive-refresh-token");
+    assert!(!stored.refresh_requires_login);
+    assert!(stored.refresh_blocked_until > now());
+}
+
+#[tokio::test]
 async fn oauth_redirects_never_forward_credentials_or_codes() {
     let home = tempfile::tempdir().expect("tempdir");
     let server = MockServer::start().await;

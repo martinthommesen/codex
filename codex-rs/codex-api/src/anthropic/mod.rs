@@ -54,6 +54,7 @@ pub use tools::TranslatedTools;
 pub use tools::anthropic_tool_use_id;
 pub use tools::anthropic_wire_tool_name;
 pub use tools::anthropic_wire_tool_name_with_limit;
+pub use tools::collect_tool_declarations;
 pub use tools::tool_name_collision_note;
 pub use tools::translate_tools;
 

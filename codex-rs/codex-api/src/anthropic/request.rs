@@ -12,6 +12,7 @@ use super::tools::AnthropicToolNameMap;
 use super::tools::FREEFORM_INPUT_PROPERTY;
 use super::tools::anthropic_tool_use_id;
 use super::tools::anthropic_wire_tool_name;
+use super::tools::collect_tool_declarations;
 use super::tools::translate_tools;
 use codex_protocol::models::ContentItem;
 use codex_protocol::models::FunctionCallOutputBody;
@@ -58,6 +59,15 @@ pub struct AnthropicMessage {
     pub content: Vec<Value>,
 }
 
+impl AnthropicMessage {
+    fn tool_ids<'a>(&'a self, kind: &'a str, field: &'a str) -> impl Iterator<Item = &'a str> {
+        self.content
+            .iter()
+            .filter(move |block| block_type(block) == kind)
+            .filter_map(move |block| block.get(field).and_then(Value::as_str))
+    }
+}
+
 /// Serialized body of `POST /v1/messages`.
 #[derive(Debug, Clone, Serialize, PartialEq)]
 pub struct AnthropicMessagesRequest {
@@ -97,6 +107,26 @@ pub struct AnthropicRequestOptions {
     pub strip_thinking: bool,
 }
 
+impl AnthropicRequestOptions {
+    fn thinking_config(&self) -> Option<Value> {
+        let mut thinking = match self.thinking {
+            AnthropicThinking::Omit => return None,
+            AnthropicThinking::Disabled => return Some(json!({"type": "disabled"})),
+            AnthropicThinking::Adaptive => json!({
+                "type": "adaptive",
+                "display": if self.summarize_thinking { "summarized" } else { "omitted" },
+            }),
+            AnthropicThinking::Budget { budget_tokens } => {
+                json!({"type": "enabled", "budget_tokens": budget_tokens})
+            }
+        };
+        if self.drop_mismatched_thinking {
+            thinking["block_binding"] = json!({"prefix_mismatch_behavior": "drop_block"});
+        }
+        Some(thinking)
+    }
+}
+
 /// A request ready to send, with the metadata needed to interpret its response.
 #[derive(Debug, Clone, PartialEq)]
 pub struct PreparedAnthropicRequest {
@@ -115,13 +145,7 @@ pub fn build_anthropic_request(
     tool_declarations: &[Value],
     options: &AnthropicRequestOptions,
 ) -> PreparedAnthropicRequest {
-    let mut declarations = tool_declarations.to_vec();
-    // Tools added to history mid-conversation are declared alongside the prompt tools.
-    for item in input {
-        if let ResponseItem::AdditionalTools { tools, .. } = item {
-            declarations.extend(tools.iter().cloned());
-        }
-    }
+    let declarations = collect_tool_declarations(tool_declarations, input);
     let translated_tools = translate_tools(&declarations);
     let mut notes = translated_tools.unsupported.clone();
 
@@ -142,31 +166,14 @@ pub fn build_anthropic_request(
         system.push(text_block(&text));
     }
 
-    let mut betas = Vec::new();
-    let thinking = match &options.thinking {
-        AnthropicThinking::Omit => None,
-        AnthropicThinking::Disabled => Some(json!({"type": "disabled"})),
-        AnthropicThinking::Adaptive => {
-            let display = if options.summarize_thinking {
-                "summarized"
-            } else {
-                "omitted"
-            };
-            let mut thinking = json!({"type": "adaptive", "display": display});
-            if options.drop_mismatched_thinking {
-                thinking["block_binding"] = json!({"prefix_mismatch_behavior": "drop_block"});
-                betas.push(THINKING_BINDING_BETA);
-            }
-            Some(thinking)
-        }
-        AnthropicThinking::Budget { budget_tokens } => {
-            let mut thinking = json!({"type": "enabled", "budget_tokens": budget_tokens});
-            if options.drop_mismatched_thinking {
-                thinking["block_binding"] = json!({"prefix_mismatch_behavior": "drop_block"});
-                betas.push(THINKING_BINDING_BETA);
-            }
-            Some(thinking)
-        }
+    let thinking = options.thinking_config();
+    let betas = if thinking
+        .as_ref()
+        .is_some_and(|config| config.get("block_binding").is_some())
+    {
+        vec![THINKING_BINDING_BETA]
+    } else {
+        Vec::new()
     };
 
     let mut output_config = serde_json::Map::new();
@@ -241,6 +248,18 @@ impl HistoryBuilder {
         if !text.trim().is_empty() {
             self.push(role, text_block(text));
         }
+    }
+
+    fn push_tool_call(&mut self, call_id: &str, namespace: Option<&str>, name: &str, input: Value) {
+        self.push(
+            "assistant",
+            json!({
+                "type": "tool_use",
+                "id": anthropic_tool_use_id(call_id),
+                "name": anthropic_wire_tool_name(namespace, name),
+                "input": input,
+            }),
+        );
     }
 
     fn note(&mut self, note: impl Into<String>) {
@@ -386,15 +405,7 @@ fn translate_item(item: &ResponseItem, strip_thinking: bool, builder: &mut Histo
                 Ok(other) => json!({"value": other}),
                 Err(_) => json!({"raw_arguments": arguments}),
             };
-            builder.push(
-                "assistant",
-                json!({
-                    "type": "tool_use",
-                    "id": anthropic_tool_use_id(call_id),
-                    "name": anthropic_wire_tool_name(namespace.as_deref(), name),
-                    "input": input,
-                }),
-            );
+            builder.push_tool_call(call_id, namespace.as_deref(), name, input);
         }
         ResponseItem::CustomToolCall {
             name,
@@ -403,14 +414,11 @@ fn translate_item(item: &ResponseItem, strip_thinking: bool, builder: &mut Histo
             call_id,
             ..
         } => {
-            builder.push(
-                "assistant",
-                json!({
-                    "type": "tool_use",
-                    "id": anthropic_tool_use_id(call_id),
-                    "name": anthropic_wire_tool_name(namespace.as_deref(), name),
-                    "input": {FREEFORM_INPUT_PROPERTY: input},
-                }),
+            builder.push_tool_call(
+                call_id,
+                namespace.as_deref(),
+                name,
+                json!({FREEFORM_INPUT_PROPERTY: input}),
             );
         }
         ResponseItem::LocalShellCall {
@@ -631,101 +639,8 @@ fn repair_turns(messages: &mut Vec<AnthropicMessage>, notes: &mut Vec<String>) {
     });
     merge_adjacent(messages);
 
-    let mut index = 0;
-    while index < messages.len() {
-        if messages[index].role != "assistant" {
-            index += 1;
-            continue;
-        }
-        let tool_use_ids: Vec<String> = messages[index]
-            .content
-            .iter()
-            .filter(|block| block_type(block) == "tool_use")
-            .filter_map(|block| block.get("id").and_then(Value::as_str).map(str::to_string))
-            .collect();
-        if tool_use_ids.is_empty() {
-            index += 1;
-            continue;
-        }
-        if messages
-            .get(index + 1)
-            .is_none_or(|next| next.role != "user")
-        {
-            messages.insert(
-                index + 1,
-                AnthropicMessage {
-                    role: "user",
-                    content: Vec::new(),
-                },
-            );
-        }
-        let next = &mut messages[index + 1];
-        let answered: BTreeSet<String> = next
-            .content
-            .iter()
-            .filter(|block| block_type(block) == "tool_result")
-            .filter_map(|block| {
-                block
-                    .get("tool_use_id")
-                    .and_then(Value::as_str)
-                    .map(str::to_string)
-            })
-            .collect();
-        for id in &tool_use_ids {
-            if !answered.contains(id) {
-                next.content.push(json!({
-                    "type": "tool_result",
-                    "tool_use_id": id,
-                    "content": "Tool call did not complete.",
-                    "is_error": true,
-                }));
-                notes.push("a tool call without a recorded result was marked incomplete".into());
-            }
-        }
-        index += 2;
-    }
-
-    // Tool results must answer a tool_use in the immediately preceding assistant turn, once; any
-    // other result is kept as plain text. Results must also lead their user turn.
-    let mut previous_tool_uses: BTreeSet<String> = BTreeSet::new();
-    for message in messages.iter_mut() {
-        if message.role == "assistant" {
-            previous_tool_uses = message
-                .content
-                .iter()
-                .filter(|block| block_type(block) == "tool_use")
-                .filter_map(|block| block.get("id").and_then(Value::as_str).map(str::to_string))
-                .collect();
-            continue;
-        }
-        let mut results = Vec::new();
-        let mut others = Vec::new();
-        for block in message.content.drain(..) {
-            if block_type(&block) == "tool_result" {
-                let id = block
-                    .get("tool_use_id")
-                    .and_then(Value::as_str)
-                    .unwrap_or_default()
-                    .to_string();
-                if previous_tool_uses.remove(&id) {
-                    results.push(block);
-                } else {
-                    let text = match block.get("content") {
-                        Some(Value::String(text)) => text.clone(),
-                        Some(other) => other.to_string(),
-                        None => String::new(),
-                    };
-                    others.push(text_block(&format!("[output of call {id}]\n{text}")));
-                }
-            } else {
-                others.push(block);
-            }
-        }
-        results.extend(others);
-        message.content = results;
-        previous_tool_uses.clear();
-    }
-
+    complete_tool_turns(messages, notes);
+    order_tool_results(messages);
     messages.retain(|message| !message.content.is_empty());
     merge_adjacent(messages);
 
@@ -755,6 +670,94 @@ fn repair_turns(messages: &mut Vec<AnthropicMessage>, notes: &mut Vec<String>) {
             content: vec![text_block("Continue.")],
         });
         notes.push("history ended with an assistant turn; a continuation request was added".into());
+    }
+}
+
+/// Makes every tool call's next user turn contain a result, including interrupted calls.
+fn complete_tool_turns(messages: &mut Vec<AnthropicMessage>, notes: &mut Vec<String>) {
+    let mut index = 0;
+    while index < messages.len() {
+        if messages[index].role != "assistant" {
+            index += 1;
+            continue;
+        }
+        let tool_use_ids: Vec<String> = messages[index]
+            .tool_ids("tool_use", "id")
+            .map(str::to_owned)
+            .collect();
+        if tool_use_ids.is_empty() {
+            index += 1;
+            continue;
+        }
+        if messages
+            .get(index + 1)
+            .is_none_or(|next| next.role != "user")
+        {
+            messages.insert(
+                index + 1,
+                AnthropicMessage {
+                    role: "user",
+                    content: Vec::new(),
+                },
+            );
+        }
+        let next = &mut messages[index + 1];
+        let answered: BTreeSet<String> = next
+            .tool_ids("tool_result", "tool_use_id")
+            .map(str::to_owned)
+            .collect();
+        for id in &tool_use_ids {
+            if !answered.contains(id) {
+                next.content.push(json!({
+                    "type": "tool_result",
+                    "tool_use_id": id,
+                    "content": "Tool call did not complete.",
+                    "is_error": true,
+                }));
+                notes.push("a tool call without a recorded result was marked incomplete".into());
+            }
+        }
+        index += 2;
+    }
+}
+
+/// Moves valid results to the start of their user turn and renders unmatched results as text.
+fn order_tool_results(messages: &mut [AnthropicMessage]) {
+    let mut previous_tool_uses: BTreeSet<String> = BTreeSet::new();
+    for message in messages {
+        if message.role == "assistant" {
+            previous_tool_uses = message
+                .tool_ids("tool_use", "id")
+                .map(str::to_owned)
+                .collect();
+            continue;
+        }
+        let mut results = Vec::new();
+        let mut others = Vec::new();
+        for block in message.content.drain(..) {
+            if block_type(&block) == "tool_result" {
+                let id = block
+                    .get("tool_use_id")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string();
+                if previous_tool_uses.remove(&id) {
+                    results.push(block);
+                } else {
+                    let text = match block.get("content") {
+                        Some(Value::String(text)) => text.clone(),
+                        Some(other) => other.to_string(),
+                        None => String::new(),
+                    };
+                    others.push(text_block(&format!("[output of call {id}]\n{text}")));
+                }
+            } else {
+                others.push(block);
+            }
+        }
+        results.extend(others);
+        message.content = results;
+        previous_tool_uses.clear();
     }
 }
 

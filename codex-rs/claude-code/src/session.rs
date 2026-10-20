@@ -41,6 +41,7 @@ use codex_api::anthropic::AnthropicStreamEvent;
 use codex_api::anthropic::AnthropicStreamTranslator;
 use codex_api::anthropic::AnthropicToolNameMap;
 use codex_api::anthropic::AnthropicUsage;
+use codex_api::anthropic::collect_tool_declarations;
 use codex_protocol::models::ResponseItem;
 use serde_json::Value;
 use serde_json::json;
@@ -186,12 +187,7 @@ are {}",
             bridge.socket_path(),
         );
 
-        let mut declarations = request.tools.clone();
-        for item in &request.input {
-            if let ResponseItem::AdditionalTools { tools, .. } = item {
-                declarations.extend(tools.iter().cloned());
-            }
-        }
+        let declarations = collect_tool_declarations(&request.tools, &request.input);
         let registry = ToolRegistry::from_declarations(&declarations);
         for note in &registry.unsupported {
             debug!(note = %note, "Codex tool not exposed to Claude Code");
@@ -199,18 +195,7 @@ are {}",
         let names = registry.translator_names();
         core.set_tools(registry.clone());
 
-        if !inner.loaded {
-            inner.loaded = true;
-            if let Some(persisted) = load_session(&self.config.state_dir, &self.config.thread_id) {
-                inner.had_persisted_state = true;
-                if let Ok(id) = Uuid::parse_str(&persisted.session_id) {
-                    inner.session_id = Some(id);
-                    inner.session_started = true;
-                    inner.synced_len = persisted.synced_len;
-                    inner.prefix_hash = persisted.prefix_hash;
-                }
-            }
-        }
+        inner.load(&self.config);
 
         let input = &request.input;
         let (leading_len, hoisted) = leading_system(input);
@@ -227,26 +212,25 @@ are {}",
             ))
         })?;
 
-        let prefix_matches = inner.session_id.is_some()
-            && inner.synced_len <= input.len()
-            && prefix_hash(&input[..inner.synced_len]) == inner.prefix_hash;
+        let launch = ProcessLaunch {
+            config: Arc::clone(&self.config),
+            key,
+            mcp_config,
+            prompt_path,
+        };
+        let prefix_matches = inner.prefix_matches(input);
         if !prefix_matches {
             let id = self.fresh_session_id(&mut inner);
-            reset_session(&mut inner, &core, id).await;
+            inner.reset(&core, id).await;
         }
 
         let needs_spawn = match inner.process.as_mut() {
-            Some(process) => process.is_closed() || process.key != key,
+            Some(process) => process.is_closed() || process.key != launch.key,
             None => true,
         };
         let mut fallback = None;
         if needs_spawn {
-            if let Some(mut old) = inner.process.take() {
-                old.kill().await;
-            }
-            inner.query_in_flight = false;
-            inner.outstanding.clear();
-            core.fail_all(RESTARTED_MESSAGE);
+            inner.stop_process(&core, RESTARTED_MESSAGE).await;
             let Some(session_id) = inner.session_id else {
                 return Err(ApiError::Stream(
                     "Claude Code session id is missing".to_string(),
@@ -263,27 +247,9 @@ are {}",
                 fallback = Some(Fallback {
                     input: input.clone(),
                     leading_len,
-                    key: key.clone(),
                 });
             }
-            let spec = SpawnSpec {
-                command: &self.config.command,
-                cwd: &self.config.cwd,
-                model: &request.model,
-                effort: request.effort.as_deref(),
-                system_prompt_file: &prompt_path,
-                mcp_config: &mcp_config,
-                session,
-            };
-            match ClaudeProcess::spawn(&spec, key.clone()) {
-                Ok(process) => inner.process = Some(process),
-                Err(err) => {
-                    // Nothing reached Claude Code; without this, the next request would match
-                    // the empty synced prefix and seed the session without the transcript.
-                    forget_unstarted_session(&mut inner);
-                    return Err(err);
-                }
-            }
+            launch.spawn(&mut inner, session)?;
         }
 
         let payload = if prefix_matches {
@@ -297,14 +263,11 @@ are {}",
         let driver = Driver {
             inner,
             core,
-            config: Arc::clone(&self.config),
+            launch,
             tx,
             abort: self.abort.subscribe(),
             names,
             registry,
-            model: request.model,
-            mcp_config,
-            prompt_path,
             fallback,
         };
         tokio::spawn(driver.run());
@@ -321,11 +284,10 @@ are {}",
         self.abort.send_modify(|generation| *generation += 1);
         let process = {
             let mut inner = self.inner.lock().await;
-            inner.query_in_flight = false;
-            inner.outstanding.clear();
             if let Some(bridge) = inner.bridge.as_ref() {
                 bridge.core.fail_all(INTERRUPTED_MESSAGE);
             }
+            inner.clear_query();
             inner.process.take()
         };
         if let Some(mut process) = process {
@@ -360,18 +322,95 @@ impl Drop for ClaudeCodeSession {
     }
 }
 
-/// Starts over with a new, empty Claude Code session.
-async fn reset_session(inner: &mut SessionInner, core: &BridgeCore, id: Uuid) {
-    if let Some(mut process) = inner.process.take() {
-        process.kill().await;
+impl SessionInner {
+    fn load(&mut self, config: &ClaudeCodeSessionConfig) {
+        if self.loaded {
+            return;
+        }
+        self.loaded = true;
+        if let Some(persisted) = load_session(&config.state_dir, &config.thread_id) {
+            self.had_persisted_state = true;
+            if let Ok(id) = Uuid::parse_str(&persisted.session_id) {
+                self.session_id = Some(id);
+                self.session_started = true;
+                self.synced_len = persisted.synced_len;
+                self.prefix_hash = persisted.prefix_hash;
+            }
+        }
     }
-    core.fail_all(RESTARTED_MESSAGE);
-    inner.session_id = Some(id);
-    inner.session_started = false;
-    inner.synced_len = 0;
-    inner.prefix_hash = prefix_hash(&[]);
-    inner.query_in_flight = false;
-    inner.outstanding.clear();
+
+    fn prefix_matches(&self, input: &[ResponseItem]) -> bool {
+        self.session_id.is_some()
+            && self.synced_len <= input.len()
+            && prefix_hash(&input[..self.synced_len]) == self.prefix_hash
+    }
+
+    fn clear_query(&mut self) {
+        self.query_in_flight = false;
+        self.outstanding.clear();
+    }
+
+    async fn stop_process(&mut self, core: &BridgeCore, message: &str) {
+        if let Some(mut process) = self.process.take() {
+            process.kill().await;
+        }
+        self.clear_query();
+        core.fail_all(message);
+    }
+
+    /// Starts over with a new, empty Claude Code session.
+    async fn reset(&mut self, core: &BridgeCore, id: Uuid) {
+        self.stop_process(core, RESTARTED_MESSAGE).await;
+        self.session_id = Some(id);
+        self.session_started = false;
+        self.reset_sync();
+    }
+
+    fn reset_sync(&mut self) {
+        self.synced_len = 0;
+        self.prefix_hash = prefix_hash(&[]);
+    }
+
+    /// An unstarted session holds no input; the next request must rebuild the full payload.
+    fn forget_unstarted(&mut self) {
+        if !self.session_started {
+            self.session_id = None;
+            self.reset_sync();
+        }
+    }
+}
+
+/// Immutable launch settings shared by the initial process and any fresh-session fallback.
+struct ProcessLaunch {
+    config: Arc<ClaudeCodeSessionConfig>,
+    key: ProcessKey,
+    mcp_config: String,
+    prompt_path: PathBuf,
+}
+
+impl ProcessLaunch {
+    fn spawn(&self, inner: &mut SessionInner, session: SessionArg) -> Result<(), ApiError> {
+        let spec = SpawnSpec {
+            command: &self.config.command,
+            cwd: &self.config.cwd,
+            model: &self.key.model,
+            effort: self.key.effort.as_deref(),
+            system_prompt_file: &self.prompt_path,
+            mcp_config: &self.mcp_config,
+            session,
+        };
+        match ClaudeProcess::spawn(&spec, self.key.clone()) {
+            Ok(process) => {
+                inner.process = Some(process);
+                Ok(())
+            }
+            Err(err) => {
+                // Nothing reached Claude Code; replay the full transcript on the next request.
+                inner.forget_unstarted();
+                Err(err)
+            }
+        }
+    }
 }
 
 /// Content for a fresh session: a transcript of earlier history plus the trailing user input.
@@ -552,17 +591,7 @@ async fn settle_query(inner: &mut SessionInner, core: &BridgeCore) {
     }
     if !settled && let Some(mut process) = inner.process.take() {
         process.kill().await;
-        forget_unstarted_session(inner);
-    }
-}
-
-/// After the process is lost, a session Claude Code never started holds none of the input that
-/// was sent to it; clearing the id makes the next request rebuild the full payload.
-fn forget_unstarted_session(inner: &mut SessionInner) {
-    if !inner.session_started {
-        inner.session_id = None;
-        inner.synced_len = 0;
-        inner.prefix_hash = prefix_hash(&[]);
+        inner.forget_unstarted();
     }
 }
 
@@ -660,7 +689,6 @@ pub(crate) fn result_error(value: &Value) -> ApiError {
 struct Fallback {
     input: Vec<ResponseItem>,
     leading_len: usize,
-    key: ProcessKey,
 }
 
 #[derive(Default)]
@@ -676,6 +704,74 @@ struct Segment {
     forwarded_any: bool,
 }
 
+impl Segment {
+    fn start_message(&mut self, names: AnthropicToolNameMap) {
+        self.translator = Some(AnthropicStreamTranslator::new(names));
+        self.tool_use_names.clear();
+        self.message_calls.clear();
+        self.held_completion = None;
+        self.held_error = None;
+    }
+
+    /// Tracks bridged calls; returns false for tools Claude Code must answer itself.
+    fn track_tool_call(&mut self, item: &ResponseItem, registry: &ToolRegistry) -> bool {
+        let call_id = match item {
+            ResponseItem::FunctionCall { call_id, .. }
+            | ResponseItem::CustomToolCall { call_id, .. } => call_id,
+            _ => return true,
+        };
+        let mcp_name = self
+            .tool_use_names
+            .get(call_id)
+            .and_then(|wire| registry.mcp_name_for_wire(wire));
+        let Some(mcp_name) = mcp_name else {
+            debug!("dropping a call to a tool Codex does not provide");
+            return false;
+        };
+        self.message_calls.push(OutstandingCall {
+            call_id: call_id.clone(),
+            mcp_name: mcp_name.to_string(),
+        });
+        true
+    }
+
+    fn finish(&mut self, result: &Value) -> Result<ResponseEvent, ApiError> {
+        if result
+            .get("is_error")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+        {
+            return Err(result_error(result));
+        }
+        if let Some(err) = self.held_error.take() {
+            return Err(err);
+        }
+        let completion = match self.held_completion.take() {
+            Some(ResponseEvent::Completed {
+                response_id,
+                token_usage,
+                usage_metadata,
+                ..
+            }) => ResponseEvent::Completed {
+                response_id,
+                token_usage,
+                usage_metadata,
+                end_turn: Some(true),
+            },
+            _ => ResponseEvent::Completed {
+                response_id: String::new(),
+                token_usage: result
+                    .get("usage")
+                    .and_then(|usage| serde_json::from_value::<AnthropicUsage>(usage.clone()).ok())
+                    .map(AnthropicUsage::to_token_usage),
+                usage_metadata: None,
+                end_turn: Some(true),
+            },
+        };
+        Ok(completion)
+    }
+}
+
 enum Step {
     Continue,
     Done,
@@ -684,14 +780,11 @@ enum Step {
 struct Driver {
     inner: OwnedMutexGuard<SessionInner>,
     core: Arc<BridgeCore>,
-    config: Arc<ClaudeCodeSessionConfig>,
+    launch: ProcessLaunch,
     tx: mpsc::Sender<Result<ResponseEvent, ApiError>>,
     abort: watch::Receiver<u64>,
     names: AnthropicToolNameMap,
     registry: ToolRegistry,
-    model: String,
-    mcp_config: String,
-    prompt_path: PathBuf,
     fallback: Option<Fallback>,
 }
 
@@ -729,13 +822,10 @@ impl Driver {
                     Step::Done
                 }
                 Wake::Abort => {
-                    if let Some(mut process) = self.inner.process.take() {
-                        process.kill().await;
-                    }
-                    forget_unstarted_session(&mut self.inner);
-                    self.inner.query_in_flight = false;
-                    self.inner.outstanding.clear();
-                    self.core.fail_all(INTERRUPTED_MESSAGE);
+                    self.inner
+                        .stop_process(&self.core, INTERRUPTED_MESSAGE)
+                        .await;
+                    self.inner.forget_unstarted();
                     self.fail(ApiError::Stream(
                         "the Claude Code session was shut down".to_string(),
                     ))
@@ -772,8 +862,8 @@ impl Driver {
         match value.get("type").and_then(Value::as_str).unwrap_or("") {
             "system" if is_init(&value) => {
                 if let Err(err) = check_bridge_status(&value) {
-                    self.stop_process().await;
-                    forget_unstarted_session(&mut self.inner);
+                    self.inner.stop_process(&self.core, RESTARTED_MESSAGE).await;
+                    self.inner.forget_unstarted();
                     self.fail(err).await;
                     return Step::Done;
                 }
@@ -814,11 +904,7 @@ impl Driver {
         let is_message_stop = matches!(event, AnthropicStreamEvent::MessageStop);
         match &event {
             AnthropicStreamEvent::MessageStart { .. } => {
-                segment.translator = Some(AnthropicStreamTranslator::new(self.names.clone()));
-                segment.tool_use_names.clear();
-                segment.message_calls.clear();
-                segment.held_completion = None;
-                segment.held_error = None;
+                segment.start_message(self.names.clone());
             }
             AnthropicStreamEvent::ContentBlockStart { content_block, .. }
                 if content_block.get("type").and_then(Value::as_str) == Some("tool_use") =>
@@ -863,43 +949,19 @@ impl Driver {
         };
         let stop_reason = translator.stop_reason().map(str::to_string);
         for event in events {
-            match event {
+            let finishes_segment = match &event {
                 ResponseEvent::Created { .. } => {
                     if segment.created_sent {
                         continue;
                     }
                     segment.created_sent = true;
-                    if !self.forward(event, segment).await {
-                        return self.consumer_gone(segment).await;
-                    }
+                    false
                 }
                 ResponseEvent::OutputItemDone(item) => {
-                    let call_id = match &item {
-                        ResponseItem::FunctionCall { call_id, .. }
-                        | ResponseItem::CustomToolCall { call_id, .. } => Some(call_id.clone()),
-                        _ => None,
-                    };
-                    if let Some(call_id) = call_id {
-                        let mcp_name = segment
-                            .tool_use_names
-                            .get(&call_id)
-                            .and_then(|wire| self.registry.mcp_name_for_wire(wire))
-                            .map(str::to_string);
-                        let Some(mcp_name) = mcp_name else {
-                            // Not a Codex tool: Claude Code answers it itself with an error.
-                            debug!("dropping a call to a tool Codex does not provide");
-                            continue;
-                        };
-                        segment
-                            .message_calls
-                            .push(OutstandingCall { call_id, mcp_name });
+                    if !segment.track_tool_call(item, &self.registry) {
+                        continue;
                     }
-                    if !self
-                        .forward(ResponseEvent::OutputItemDone(item), segment)
-                        .await
-                    {
-                        return self.consumer_gone(segment).await;
-                    }
+                    false
                 }
                 ResponseEvent::Completed { .. } => {
                     // Claude Code runs every complete tool_use block, whatever the stop reason
@@ -907,23 +969,24 @@ impl Driver {
                     // calls always go back to Codex now.
                     if !segment.message_calls.is_empty() {
                         self.inner.outstanding = std::mem::take(&mut segment.message_calls);
-                        if !self.forward(event, segment).await {
-                            return self.consumer_gone(segment).await;
+                        true
+                    } else {
+                        // Unknown tools are answered by Claude Code; other completions wait
+                        // until its final result confirms the turn has ended.
+                        if stop_reason.as_deref() != Some("tool_use") {
+                            segment.held_completion = Some(event);
                         }
-                        self.persist().await;
-                        return Step::Done;
-                    }
-                    if stop_reason.as_deref() == Some("tool_use") {
-                        // Only tools Codex does not provide; Claude Code answers those itself.
                         continue;
                     }
-                    segment.held_completion = Some(event);
                 }
-                other => {
-                    if !self.forward(other, segment).await {
-                        return self.consumer_gone(segment).await;
-                    }
-                }
+                _ => false,
+            };
+            if !self.forward(event, segment).await {
+                return self.consumer_gone(segment).await;
+            }
+            if finishes_segment {
+                self.persist().await;
+                return Step::Done;
             }
         }
         Step::Continue
@@ -936,49 +999,15 @@ impl Driver {
             .as_ref()
             .is_some_and(|process| process.init_seen);
         if !init_seen && !segment.forwarded_any && self.fallback.is_some() {
-            self.stop_process().await;
+            self.inner.stop_process(&self.core, RESTARTED_MESSAGE).await;
             return self.run_fallback().await;
         }
         // A started session holds this query's input even when the query failed, so the cursor
         // stays advanced and a retry continues it rather than repeating the input. Without
         // `system/init` there is no session, so the next request reseeds a fresh one.
-        forget_unstarted_session(&mut self.inner);
+        self.inner.forget_unstarted();
         self.inner.query_in_flight = false;
-        let is_error = value
-            .get("is_error")
-            .and_then(Value::as_bool)
-            .unwrap_or(false);
-        let outcome = if is_error {
-            Err(result_error(value))
-        } else if let Some(err) = segment.held_error.take() {
-            Err(err)
-        } else {
-            let completion = match segment.held_completion.take() {
-                Some(ResponseEvent::Completed {
-                    response_id,
-                    token_usage,
-                    usage_metadata,
-                    ..
-                }) => ResponseEvent::Completed {
-                    response_id,
-                    token_usage,
-                    usage_metadata,
-                    end_turn: Some(true),
-                },
-                _ => ResponseEvent::Completed {
-                    response_id: String::new(),
-                    token_usage: value
-                        .get("usage")
-                        .and_then(|usage| {
-                            serde_json::from_value::<AnthropicUsage>(usage.clone()).ok()
-                        })
-                        .map(AnthropicUsage::to_token_usage),
-                    usage_metadata: None,
-                    end_turn: Some(true),
-                },
-            };
-            Ok(completion)
-        };
+        let outcome = segment.finish(value);
         self.persist().await;
         let _ = self.tx.send(outcome).await;
         Step::Done
@@ -991,13 +1020,12 @@ impl Driver {
         let init_seen = process.init_seen;
         let description = process.exit_description().await;
         drop(process);
-        self.inner.query_in_flight = false;
-        self.inner.outstanding.clear();
+        self.inner.clear_query();
         self.core.fail_all(RESTARTED_MESSAGE);
         if !init_seen && !segment.forwarded_any && self.fallback.is_some() {
             return self.run_fallback().await;
         }
-        forget_unstarted_session(&mut self.inner);
+        self.inner.forget_unstarted();
         self.fail(ApiError::Stream(format!(
             "Claude Code exited before the turn finished ({description})"
         )))
@@ -1013,23 +1041,10 @@ impl Driver {
         };
         warn!("could not attach to the previous Claude Code session; starting a fresh one");
         let id = Uuid::new_v4();
-        reset_session(&mut self.inner, &self.core, id).await;
-        let spec = SpawnSpec {
-            command: &self.config.command,
-            cwd: &self.config.cwd,
-            model: &self.model,
-            effort: fallback.key.effort.as_deref(),
-            system_prompt_file: &self.prompt_path,
-            mcp_config: &self.mcp_config,
-            session: SessionArg::New(id),
-        };
-        match ClaudeProcess::spawn(&spec, fallback.key.clone()) {
-            Ok(process) => self.inner.process = Some(process),
-            Err(err) => {
-                forget_unstarted_session(&mut self.inner);
-                self.fail(err).await;
-                return Step::Done;
-            }
+        self.inner.reset(&self.core, id).await;
+        if let Err(err) = self.launch.spawn(&mut self.inner, SessionArg::New(id)) {
+            self.fail(err).await;
+            return Step::Done;
         }
         deliver_input(
             &mut self.inner,
@@ -1066,15 +1081,6 @@ impl Driver {
         Step::Done
     }
 
-    async fn stop_process(&mut self) {
-        if let Some(mut process) = self.inner.process.take() {
-            process.kill().await;
-        }
-        self.inner.query_in_flight = false;
-        self.inner.outstanding.clear();
-        self.core.fail_all(RESTARTED_MESSAGE);
-    }
-
     async fn forward(&self, event: ResponseEvent, segment: &mut Segment) -> bool {
         segment.forwarded_any = true;
         self.tx.send(Ok(event)).await.is_ok()
@@ -1095,10 +1101,10 @@ impl Driver {
             session_id: session_id.to_string(),
             synced_len: self.inner.synced_len,
             prefix_hash: self.inner.prefix_hash.clone(),
-            model: self.model.clone(),
+            model: self.launch.key.model.clone(),
         };
-        let state_dir = self.config.state_dir.clone();
-        let thread_id = self.config.thread_id.clone();
+        let state_dir = self.launch.config.state_dir.clone();
+        let thread_id = self.launch.config.thread_id.clone();
         let result =
             tokio::task::spawn_blocking(move || save_session(&state_dir, &thread_id, &session))
                 .await;

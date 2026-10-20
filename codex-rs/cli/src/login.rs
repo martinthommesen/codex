@@ -470,31 +470,15 @@ experimental native OAuth with `codex login --provider claude-oauth`."
         "No API key provided via stdin.",
     );
     let config = load_config_or_exit(cli_config_overrides).await;
-    match crate::claude_login::login_anthropic_with_api_key(&config, &api_key) {
-        Ok(message) => {
-            eprintln!("{message}");
-            std::process::exit(0);
-        }
-        Err(message) => {
-            eprintln!("{message}");
-            std::process::exit(1);
-        }
-    }
+    exit_with(crate::claude_login::login_anthropic_with_api_key(
+        &config, &api_key,
+    ));
 }
 
 /// Connects the official Claude Code CLI (its own sign-in), leaving ChatGPT credentials untouched.
 pub async fn run_login_claude_code(cli_config_overrides: CliConfigOverrides) -> ! {
     let config = load_config_or_exit(cli_config_overrides).await;
-    match crate::claude_login::login_claude_code(&config).await {
-        Ok(message) => {
-            eprintln!("{message}");
-            std::process::exit(0);
-        }
-        Err(message) => {
-            eprintln!("{message}");
-            std::process::exit(1);
-        }
-    }
+    exit_with(crate::claude_login::login_claude_code(&config).await);
 }
 
 /// Explicitly opts into native experimental Claude OAuth without changing other credentials.
@@ -513,56 +497,50 @@ pub async fn run_login_status(
     provider: Option<LoginProvider>,
 ) -> ! {
     let config = load_config_or_exit(cli_config_overrides).await;
-    match provider {
-        Some(LoginProvider::Anthropic) => {
-            let (connected, message) = crate::claude_login::anthropic_status(&config);
-            eprintln!("{message}");
-            std::process::exit(if connected { 0 } else { 1 });
-        }
-        Some(LoginProvider::ClaudeCode) => {
-            let (connected, message) = crate::claude_login::claude_code_status(&config).await;
-            eprintln!("{message}");
-            std::process::exit(if connected { 0 } else { 1 });
-        }
-        Some(LoginProvider::ClaudeOauth) => {
-            let (connected, message) = crate::claude_oauth_login::status(&config);
-            eprintln!("{message}");
-            std::process::exit(if connected { 0 } else { 1 });
-        }
+    let (connected, message) = match provider {
+        Some(LoginProvider::Anthropic) => crate::claude_login::anthropic_status(&config),
+        Some(LoginProvider::ClaudeCode) => crate::claude_login::claude_code_status(&config).await,
+        Some(LoginProvider::ClaudeOauth) => crate::claude_oauth_login::status(&config),
         Some(LoginProvider::All) => {
             let (openai_ok, openai) = openai_login_status(&config).await;
             let (anthropic_ok, anthropic) = crate::claude_login::anthropic_status(&config);
             let (claude_code_ok, claude_code) =
                 crate::claude_login::claude_code_status(&config).await;
             let (claude_oauth_ok, claude_oauth) = crate::claude_oauth_login::status(&config);
-            eprintln!("OpenAI: {openai}\n{anthropic}\n{claude_code}\n{claude_oauth}");
             let any = openai_ok || anthropic_ok || claude_code_ok || claude_oauth_ok;
-            std::process::exit(if any { 0 } else { 1 });
+            (
+                any,
+                format!("OpenAI: {openai}\n{anthropic}\n{claude_code}\n{claude_oauth}"),
+            )
         }
-        Some(LoginProvider::Openai) | None => {}
-    }
-
-    let (logged_in, message) = openai_login_status(&config).await;
+        Some(LoginProvider::Openai) | None => default_login_status(&config).await,
+    };
     eprintln!("{message}");
+    std::process::exit(if connected { 0 } else { 1 });
+}
+
+async fn default_login_status(config: &Config) -> (bool, String) {
+    let (logged_in, openai) = openai_login_status(config).await;
+    let mut messages = vec![openai];
     // Mention connected Claude providers without changing the exit status, which keeps
     // describing the OpenAI login for scripts.
-    let (anthropic_ok, anthropic) = crate::claude_login::anthropic_status(&config);
+    let (anthropic_ok, anthropic) = crate::claude_login::anthropic_status(config);
     if anthropic_ok {
-        eprintln!("{anthropic}");
+        messages.push(anthropic);
     }
     if config
         .codex_home
         .join(codex_core::provider_models::CLAUDE_CODE_CONNECTED_MARKER)
         .exists()
     {
-        let (_, claude_code) = crate::claude_login::claude_code_status(&config).await;
-        eprintln!("{claude_code}");
+        let (_, claude_code) = crate::claude_login::claude_code_status(config).await;
+        messages.push(claude_code);
     }
-    let (claude_oauth_ok, claude_oauth) = crate::claude_oauth_login::status(&config);
+    let (claude_oauth_ok, claude_oauth) = crate::claude_oauth_login::status(config);
     if claude_oauth_ok {
-        eprintln!("{claude_oauth}");
+        messages.push(claude_oauth);
     }
-    std::process::exit(if logged_in { 0 } else { 1 });
+    (logged_in, messages.join("\n"))
 }
 
 /// Describes the ChatGPT/OpenAI login; `true` when logged in.

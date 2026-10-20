@@ -55,6 +55,7 @@ const SCOPE: &str =
     "user:profile user:inference user:sessions:claude_code user:mcp_servers user:file_upload";
 const KEYRING_SERVICE: &str = "Codex Claude OAuth";
 const REFRESH_LEAD_SECONDS: u64 = 60;
+const MAX_REFRESH_ATTEMPTS: u64 = 3;
 const MAX_RESPONSE_BYTES: usize = 1024 * 1024;
 
 static EPHEMERAL: LazyLock<Mutex<HashMap<String, ClaudeOAuthCredential>>> =
@@ -98,6 +99,25 @@ impl ClaudeOAuthCredential {
     }
     pub fn expires_at(&self) -> u64 {
         self.expires_at
+    }
+
+    fn is_fresh(&self) -> bool {
+        !self.refresh_requires_login && self.expires_at > now().saturating_add(REFRESH_LEAD_SECONDS)
+    }
+
+    fn ensure_refresh_allowed(&self) -> io::Result<()> {
+        if self.refresh_requires_login {
+            return Err(io::Error::other(
+                "Claude OAuth refresh cannot safely be replayed; run codex login --provider claude-oauth",
+            ));
+        }
+        if self.refresh_blocked_until > now() {
+            return Err(io::Error::other(format!(
+                "Claude OAuth refresh is rate limited until Unix time {}; no alternate billing provider was used",
+                self.refresh_blocked_until
+            )));
+        }
+        Ok(())
     }
 }
 
@@ -426,9 +446,7 @@ impl ClaudeOAuthAuthConfig {
         let Some(credential) = self.load_stored_credential()? else {
             return Ok(None);
         };
-        if !credential.refresh_requires_login
-            && credential.expires_at > now().saturating_add(REFRESH_LEAD_SECONDS)
-        {
+        if credential.is_fresh() {
             return Ok(Some(credential));
         }
         let refresh_lock = {
@@ -442,84 +460,96 @@ impl ClaudeOAuthAuthConfig {
         let _local_guard = refresh_lock.lock_owned().await;
         let _file_guard = self.lock_credentials().await?;
         // Reload after both locks: another Codex process may have rotated the refresh token.
-        let Some(mut credential) = self.load_stored_credential()? else {
+        let Some(credential) = self.load_stored_credential()? else {
             return Ok(None);
         };
-        if !credential.refresh_requires_login
-            && credential.expires_at > now().saturating_add(REFRESH_LEAD_SECONDS)
-        {
+        if credential.is_fresh() {
             return Ok(Some(credential));
         }
-        if credential.refresh_requires_login {
-            return Err(io::Error::other(
-                "Claude OAuth refresh cannot safely be replayed; run codex login --provider claude-oauth",
-            ));
-        }
-        if credential.refresh_blocked_until > now() {
-            return Err(io::Error::other(format!(
-                "Claude OAuth refresh is rate limited until Unix time {}; no alternate billing provider was used",
-                credential.refresh_blocked_until
-            )));
-        }
+        self.refresh_credential(credential).await.map(Some)
+    }
+
+    /// Called with both refresh locks held, using the credential reloaded under those locks.
+    async fn refresh_credential(
+        &self,
+        mut credential: ClaudeOAuthCredential,
+    ) -> io::Result<ClaudeOAuthCredential> {
+        credential.ensure_refresh_allowed()?;
         // Persist before sending: cancellation, a crash, or a lost successful response must
         // not cause a second process to replay a potentially consumed refresh token.
         credential.refresh_requires_login = true;
         self.save(&credential)?;
         let client = control_client()?;
-        for attempt in 0..3 {
-            let response = client.post(&self.endpoints.token).json(&RefreshGrant {
-                client_id: CLIENT_ID,
-                grant_type: "refresh_token",
-                refresh_token: &credential.refresh_token,
-                scope: SCOPE,
-            }).send().await.map_err(|_| io::Error::other("Claude OAuth refresh response was lost; restart login to avoid replaying a rotating refresh token"))?;
-            let status = response.status();
-            if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
-                credential.refresh_requires_login = false;
-                credential.refresh_blocked_until =
-                    now().saturating_add(refresh_backoff(response.headers()));
-                self.save(&credential)?;
-                return Err(io::Error::other(
-                    "Claude OAuth refresh is rate limited; respect Retry-After and retry later",
-                ));
-            }
-            if status.is_server_error() && attempt < 2 {
-                tokio::time::sleep(Duration::from_secs(attempt + 1)).await;
-                continue;
-            }
-            if !status.is_success() {
-                if status.is_server_error() {
-                    credential.refresh_requires_login = false;
-                    credential.refresh_blocked_until = now().saturating_add(5);
-                    self.save(&credential)?;
-                }
-                return Err(status_error(status, "refresh"));
-            }
-            let token: TokenResponse = decode_success(response, "refresh").await?;
-            validate_token(&token, false)?;
-            credential.access_token = token.access_token;
-            if !token.refresh_token.is_empty() {
-                credential.refresh_token = token.refresh_token;
-            }
-            credential.expires_at = now().saturating_add(token.expires_in);
-            credential.refresh_blocked_until = 0;
-            // Save rotation BEFORE advisory account lookup, including cancellation/failure.
-            self.save(&credential)?;
-            if let Ok(profile) = self.fetch_profile(&client, &credential.access_token).await
-                && profile.account.uuid != credential.account_uuid
-            {
-                credential.refresh_requires_login = true;
-                credential.expires_at = 0;
-                self.save(&credential)?;
-                return Err(io::Error::other(
-                    "Claude OAuth refresh returned a different account; login again",
-                ));
-            }
+        let response = self
+            .request_refresh(&client, &credential.refresh_token)
+            .await?;
+        let status = response.status();
+        if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
             credential.refresh_requires_login = false;
+            credential.refresh_blocked_until =
+                now().saturating_add(refresh_backoff(response.headers()));
             self.save(&credential)?;
-            return Ok(Some(credential));
+            return Err(io::Error::other(
+                "Claude OAuth refresh is rate limited; respect Retry-After and retry later",
+            ));
         }
-        Err(io::Error::other("Claude OAuth refresh failed"))
+        if !status.is_success() {
+            if status.is_server_error() {
+                credential.refresh_requires_login = false;
+                credential.refresh_blocked_until = now().saturating_add(5);
+                self.save(&credential)?;
+            }
+            return Err(status_error(status, "refresh"));
+        }
+        let token: TokenResponse = decode_success(response, "refresh").await?;
+        validate_token(&token, false)?;
+        credential.access_token = token.access_token;
+        if !token.refresh_token.is_empty() {
+            credential.refresh_token = token.refresh_token;
+        }
+        credential.expires_at = now().saturating_add(token.expires_in);
+        credential.refresh_blocked_until = 0;
+        // Save rotation BEFORE advisory account lookup, including cancellation/failure.
+        self.save(&credential)?;
+        if let Ok(profile) = self.fetch_profile(&client, &credential.access_token).await
+            && profile.account.uuid != credential.account_uuid
+        {
+            credential.refresh_requires_login = true;
+            credential.expires_at = 0;
+            self.save(&credential)?;
+            return Err(io::Error::other(
+                "Claude OAuth refresh returned a different account; login again",
+            ));
+        }
+        credential.refresh_requires_login = false;
+        self.save(&credential)?;
+        Ok(credential)
+    }
+
+    async fn request_refresh(
+        &self,
+        client: &reqwest::Client,
+        refresh_token: &str,
+    ) -> io::Result<reqwest::Response> {
+        let mut attempt = 1;
+        loop {
+            let response = client
+                .post(&self.endpoints.token)
+                .json(&RefreshGrant {
+                    client_id: CLIENT_ID,
+                    grant_type: "refresh_token",
+                    refresh_token,
+                    scope: SCOPE,
+                })
+                .send()
+                .await
+                .map_err(|_| io::Error::other("Claude OAuth refresh response was lost; restart login to avoid replaying a rotating refresh token"))?;
+            if !response.status().is_server_error() || attempt == MAX_REFRESH_ATTEMPTS {
+                return Ok(response);
+            }
+            tokio::time::sleep(Duration::from_secs(attempt)).await;
+            attempt += 1;
+        }
     }
 
     async fn fetch_profile(&self, client: &reqwest::Client, token: &str) -> io::Result<Profile> {

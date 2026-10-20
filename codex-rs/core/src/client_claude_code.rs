@@ -9,6 +9,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use codex_api::anthropic::AnthropicThinking;
+use codex_api::anthropic::collect_tool_declarations;
 use codex_api::anthropic::resolve_claude_reasoning;
 use codex_claude_code::ClaudeCodeSession;
 use codex_claude_code::ClaudeCodeSessionConfig;
@@ -16,7 +17,6 @@ use codex_claude_code::ClaudeCodeTurnRequest;
 use codex_claude_code::resolve_claude_command;
 use codex_otel::SessionTelemetry;
 use codex_protocol::config_types::ReasoningSummary as ReasoningSummaryConfig;
-use codex_protocol::models::ResponseItem;
 use codex_protocol::openai_models::ModelInfo;
 use codex_protocol::openai_models::ReasoningEffort as ReasoningEffortConfig;
 use codex_rollout_trace::InferenceTraceContext;
@@ -127,12 +127,7 @@ use the anthropic provider for structured output"
         }
         let input = prompt.get_formatted_input_for_request(model_info);
         let tools = create_tools_json_for_responses_api(&prompt.tools)?;
-        let mut declarations = tools.clone();
-        for item in &input {
-            if let ResponseItem::AdditionalTools { tools, .. } = item {
-                declarations.extend(tools.iter().cloned());
-            }
-        }
+        let declarations = collect_tool_declarations(&tools, &input);
         warnings.extend(codex_claude_code::unsupported_tool_notes(&declarations));
         client.emit_claude_warnings(responses_metadata, warnings);
 

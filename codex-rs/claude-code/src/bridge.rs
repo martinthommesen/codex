@@ -14,6 +14,7 @@ use codex_uds::UnixListener;
 use serde_json::Value;
 use serde_json::json;
 use std::collections::BTreeMap;
+use std::collections::VecDeque;
 use std::io::ErrorKind;
 use std::path::Path;
 use std::path::PathBuf;
@@ -157,10 +158,29 @@ struct BridgeState {
     next_connection: u64,
     parked: Vec<ParkedCall>,
     /// Outputs supplied before Claude Code sent the matching `tools/call`.
-    prepared: Vec<PreparedAnswer>,
+    prepared: VecDeque<PreparedAnswer>,
     /// A call carried a tool_use id. Claude Code then tags all its calls, so calls without one
     /// come from another client and are refused instead of matched by name.
     tagged_calls_seen: bool,
+}
+
+impl BridgeState {
+    /// Removes matching calls before responding, keeping every release path consistent.
+    fn fail_parked(&mut self, message: &str, predicate: impl FnMut(&ParkedCall) -> bool) -> usize {
+        let (failed, kept): (Vec<_>, Vec<_>) = std::mem::take(&mut self.parked)
+            .into_iter()
+            .partition(predicate);
+        self.parked = kept;
+        for call in &failed {
+            respond(self, call, crate::history::error_tool_result(message));
+        }
+        failed.len()
+    }
+
+    fn take_prepared(&mut self, predicate: impl FnMut(&PreparedAnswer) -> bool) -> Option<Value> {
+        let position = self.prepared.iter().position(predicate)?;
+        self.prepared.remove(position).map(|answer| answer.result)
+    }
 }
 
 /// Shared bridge state; the socket listener lives in [`Bridge`].
@@ -215,9 +235,9 @@ impl BridgeCore {
             }
             None => {
                 if state.prepared.len() >= MAX_PREPARED {
-                    state.prepared.remove(0);
+                    state.prepared.pop_front();
                 }
-                state.prepared.push(PreparedAnswer {
+                state.prepared.push_back(PreparedAnswer {
                     call_id: call_id.to_string(),
                     mcp_name: mcp_name.to_string(),
                     result,
@@ -230,33 +250,19 @@ impl BridgeCore {
     /// `expected` (calls Codex will run). Returns how many were answered.
     pub(crate) fn fail_unexpected_parked(&self, expected: &[String], grace: Duration) -> usize {
         let mut state = self.lock();
-        let (stale, kept): (Vec<_>, Vec<_>) = std::mem::take(&mut state.parked)
-            .into_iter()
-            .partition(|call| {
-                call.parked_at.elapsed() >= grace
-                    && !call
-                        .tool_use_id
-                        .as_ref()
-                        .is_some_and(|id| expected.contains(id))
-            });
-        state.parked = kept;
-        for call in &stale {
-            respond(
-                &state,
-                call,
-                crate::history::error_tool_result(UNEXPECTED_CALL_MESSAGE),
-            );
-        }
-        stale.len()
+        state.fail_parked(UNEXPECTED_CALL_MESSAGE, |call| {
+            call.parked_at.elapsed() >= grace
+                && !call
+                    .tool_use_id
+                    .as_ref()
+                    .is_some_and(|id| expected.contains(id))
+        })
     }
 
     /// Fails every parked call with `message` and drops prepared answers.
     pub(crate) fn fail_all(&self, message: &str) {
         let mut state = self.lock();
-        let parked = std::mem::take(&mut state.parked);
-        for call in &parked {
-            respond(&state, call, crate::history::error_tool_result(message));
-        }
+        state.fail_parked(message, |_| true);
         state.prepared.clear();
     }
 
@@ -381,29 +387,14 @@ impl BridgeCore {
             Some(tool_use_id) => {
                 if !state.tagged_calls_seen {
                     state.tagged_calls_seen = true;
-                    let (untagged, tagged): (Vec<_>, Vec<_>) = std::mem::take(&mut state.parked)
-                        .into_iter()
-                        .partition(|call| call.tool_use_id.is_none());
-                    state.parked = tagged;
-                    for call in &untagged {
-                        respond(
-                            &state,
-                            call,
-                            crate::history::error_tool_result(UNTAGGED_CALL_MESSAGE),
-                        );
-                    }
+                    state.fail_parked(UNTAGGED_CALL_MESSAGE, |call| call.tool_use_id.is_none());
                 }
                 // An answer Codex already supplied wins even if the next request exposes a
                 // different tool set (for example a compaction request with no tools): Claude
                 // Code sends serial calls only after earlier ones resolve, and Codex has already
                 // run this one.
-                if let Some(position) = state
-                    .prepared
-                    .iter()
-                    .position(|answer| &answer.call_id == tool_use_id)
-                {
-                    let answer = state.prepared.remove(position);
-                    return Some(result_response(id, answer.result));
+                if let Some(result) = state.take_prepared(|answer| &answer.call_id == tool_use_id) {
+                    return Some(result_response(id, result));
                 }
             }
             None if state.tagged_calls_seen => {
@@ -423,13 +414,9 @@ impl BridgeCore {
             ));
         }
         if tool_use_id.is_none()
-            && let Some(position) = state
-                .prepared
-                .iter()
-                .position(|answer| answer.mcp_name == mcp_name)
+            && let Some(result) = state.take_prepared(|answer| answer.mcp_name == mcp_name)
         {
-            let answer = state.prepared.remove(position);
-            return Some(result_response(id, answer.result));
+            return Some(result_response(id, result));
         }
         let parked_here = state
             .parked
