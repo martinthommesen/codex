@@ -1007,9 +1007,124 @@ fn deserialize_model_providers<'de, D>(
 where
     D: serde::Deserializer<'de>,
 {
-    let model_providers = HashMap::<String, ModelProviderInfo>::deserialize(deserializer)?;
+    let entries = HashMap::<String, ModelProviderOverride>::deserialize(deserializer)?;
+    let model_providers = model_provider_overrides(entries).map_err(serde::de::Error::custom)?;
     validate_model_providers(&model_providers).map_err(serde::de::Error::custom)?;
     Ok(model_providers)
+}
+
+// Preserve whether a wire protocol was explicitly set until the built-in id is known.
+// Otherwise an explicit `responses` is indistinguishable from an omitted default.
+struct ModelProviderOverride {
+    wire_api: Option<codex_model_provider_info::WireApi>,
+    provider: ModelProviderInfo,
+}
+
+impl<'de> Deserialize<'de> for ModelProviderOverride {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct ProviderVisitor;
+        impl<'de> serde::de::Visitor<'de> for ProviderVisitor {
+            type Value = ModelProviderOverride;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("a model provider override")
+            }
+
+            fn visit_map<M>(self, map: M) -> Result<Self::Value, M::Error>
+            where
+                M: serde::de::MapAccess<'de>,
+            {
+                let mut wire_api = None;
+                let provider = ModelProviderInfo::deserialize(
+                    serde::de::value::MapAccessDeserializer::new(ProviderOverrideMap {
+                        inner: map,
+                        wire_api: &mut wire_api,
+                        next_is_wire_api: false,
+                    }),
+                )?;
+                Ok(ModelProviderOverride { provider, wire_api })
+            }
+        }
+        deserializer.deserialize_map(ProviderVisitor)
+    }
+}
+
+// Forward the original map instead of buffering a flattened struct. This preserves
+// serde_ignored's paths and warnings for unrecognized provider settings.
+struct ProviderOverrideMap<'a, M> {
+    inner: M,
+    wire_api: &'a mut Option<codex_model_provider_info::WireApi>,
+    next_is_wire_api: bool,
+}
+
+impl<'de, M: serde::de::MapAccess<'de>> serde::de::MapAccess<'de> for ProviderOverrideMap<'_, M> {
+    type Error = M::Error;
+
+    fn next_key_seed<K>(&mut self, seed: K) -> Result<Option<K::Value>, Self::Error>
+    where
+        K: serde::de::DeserializeSeed<'de>,
+    {
+        let Some(key) = self.inner.next_key::<String>()? else {
+            return Ok(None);
+        };
+        self.next_is_wire_api = key == "wire_api";
+        seed.deserialize(serde::de::value::StringDeserializer::<Self::Error>::new(
+            key,
+        ))
+        .map(Some)
+    }
+
+    fn next_value_seed<V>(&mut self, seed: V) -> Result<V::Value, Self::Error>
+    where
+        V: serde::de::DeserializeSeed<'de>,
+    {
+        if self.next_is_wire_api {
+            let wire_api: codex_model_provider_info::WireApi = self.inner.next_value()?;
+            *self.wire_api = Some(wire_api);
+            seed.deserialize(serde::de::value::StringDeserializer::<Self::Error>::new(
+                wire_api.to_string(),
+            ))
+        } else {
+            self.inner.next_value_seed(seed)
+        }
+    }
+}
+
+fn model_provider_overrides(
+    entries: HashMap<String, ModelProviderOverride>,
+) -> Result<HashMap<String, ModelProviderInfo>, String> {
+    use codex_model_provider_info::WireApi;
+    entries.into_iter().map(|(id, entry)| {
+        let expected = match id.as_str() {
+            ANTHROPIC_PROVIDER_ID => Some(WireApi::AnthropicMessages),
+            CLAUDE_CODE_PROVIDER_ID => Some(WireApi::ClaudeCode),
+            CLAUDE_OAUTH_PROVIDER_ID => Some(WireApi::ClaudeOAuth),
+            _ => None,
+        };
+        if let (Some(expected), Some(configured)) = (expected, entry.wire_api)
+            && expected != configured
+        {
+            return Err(format!("model_providers.{id} is a built-in provider and cannot be redefined with wire_api = \"{configured}\"; rename your custom provider (for example `{id}-custom`)"));
+        }
+        let mut provider = entry.provider;
+        provider.wire_api = entry.wire_api.or(expected).unwrap_or_default();
+        Ok((id, provider))
+    }).collect()
+}
+
+pub(crate) fn deserialize_optional_model_providers<'de, D>(
+    deserializer: D,
+) -> Result<Option<HashMap<String, ModelProviderInfo>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Option::<HashMap<String, ModelProviderOverride>>::deserialize(deserializer)?
+        .map(model_provider_overrides)
+        .transpose()
+        .map_err(serde::de::Error::custom)
 }
 
 #[cfg(test)]
@@ -1036,6 +1151,23 @@ pub fn validate_oss_provider(provider: &str) -> std::io::Result<()> {
 mod tests {
     use super::*;
     use pretty_assertions::assert_eq;
+
+    #[test]
+    fn explicit_responses_wire_cannot_redefine_a_builtin_claude_provider() {
+        for provider in [
+            ANTHROPIC_PROVIDER_ID,
+            CLAUDE_CODE_PROVIDER_ID,
+            CLAUDE_OAUTH_PROVIDER_ID,
+        ] {
+            let source = format!("[model_providers.{provider}]\nwire_api = 'responses'");
+            let error = toml::from_str::<ConfigToml>(&source)
+                .expect_err("an explicit wire protocol cannot be silently discarded");
+            assert!(error.to_string().contains(provider), "{error}");
+            let error = toml::from_str::<crate::ConfigRequirementsToml>(&source)
+                .expect_err("managed overrides must preserve the same invariant");
+            assert!(error.to_string().contains(provider), "{error}");
+        }
+    }
 
     #[test]
     fn claude_oauth_partial_override_does_not_require_a_custom_provider_name() {

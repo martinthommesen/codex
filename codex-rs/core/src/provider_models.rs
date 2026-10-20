@@ -140,7 +140,7 @@ pub(crate) fn provider_connection(
                     .load_stored_credential()
                     .ok()
                     .flatten()
-                    .is_some()
+                    .is_some_and(|credential| !credential.requires_login())
             });
         return if connected {
             ProviderConnection::Connected

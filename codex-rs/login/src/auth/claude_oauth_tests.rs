@@ -28,6 +28,7 @@ fn credential(expiry: u64) -> ClaudeOAuthCredential {
         device_id: "ab".repeat(32),
         refresh_blocked_until: 0,
         refresh_requires_login: false,
+        profile_validation_pending: false,
     }
 }
 
@@ -321,6 +322,160 @@ async fn code_exchange_validates_identity_before_secure_persistence() {
     );
     assert_eq!(credential.device_id().len(), 64);
     assert!(config.load_stored_credential().expect("stored").is_some());
+    assert!(
+        !home.path().join("secrets").exists(),
+        "ephemeral login must not write state to disk"
+    );
+}
+
+async fn wait_for_request(server: &MockServer, endpoint: &str) {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if server
+                .received_requests()
+                .await
+                .expect("requests")
+                .iter()
+                .any(|request| request.url.path() == endpoint)
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("request reaches mock server");
+}
+
+#[tokio::test]
+async fn cancelled_profile_validation_resumes_without_replaying_refresh() {
+    let home = tempfile::tempdir().expect("tempdir");
+    let server = MockServer::start().await;
+    let mut config = configuration(home.path(), AuthCredentialsStoreMode::Ephemeral);
+    mock_endpoints(&mut config, &server);
+    config.save(&credential(1)).expect("expired credential");
+    Mock::given(method("POST"))
+        .and(path("/token"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "access_token": "new-access", "refresh_token": "rotated-refresh", "expires_in": 3600
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/profile"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_delay(Duration::from_millis(200))
+                .set_body_json(serde_json::json!({
+                    "account": { "uuid": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa" }
+                })),
+        )
+        .expect(2)
+        .mount(&server)
+        .await;
+    let task = tokio::spawn({
+        let config = config.clone();
+        async move { config.resolve().await }
+    });
+    wait_for_request(&server, "/profile").await;
+    task.abort();
+    assert!(task.await.expect_err("cancelled resolver").is_cancelled());
+
+    let resolved = config
+        .resolve()
+        .await
+        .expect("resume profile check")
+        .expect("credential");
+    assert_eq!(resolved.access_token(), "new-access");
+    assert_eq!(resolved.refresh_token, "rotated-refresh");
+    assert!(
+        !home.path().join("secrets").exists(),
+        "ephemeral refresh must not write state to disk"
+    );
+}
+
+#[tokio::test]
+async fn refresh_preparation_failure_does_not_invalidate_credentials() {
+    let home = tempfile::tempdir().expect("tempdir");
+    let mut config = configuration(home.path(), AuthCredentialsStoreMode::Ephemeral);
+    config.endpoints.token = "http://[invalid".to_string();
+    config.save(&credential(1)).expect("expired credential");
+    assert!(config.resolve().await.is_err());
+    let stored = config
+        .load_stored_credential()
+        .expect("load")
+        .expect("credential");
+    assert!(
+        !stored.refresh_requires_login,
+        "no request could consume the refresh token"
+    );
+}
+
+#[tokio::test]
+async fn an_expired_rotation_finishes_validation_then_refreshes_the_rotated_token() {
+    let home = tempfile::tempdir().expect("tempdir");
+    let server = MockServer::start().await;
+    let mut config = configuration(home.path(), AuthCredentialsStoreMode::Ephemeral);
+    mock_endpoints(&mut config, &server);
+    let mut rotated = credential(1);
+    rotated.refresh_token = "first-rotation".to_string();
+    rotated.profile_validation_pending = true;
+    config
+        .save(&rotated)
+        .expect("saved rotation awaiting validation");
+    Mock::given(method("GET"))
+        .and(path("/profile"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "account": { "uuid": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa" }
+        })))
+        .expect(2)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST")).and(path("/token"))
+        .and(body_json(serde_json::json!({
+            "client_id": CLIENT_ID, "grant_type": "refresh_token", "refresh_token": "first-rotation", "scope": SCOPE
+        })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "access_token": "new-access", "refresh_token": "second-rotation", "expires_in": 3600
+        }))).expect(1).mount(&server).await;
+
+    let resolved = config
+        .resolve()
+        .await
+        .expect("refresh")
+        .expect("credential");
+    assert_eq!(resolved.refresh_token, "second-rotation");
+    assert!(resolved.is_fresh());
+}
+
+#[tokio::test]
+async fn ephemeral_logout_cannot_race_an_in_flight_refresh() {
+    let home = tempfile::tempdir().expect("tempdir");
+    let server = MockServer::start().await;
+    let mut config = configuration(home.path(), AuthCredentialsStoreMode::Ephemeral);
+    mock_endpoints(&mut config, &server);
+    config.save(&credential(1)).expect("expired credential");
+    Mock::given(method("POST")).and(path("/token"))
+        .respond_with(ResponseTemplate::new(200).set_delay(Duration::from_secs(5)).set_body_json(serde_json::json!({
+            "access_token": "new-access", "refresh_token": "rotated-refresh", "expires_in": 3600
+        }))).mount(&server).await;
+    let task = tokio::spawn({
+        let config = config.clone();
+        async move { config.resolve().await }
+    });
+    wait_for_request(&server, "/token").await;
+    assert_eq!(
+        config
+            .delete()
+            .expect_err("refresh owns credentials")
+            .kind(),
+        io::ErrorKind::WouldBlock
+    );
+    task.abort();
+    let _ = task.await;
+    assert!(config.delete().expect("logout after cancellation"));
+    assert!(config.load_stored_credential().expect("load").is_none());
 }
 
 #[tokio::test]

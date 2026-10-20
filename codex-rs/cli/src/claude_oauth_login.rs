@@ -21,6 +21,7 @@ use tokio::sync::oneshot;
 
 const MAX_CALLBACK_BYTES: usize = 64 * 1024;
 const LOGIN_TIMEOUT: Duration = Duration::from_secs(10 * 60);
+const LOGIN_CANCELLED: &str = "Claude OAuth login cancelled.";
 const EXPERIMENTAL_WARNING: &str = "Experimental Claude OAuth: this unofficial integration uses \
 undocumented compatibility behavior and may violate Anthropic's third-party authentication \
 policy or affect your account. Anthropic controls billing: subscription-quota treatment is \
@@ -80,14 +81,14 @@ check your Claude account's Usage and billing settings."
     tokio::select! {
         result = authorize => result,
         _ = tokio::time::sleep(LOGIN_TIMEOUT) => Err("Claude OAuth login timed out; start a new login.".to_string()),
-        _ = tokio::signal::ctrl_c() => Err("Claude OAuth login cancelled.".to_string()),
+        _ = tokio::signal::ctrl_c() => Err(LOGIN_CANCELLED.to_string()),
     }
 }
 
-/// Reports local credential presence without exchanging or refreshing credentials.
+/// Reports saved credential state without exchanging or refreshing credentials.
 pub(crate) fn status(config: &Config) -> (bool, String) {
     match auth_config(config).load_stored_credential() {
-        Ok(Some(credential)) => (true, describe_status(&credential)),
+        Ok(Some(credential)) => describe_status(&credential),
         Ok(None) => (
             false,
             "Claude OAuth (experimental): not configured (`codex login --provider claude-oauth`)"
@@ -100,7 +101,7 @@ pub(crate) fn status(config: &Config) -> (bool, String) {
     }
 }
 
-fn describe_status(credential: &ClaudeOAuthCredential) -> String {
+fn describe_status(credential: &ClaudeOAuthCredential) -> (bool, String) {
     let identity: String = credential
         .email()
         .chars()
@@ -111,14 +112,25 @@ fn describe_status(credential: &ClaudeOAuthCredential) -> String {
     } else {
         identity
     };
-    let expiration = if credential.expires_at() <= chrono::Utc::now().timestamp().max(0) as u64 {
-        "access token expired; refresh required on next request"
+    let now = chrono::Utc::now().timestamp().max(0) as u64;
+    let expiration = if credential.requires_login() {
+        "a previous refresh could not be completed safely; run `codex login --provider claude-oauth` again".to_string()
+    } else if credential.refresh_blocked_until() > now {
+        format!(
+            "refresh rate limited until Unix time {}",
+            credential.refresh_blocked_until()
+        )
+    } else if credential.expires_at() <= now {
+        "access token expired; refresh required on next request".to_string()
     } else {
-        "access token has not expired"
+        "access token has not expired".to_string()
     };
-    format!(
-        "Claude OAuth (experimental): saved credentials ({identity}; {expiration}). \
+    (
+        !credential.requires_login(),
+        format!(
+            "Claude OAuth (experimental): saved credentials ({identity}; {expiration}). \
 Local status only; entitlement and subscription-quota billing are unverified."
+        ),
     )
 }
 
@@ -138,6 +150,10 @@ Local logout does not revoke the grant at Anthropic; manage account access in Cl
 }
 
 async fn read_callback(callback_listener_available: bool) -> Result<String, String> {
+    callback_or_wait_for_browser(read_manual_callback().await, callback_listener_available).await
+}
+
+async fn read_manual_callback() -> Result<String, String> {
     if io::stdin().is_terminal() {
         return read_terminal_callback().await;
     }
@@ -151,16 +167,25 @@ async fn read_callback(callback_listener_available: bool) -> Result<String, Stri
             let _ = sender.send(read_callback_line(io::stdin().lock()));
         })
         .map_err(|_| "Could not start Claude OAuth callback input.".to_string())?;
-    let callback = receiver
+    receiver
         .await
-        .map_err(|_| "Claude OAuth callback input closed.".to_string())?;
+        .map_err(|_| "Claude OAuth callback input closed.".to_string())?
+}
+
+async fn callback_or_wait_for_browser(
+    callback: Result<String, String>,
+    callback_listener_available: bool,
+) -> Result<String, String> {
     if callback_listener_available
         && callback
             .as_ref()
-            .is_err_and(|error| error == "No Claude OAuth callback received before input closed.")
+            .is_err_and(|error| error != LOGIN_CANCELLED)
     {
-        // Detached or redirected stdin may be closed while a browser callback is still
-        // possible. Keep that listener alive until its deadline or user cancellation.
+        // Empty input, EOF, and terminal errors cannot cancel a working browser listener.
+        // Explicit Ctrl-C still cancels the entire login.
+        eprintln!(
+            "Manual callback input is unavailable; waiting for the browser callback. Press Ctrl-C to cancel."
+        );
         return futures::future::pending().await;
     }
     callback
@@ -220,12 +245,12 @@ async fn read_terminal_callback() -> Result<String, String> {
             Event::Key(key) if key.kind != KeyEventKind::Release => match key.code {
                 KeyCode::Enter => {
                     if input.is_empty() {
-                        return Err("No Claude OAuth callback entered.".to_string());
+                        continue;
                     }
                     return Ok(input);
                 }
                 KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                    return Err("Claude OAuth login cancelled.".to_string());
+                    return Err(LOGIN_CANCELLED.to_string());
                 }
                 KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                     return Err("Claude OAuth callback input closed.".to_string());

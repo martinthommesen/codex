@@ -60,7 +60,7 @@ const MAX_RESPONSE_BYTES: usize = 1024 * 1024;
 
 static EPHEMERAL: LazyLock<Mutex<HashMap<String, ClaudeOAuthCredential>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
-static REFRESH_LOCKS: LazyLock<Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>> =
+static CREDENTIAL_LOCKS: LazyLock<Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
 /// Tokens deliberately have no derived Debug implementation.
@@ -79,6 +79,9 @@ pub struct ClaudeOAuthCredential {
     /// A lost refresh response may have consumed the rotating refresh token. Never replay it.
     #[serde(default)]
     refresh_requires_login: bool,
+    /// Rotation succeeded, but cancellation may have interrupted its advisory account check.
+    #[serde(default)]
+    profile_validation_pending: bool,
 }
 
 impl ClaudeOAuthCredential {
@@ -101,8 +104,18 @@ impl ClaudeOAuthCredential {
         self.expires_at
     }
 
+    pub fn requires_login(&self) -> bool {
+        self.refresh_requires_login
+    }
+
+    pub fn refresh_blocked_until(&self) -> u64 {
+        self.refresh_blocked_until
+    }
+
     fn is_fresh(&self) -> bool {
-        !self.refresh_requires_login && self.expires_at > now().saturating_add(REFRESH_LEAD_SECONDS)
+        !self.refresh_requires_login
+            && !self.profile_validation_pending
+            && self.expires_at > now().saturating_add(REFRESH_LEAD_SECONDS)
     }
 
     fn ensure_refresh_allowed(&self) -> io::Result<()> {
@@ -358,6 +371,8 @@ impl ClaudeOAuthAuthConfig {
     /// Removes all Claude OAuth entries, including a store used before a backend change.
     /// This is local logout; the reference defines no verified token-revocation endpoint.
     pub fn delete(&self) -> io::Result<bool> {
+        // Include ephemeral credentials: an in-flight login or refresh must not restore them.
+        let _guard = self.try_lock_for_logout()?;
         let removed = EPHEMERAL
             .lock()
             .map_err(|_| storage_error())?
@@ -366,8 +381,6 @@ impl ClaudeOAuthAuthConfig {
         if self.store_mode == AuthCredentialsStoreMode::Ephemeral {
             return Ok(removed);
         }
-        // Serialize with refresh/login in other processes before deleting rotated credentials.
-        let _guard = self.try_lock_for_logout()?;
         // This file belongs exclusively to this provider. Removing its ciphertext
         // also works when the keyring is locked or its key has been lost.
         let encrypted = match std::fs::remove_file(self.codex_home.join("secrets/claude_oauth.age"))
@@ -436,6 +449,7 @@ impl ClaudeOAuthAuthConfig {
             device_id: hex_bytes(&random_bytes::<32>()?),
             refresh_blocked_until: 0,
             refresh_requires_login: false,
+            profile_validation_pending: false,
         };
         self.save(&credential)?;
         Ok(credential)
@@ -449,16 +463,7 @@ impl ClaudeOAuthAuthConfig {
         if credential.is_fresh() {
             return Ok(Some(credential));
         }
-        let refresh_lock = {
-            let mut locks = REFRESH_LOCKS.lock().map_err(|_| storage_error())?;
-            Arc::clone(
-                locks
-                    .entry(self.account())
-                    .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(()))),
-            )
-        };
-        let _local_guard = refresh_lock.lock_owned().await;
-        let _file_guard = self.lock_credentials().await?;
+        let _guard = self.lock_credentials().await?;
         // Reload after both locks: another Codex process may have rotated the refresh token.
         let Some(credential) = self.load_stored_credential()? else {
             return Ok(None);
@@ -475,14 +480,29 @@ impl ClaudeOAuthAuthConfig {
         mut credential: ClaudeOAuthCredential,
     ) -> io::Result<ClaudeOAuthCredential> {
         credential.ensure_refresh_allowed()?;
+        // Local preparation cannot consume a token, so finish it before persisting uncertainty.
+        let client = control_client()?;
+        if credential.profile_validation_pending {
+            credential = self.finish_refresh(&client, credential).await?;
+            if credential.is_fresh() {
+                return Ok(credential);
+            }
+        }
+        let request = client
+            .post(&self.endpoints.token)
+            .json(&RefreshGrant {
+                client_id: CLIENT_ID,
+                grant_type: "refresh_token",
+                refresh_token: &credential.refresh_token,
+                scope: SCOPE,
+            })
+            .build()
+            .map_err(|_| io::Error::other("could not prepare Claude OAuth refresh request"))?;
         // Persist before sending: cancellation, a crash, or a lost successful response must
         // not cause a second process to replay a potentially consumed refresh token.
         credential.refresh_requires_login = true;
         self.save(&credential)?;
-        let client = control_client()?;
-        let response = self
-            .request_refresh(&client, &credential.refresh_token)
-            .await?;
+        let response = Self::request_refresh(&client, request).await?;
         let status = response.status();
         if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
             credential.refresh_requires_login = false;
@@ -509,39 +529,42 @@ impl ClaudeOAuthAuthConfig {
         }
         credential.expires_at = now().saturating_add(token.expires_in);
         credential.refresh_blocked_until = 0;
-        // Save rotation BEFORE advisory account lookup, including cancellation/failure.
+        credential.refresh_requires_login = false;
+        credential.profile_validation_pending = true;
+        // A known rotation is recoverable: cancellation retries the profile check, never the grant.
         self.save(&credential)?;
-        if let Ok(profile) = self.fetch_profile(&client, &credential.access_token).await
+        self.finish_refresh(&client, credential).await
+    }
+
+    async fn finish_refresh(
+        &self,
+        client: &reqwest::Client,
+        mut credential: ClaudeOAuthCredential,
+    ) -> io::Result<ClaudeOAuthCredential> {
+        if let Ok(profile) = self.fetch_profile(client, &credential.access_token).await
             && profile.account.uuid != credential.account_uuid
         {
             credential.refresh_requires_login = true;
+            credential.profile_validation_pending = false;
             credential.expires_at = 0;
             self.save(&credential)?;
             return Err(io::Error::other(
                 "Claude OAuth refresh returned a different account; login again",
             ));
         }
-        credential.refresh_requires_login = false;
+        credential.profile_validation_pending = false;
         self.save(&credential)?;
         Ok(credential)
     }
 
     async fn request_refresh(
-        &self,
         client: &reqwest::Client,
-        refresh_token: &str,
+        request: reqwest::Request,
     ) -> io::Result<reqwest::Response> {
         let mut attempt = 1;
         loop {
             let response = client
-                .post(&self.endpoints.token)
-                .json(&RefreshGrant {
-                    client_id: CLIENT_ID,
-                    grant_type: "refresh_token",
-                    refresh_token,
-                    scope: SCOPE,
-                })
-                .send()
+                .execute(request.try_clone().ok_or_else(|| io::Error::other("could not prepare Claude OAuth refresh retry"))?)
                 .await
                 .map_err(|_| io::Error::other("Claude OAuth refresh response was lost; restart login to avoid replaying a rotating refresh token"))?;
             if !response.status().is_server_error() || attempt == MAX_REFRESH_ATTEMPTS {
@@ -585,7 +608,28 @@ impl ClaudeOAuthAuthConfig {
         options.open(directory.join("claude_oauth.lock"))
     }
 
-    async fn lock_credentials(&self) -> io::Result<File> {
+    fn credential_lock(&self) -> io::Result<Arc<tokio::sync::Mutex<()>>> {
+        let mut locks = CREDENTIAL_LOCKS.lock().map_err(|_| storage_error())?;
+        Ok(Arc::clone(
+            locks
+                .entry(self.account())
+                .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(()))),
+        ))
+    }
+
+    async fn lock_credentials(&self) -> io::Result<CredentialLock> {
+        let local = tokio::time::timeout(
+            Duration::from_secs(60),
+            self.credential_lock()?.lock_owned(),
+        )
+        .await
+        .map_err(|_| io::Error::other("timed out waiting for Claude OAuth credentials"))?;
+        if self.store_mode == AuthCredentialsStoreMode::Ephemeral {
+            return Ok(CredentialLock {
+                _file: None,
+                _local: local,
+            });
+        }
         let file = self.open_lock_file()?;
         tokio::time::timeout(Duration::from_secs(60), async {
             loop {
@@ -600,23 +644,48 @@ impl ClaudeOAuthAuthConfig {
         })
         .await
         .map_err(|_| io::Error::other("timed out waiting for Claude OAuth credentials"))??;
-        Ok(file)
+        Ok(CredentialLock {
+            _file: Some(file),
+            _local: local,
+        })
     }
 
-    fn try_lock_for_logout(&self) -> io::Result<File> {
+    fn try_lock_for_logout(&self) -> io::Result<CredentialLock> {
+        let local = self
+            .credential_lock()?
+            .try_lock_owned()
+            .map_err(|_| credentials_busy())?;
+        if self.store_mode == AuthCredentialsStoreMode::Ephemeral {
+            return Ok(CredentialLock {
+                _file: None,
+                _local: local,
+            });
+        }
         let file = self.open_lock_file()?;
         match file.try_lock() {
             Ok(()) => {}
             Err(TryLockError::WouldBlock) => {
-                return Err(io::Error::new(
-                    io::ErrorKind::WouldBlock,
-                    "Claude OAuth credentials are being updated; retry logout shortly",
-                ));
+                return Err(credentials_busy());
             }
             Err(error) => return Err(io::Error::from(error)),
         }
-        Ok(file)
+        Ok(CredentialLock {
+            _file: Some(file),
+            _local: local,
+        })
     }
+}
+
+struct CredentialLock {
+    _file: Option<File>,
+    _local: tokio::sync::OwnedMutexGuard<()>,
+}
+
+fn credentials_busy() -> io::Error {
+    io::Error::new(
+        io::ErrorKind::WouldBlock,
+        "Claude OAuth credentials are being updated; retry logout shortly",
+    )
 }
 
 #[derive(Serialize)]

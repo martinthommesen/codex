@@ -3,8 +3,57 @@ use codex_config::types::AuthCredentialsStoreMode;
 use codex_login::AnthropicAuthConfig;
 use codex_login::AuthKeyringBackendKind;
 use codex_login::login_with_api_key;
+use futures::FutureExt;
 use pretty_assertions::assert_eq;
 use tempfile::TempDir;
+
+#[test]
+fn unavailable_manual_input_does_not_cancel_a_browser_callback() {
+    for error in [
+        "No Claude OAuth callback entered.",
+        "Claude OAuth callback input closed.",
+        "Could not hide Claude OAuth callback input.",
+        "Could not read Claude OAuth callback input.",
+    ] {
+        assert!(
+            callback_or_wait_for_browser(Err(error.to_string()), true)
+                .now_or_never()
+                .is_none()
+        );
+        assert_eq!(
+            callback_or_wait_for_browser(Err(error.to_string()), false).now_or_never(),
+            Some(Err(error.to_string()))
+        );
+    }
+    assert_eq!(
+        callback_or_wait_for_browser(Err(LOGIN_CANCELLED.to_string()), true).now_or_never(),
+        Some(Err(LOGIN_CANCELLED.to_string()))
+    );
+    assert_eq!(
+        callback_or_wait_for_browser(Ok("code#state".to_string()), true).now_or_never(),
+        Some(Ok("code#state".to_string()))
+    );
+}
+
+#[test]
+fn oauth_status_explains_unusable_credentials_and_refresh_backoff() {
+    let mut value = serde_json::json!({
+        "version": 1, "access_token": "access-secret", "refresh_token": "refresh-secret",
+        "expires_at": u64::MAX, "account_uuid": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+        "organization_uuid": "", "email": "example@example.com", "device_id": "ab".repeat(32),
+        "refresh_requires_login": true,
+    });
+    let credential = serde_json::from_value(value.clone()).expect("credential");
+    let (connected, message) = describe_status(&credential);
+    assert!(!connected);
+    assert!(message.contains("codex login --provider claude-oauth"));
+    assert!(!message.contains("secret"));
+    value["refresh_requires_login"] = serde_json::json!(false);
+    value["refresh_blocked_until"] = serde_json::json!(u64::MAX);
+    let (connected, message) = describe_status(&serde_json::from_value(value).expect("credential"));
+    assert!(connected, "a temporary backoff keeps the configured login");
+    assert!(message.contains("refresh rate limited"));
+}
 
 #[test]
 fn manual_input_accepts_callback_url_and_code_without_echoing_or_rewriting() {

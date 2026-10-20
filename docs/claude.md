@@ -151,7 +151,8 @@ It listens on loopback port `54545` for `http://localhost:54545/callback`. If th
 reach that listener (for example, over SSH), paste the full callback URL or `code#state` into the
 terminal's hidden prompt. A bare code is rejected because it cannot verify the returned state.
 Manual completion remains available if the port cannot be bound. Login times out after ten
-minutes and can be cancelled with Ctrl-C. Never put the code or callback URL in shell arguments,
+minutes and can be cancelled with Ctrl-C. Empty manual input, EOF, or an unavailable terminal does
+not cancel a working browser listener. Never put the code or callback URL in shell arguments,
 logs, or a shared chat.
 
 Codex performs OAuth authorization with S256 PKCE and a random state value checked before the
@@ -162,7 +163,8 @@ registration. API-key/token input flags, device authentication, and custom OAuth
 flags cannot be used with this provider. A successful profile lookup identifies the signed-in
 account; it is not proof of
 model entitlement or subscription-quota treatment. `login status --provider claude-oauth` reports
-local credential presence, saved identity, and expiration; it does not contact Anthropic to
+local credential presence, saved identity, expiration, refresh backoff, and whether a new login is
+required; it does not contact Anthropic to
 validate or refresh the login. Logout deletes Codex's local OAuth credential only. It does not
 revoke the authorization grant at Anthropic; manage account grants separately if available.
 
@@ -177,7 +179,10 @@ from `auth.json`, `anthropic_auth.json`, and Claude Code's credentials.
 
 Access tokens refresh shortly before expiration. In-process synchronization and a per-home file
 lock serialize refresh across agents/processes, then reload the latest rotated credential.
-Rotation is persisted before optional profile follow-up. Rate-limited refresh honors bounded
+Rotation is persisted before optional profile follow-up. Cancellation during that follow-up leaves
+the rotated credential recoverable: the next request repeats only the account check. Local client
+or request preparation errors do not invalidate a refresh token. Ephemeral storage uses an
+in-process lock and creates no credential files or lock files. Rate-limited refresh honors bounded
 `Retry-After`/`Retry-After-Ms` backoff. An interrupted or ambiguous single-use refresh is not blindly
 replayed; sign in again if Codex cannot safely recover it. Refresh tokens are single-use, so Codex
 marks a refresh as in progress before sending it. If that request fails for any network reason
@@ -185,7 +190,7 @@ marks a refresh as in progress before sending it. If that request fails for any 
 or the process stops mid-refresh, Codex cannot tell whether the token was consumed: it then
 requires `codex login --provider claude-oauth` again instead of retrying, so one transient network
 failure can force a new login. Only an HTTP 429 or three 5xx responses in a row leave the login
-usable. `codex login status --provider claude-oauth` does not show that a new login is required.
+usable. `codex login status --provider claude-oauth` reports when a new login is required.
 Revocation or an account-identity change also requires an explicit login. Logout removes local
 credential ciphertext, the direct keyring credential entry, and in-memory credentials without
 changing another provider's login. Following
