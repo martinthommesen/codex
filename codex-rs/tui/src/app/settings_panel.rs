@@ -28,16 +28,19 @@ impl App {
         // Remote threads follow the app server's web search requirements, not this machine's.
         let remote_web_search_modes = if remote_web_search {
             match read_web_search_modes(app_server).await {
-                Ok(modes) => Some(modes),
+                Ok(modes) => Ok(modes),
                 Err(err) => {
                     tracing::warn!(error = %err, "failed to read app server web search requirements");
-                    None
+                    Err(format!(
+                        "could not read the app server's web search requirements: {}",
+                        format_config_error(&err)
+                    ))
                 }
             }
         } else {
-            None
+            Ok(None)
         };
-        if let Some(modes) = &remote_web_search_modes {
+        if remote_web_search && let Ok(modes) = &remote_web_search_modes {
             self.config.web_search_mode =
                 web_search_constraint(modes.as_deref(), self.config.web_search_mode.value());
         }
@@ -84,7 +87,7 @@ impl App {
                 switch,
                 enabled,
                 &response.file_path,
-                remote_web_search_modes.as_ref().and_then(|modes| modes.as_deref()),
+                remote_web_search_modes.as_ref().map(|modes| modes.as_deref()).map_err(String::as_str),
             )
             .await
             .unwrap_or_else(|err| {
@@ -119,7 +122,7 @@ impl App {
         switch: SettingsSwitch,
         enabled: bool,
         written: &AbsolutePathBuf,
-        remote_web_search_modes: Option<&[WebSearchMode]>,
+        remote_web_search_modes: RemoteWebSearchModes<'_>,
     ) -> Result<SaveResolution> {
         if app_server.uses_remote_workspace() {
             // New remote sessions start where /new starts them, not in the displayed thread's cwd.
@@ -425,13 +428,15 @@ fn constrain_web_search(
 
 /// The launch choices this TUI sends with each new thread to a remote app server, and where they
 /// came from.
+type RemoteWebSearchModes<'a> = std::result::Result<Option<&'a [WebSearchMode]>, &'a str>;
+
 struct RemoteLaunch<'a> {
     overrides: Option<HashMap<String, serde_json::Value>>,
     origins: &'a HashMap<String, codex_config::ConfigLayerMetadata>,
     /// The launch key behind a forwarded `web_search`.
     web_search_source: Option<String>,
-    /// The app server's allowed web search modes, when known and restricted.
-    web_search_modes: Option<&'a [WebSearchMode]>,
+    /// A failed requirements read must leave the save unverified, even if config/read succeeds.
+    web_search_modes: RemoteWebSearchModes<'a>,
 }
 
 /// What a settings save resolves to for new sessions.
@@ -454,13 +459,19 @@ fn resolve_remote_save(
         .overrides
         .as_ref()
         .is_some_and(|overrides| overrides.contains_key("features"));
-    let unverified =
-        (forwards_features && !drop_replaced_server_features(effective_config)).then(|| {
+    let mut unverified = (forwards_features && !drop_replaced_server_features(effective_config))
+        .then(|| {
             "the app server did not report the config layers below its own feature flags"
                 .to_string()
         });
     let flagged = overlay_launch_overrides(effective_config, launch.overrides.as_ref());
-    let requirements_disallow = constrain_web_search(effective_config, launch.web_search_modes);
+    let requirements_disallow = match launch.web_search_modes {
+        Ok(modes) => constrain_web_search(effective_config, modes),
+        Err(error) => {
+            unverified.get_or_insert_with(|| error.to_string());
+            false
+        }
+    };
     let flag_precedence = codex_app_server_protocol::ConfigLayerSource::SessionFlags.precedence();
     let web_search_source = launch.web_search_source.as_deref();
     let winner = switch_override_layer(

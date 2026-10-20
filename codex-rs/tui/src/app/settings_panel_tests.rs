@@ -376,7 +376,7 @@ fn resolve_with_launch(
             overrides,
             origins: &launch_origins,
             web_search_source: None,
-            web_search_modes: None,
+            web_search_modes: Ok(None),
         },
         &user_file("config.toml"),
     )
@@ -395,6 +395,45 @@ fn resolve_with_launch_features(
         effective_config,
         Some(HashMap::from([("features".to_string(), features)])),
     )
+}
+
+#[test]
+fn failed_remote_requirements_read_cannot_report_a_successful_web_search_save() {
+    let mut effective_config = config_read(serde_json::json!({
+        "config": { "web_search": "cached" }, "origins": {},
+    }));
+    let origins = HashMap::new();
+    let resolution = resolve_remote_save(
+        SettingsSwitch::WebSearch,
+        true,
+        &mut effective_config,
+        &RemoteLaunch {
+            overrides: None,
+            origins: &origins,
+            web_search_source: None,
+            web_search_modes: Err("configRequirements/read failed"),
+        },
+        &user_file("config.toml"),
+    );
+    // A successful config/read reports the raw saved mode, but requirements can still disable it.
+    assert_eq!(
+        effective_config.config.web_search,
+        Some(WebSearchMode::Cached)
+    );
+    let (notice, outcome) = save_notice(
+        SettingsSwitch::WebSearch,
+        true,
+        SwitchState::On,
+        SwitchState::On,
+        SaveCheck {
+            overridden: None,
+            winner: resolution.winner,
+            unverified: resolution.unverified,
+        },
+    );
+    assert_eq!(outcome, SaveOutcome::Failed);
+    assert!(notice.contains("could not check what new sessions will get"));
+    assert!(notice.contains("configRequirements/read failed"));
 }
 
 #[test]
