@@ -6955,6 +6955,27 @@
             "responses"
           ],
           "type": "string"
+        },
+        {
+          "description": "The Anthropic Messages API at `/v1/messages`, authenticated with an Anthropic API key.",
+          "enum": [
+            "anthropic_messages"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "The locally installed, unmodified Claude Code CLI (`claude`), which uses its own sign-in (for example a Claude subscription). Codex never reads Claude Code credentials.",
+          "enum": [
+            "claude_code"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Experimental direct Anthropic Messages transport using separately stored Claude OAuth credentials. Undocumented compatibility does not establish Anthropic authorization or subscription-quota treatment.",
+          "enum": [
+            "claude_oauth"
+          ],
+          "type": "string"
         }
       ]
     },

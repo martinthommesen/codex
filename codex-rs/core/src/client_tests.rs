@@ -116,6 +116,14 @@ fn test_model_client_with_thread_id(
     session_source: SessionSource,
 ) -> ModelClient {
     let provider = create_oss_provider_with_base_url("https://example.com/v1", WireApi::Responses);
+    test_model_client_with_provider(thread_id, session_source, provider)
+}
+
+fn test_model_client_with_provider(
+    thread_id: ThreadId,
+    session_source: SessionSource,
+    provider: ModelProviderInfo,
+) -> ModelClient {
     ModelClient::new(
         /*auth_manager*/ None,
         AgentIdentityAuthPolicy::JwtOnly,
@@ -2281,4 +2289,18 @@ async fn inference_tools_changes_follow_full_specs_across_turns() {
             "step {index}"
         );
     }
+}
+
+#[tokio::test]
+async fn claude_code_prewarm_auth_is_a_no_op() {
+    let client = test_model_client_with_provider(
+        ThreadId::new(),
+        SessionSource::Cli,
+        ModelProviderInfo::create_claude_code_provider(),
+    );
+    assert!(!client.responses_websocket_enabled());
+    client
+        .prewarm_auth()
+        .await
+        .expect("claude-code has no HTTP auth to prewarm");
 }

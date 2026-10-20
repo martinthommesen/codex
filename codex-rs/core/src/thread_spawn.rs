@@ -35,6 +35,8 @@ pub(crate) struct ThreadSpawnRequest {
     /// `None` starts fresh; `FullHistory` uses native fork preparation.
     pub fork_mode: Option<SpawnAgentForkMode>,
     pub agent_type: Option<String>,
+    /// Provider id for the child (for example `anthropic`); `None` inherits the parent's.
+    pub model_provider: Option<String>,
     pub model: Option<String>,
     pub reasoning_effort: Option<ReasoningEffort>,
 }
@@ -67,6 +69,7 @@ pub(crate) async fn spawn(
         message,
         fork_mode,
         agent_type,
+        model_provider,
         model,
         reasoning_effort,
     } = request;
@@ -89,12 +92,14 @@ pub(crate) async fn spawn(
             version: SpawnConfigVersion::V2,
             full_history_fork: matches!(fork_mode, Some(SpawnAgentForkMode::FullHistory)),
             role_name,
+            model_provider: model_provider.as_deref(),
             model: model.as_deref(),
             reasoning_effort,
         },
     )
     .await
     .map_err(ThreadSpawnError::Preparation)?;
+    let mark_plaintext_tree = prepared.mark_plaintext_tree;
     let config = prepared.config;
     let task_name = turn
         .session_source
@@ -102,6 +107,20 @@ pub(crate) async fn spawn(
         .unwrap_or_else(AgentPath::root)
         .join(&task_name)
         .map_err(ThreadSpawnError::Preparation)?;
+    if mark_plaintext_tree && matches!(message, AgentMessage::Encrypted(_)) {
+        // A child on another provider, or under a Claude agent, cannot read an encrypted task.
+        // Every other check has passed, so switch the tree to plaintext now and have the model
+        // resend: its next schema asks for a plaintext message.
+        session
+            .services
+            .local_agent_runtime
+            .mark_plaintext_collaboration_messages();
+        return Err(ThreadSpawnError::Preparation(format!(
+            "model_provider `{}` needs a plaintext message. Call spawn_agent again with the same \
+arguments.",
+            config.model_provider_id
+        )));
+    }
     let spawn_source = SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
         parent_thread_id: session.thread_id,
         depth: next_thread_spawn_depth(&turn.session_source),
@@ -159,6 +178,14 @@ pub(crate) async fn spawn(
             },
         })
         .await?;
+    if mark_plaintext_tree {
+        // Only a started child makes the tree mixed. The parent, its siblings and the root keep
+        // plaintext from then on, even if the provider that made it mixed is disconnected later.
+        session
+            .services
+            .local_agent_runtime
+            .mark_plaintext_collaboration_messages();
+    }
     Ok(ThreadSpawnResult {
         agent,
         config,

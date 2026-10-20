@@ -315,21 +315,21 @@ impl StatusHistoryCell {
         if let Some(provider_id) = &model_provider {
             config_entries.insert(2, ("provider", provider_id.clone()));
         }
-        if config.model_provider.wire_api == WireApi::Responses {
-            let effort_value = reasoning_effort_override
-                .unwrap_or_else(|| config.model_reasoning_effort.clone())
-                .map(|effort| effort.to_string())
-                .unwrap_or_else(|| "none".to_string());
-            config_entries.push(("reasoning effort", effort_value));
-            if remote_connection.is_none() {
-                config_entries.push((
-                    "reasoning summaries",
-                    config
-                        .model_reasoning_summary
-                        .map(|summary| summary.to_string())
-                        .unwrap_or_else(|| "auto".to_string()),
-                ));
-            }
+        // Claude backends map reasoning effort onto Anthropic thinking effort; reasoning
+        // summary settings only apply to the Responses API.
+        let effort_value = reasoning_effort_override
+            .unwrap_or_else(|| config.model_reasoning_effort.clone())
+            .map(|effort| effort.to_string())
+            .unwrap_or_else(|| "none".to_string());
+        config_entries.push(("reasoning effort", effort_value));
+        if config.model_provider.wire_api == WireApi::Responses && remote_connection.is_none() {
+            config_entries.push((
+                "reasoning summaries",
+                config
+                    .model_reasoning_summary
+                    .map(|summary| summary.to_string())
+                    .unwrap_or_else(|| "auto".to_string()),
+            ));
         }
         let (model_name, model_details) = compose_model_display(model_name, &config_entries);
         let approval = config_entries

@@ -1,3 +1,4 @@
+pub mod anthropic;
 pub(crate) mod api_bridge;
 pub(crate) mod auth;
 pub(crate) mod common;
@@ -26,6 +27,7 @@ pub use crate::auth::AuthHeaderTelemetry;
 pub use crate::auth::AuthHeadersFuture;
 pub use crate::auth::AuthProvider;
 pub use crate::auth::AuthProviderFuture;
+pub use crate::auth::ClaudeOAuthIdentity;
 pub use crate::auth::SharedAuthProvider;
 pub use crate::auth::auth_header_telemetry;
 pub use crate::common::AccessPrograms;

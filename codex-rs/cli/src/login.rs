@@ -7,6 +7,7 @@
 //! into a one-shot CLI command while still producing a durable `codex-login.log` artifact that
 //! support can request from users.
 
+use crate::claude_login::LoginProvider;
 use codex_config::types::AuthCredentialsStoreMode;
 use codex_core::config::Config;
 use codex_core::config::edit::ConfigEdit;
@@ -209,6 +210,12 @@ pub async fn run_login_with_api_key(
     cli_config_overrides: CliConfigOverrides,
     api_key: String,
 ) -> ! {
+    if api_key.starts_with("sk-ant-") {
+        eprintln!(
+            "This looks like an Anthropic API key. Store it separately from your OpenAI login with `codex login --provider anthropic --with-api-key`."
+        );
+        std::process::exit(1);
+    }
     let config = load_config_or_exit(cli_config_overrides).await;
     let _login_log_guard = init_login_file_logging(&config);
     tracing::info!("starting api key login flow");
@@ -444,20 +451,109 @@ pub async fn run_login_with_device_code_fallback_to_browser(
     }
 }
 
-pub async fn run_login_status(cli_config_overrides: CliConfigOverrides) -> ! {
+/// Stores an Anthropic API key read from stdin, leaving ChatGPT credentials untouched.
+pub async fn run_login_anthropic(
+    cli_config_overrides: CliConfigOverrides,
+    with_api_key: bool,
+) -> ! {
+    if !with_api_key {
+        eprintln!(
+            "Anthropic login reads the API key from stdin, e.g. `printenv ANTHROPIC_API_KEY | codex login --provider anthropic --with-api-key`.\n\
+To use a Claude subscription, use `codex login --provider claude-code`, or explicitly opt into \
+experimental native OAuth with `codex login --provider claude-oauth`."
+        );
+        std::process::exit(1);
+    }
+    let api_key = read_stdin_secret(
+        "--with-api-key expects the API key on stdin. Try piping it, e.g. `printenv ANTHROPIC_API_KEY | codex login --provider anthropic --with-api-key`.",
+        "Reading Anthropic API key from stdin...",
+        "No API key provided via stdin.",
+    );
     let config = load_config_or_exit(cli_config_overrides).await;
+    exit_with(crate::claude_login::login_anthropic_with_api_key(
+        &config, &api_key,
+    ));
+}
 
-    if is_workload_identity_selected() {
-        match AuthManager::shared_from_config(&config, /*enable_codex_api_key_env*/ false).await {
-            Ok(_) => {
-                eprintln!("Logged in using workload identity");
-                std::process::exit(0);
-            }
-            Err(err) => {
-                eprintln!("Error checking login status: {err}");
-                std::process::exit(1);
-            }
+/// Connects the official Claude Code CLI (its own sign-in), leaving ChatGPT credentials untouched.
+pub async fn run_login_claude_code(cli_config_overrides: CliConfigOverrides) -> ! {
+    let config = load_config_or_exit(cli_config_overrides).await;
+    exit_with(crate::claude_login::login_claude_code(&config).await);
+}
+
+/// Explicitly opts into native experimental Claude OAuth without changing other credentials.
+pub async fn run_login_claude_oauth(cli_config_overrides: CliConfigOverrides) -> ! {
+    let config = load_config_or_exit(cli_config_overrides).await;
+    exit_with(crate::claude_oauth_login::login(&config).await);
+}
+
+/// Prints login status in the order OpenAI, Anthropic, Claude Code, Claude OAuth.
+///
+/// Exit status: without `--provider` (or with `openai`), 0 only when the OpenAI login is usable;
+/// the Claude lines are informational. With `anthropic`, `claude-code` or `claude-oauth`, 0 when
+/// that provider is usable. With `all`, 0 when at least one provider is usable. Otherwise 1.
+pub async fn run_login_status(
+    cli_config_overrides: CliConfigOverrides,
+    provider: Option<LoginProvider>,
+) -> ! {
+    let config = load_config_or_exit(cli_config_overrides).await;
+    let (connected, message) = match provider {
+        Some(LoginProvider::Anthropic) => crate::claude_login::anthropic_status(&config),
+        Some(LoginProvider::ClaudeCode) => crate::claude_login::claude_code_status(&config).await,
+        Some(LoginProvider::ClaudeOauth) => crate::claude_oauth_login::status(&config),
+        Some(LoginProvider::All) => {
+            let (openai_ok, openai) = openai_login_status(&config).await;
+            let (anthropic_ok, anthropic) = crate::claude_login::anthropic_status(&config);
+            let (claude_code_ok, claude_code) =
+                crate::claude_login::claude_code_status(&config).await;
+            let (claude_oauth_ok, claude_oauth) = crate::claude_oauth_login::status(&config);
+            let any = openai_ok || anthropic_ok || claude_code_ok || claude_oauth_ok;
+            (
+                any,
+                format!("OpenAI: {openai}\n{anthropic}\n{claude_code}\n{claude_oauth}"),
+            )
         }
+        Some(LoginProvider::Openai) | None => default_login_status(&config).await,
+    };
+    eprintln!("{message}");
+    std::process::exit(if connected { 0 } else { 1 });
+}
+
+async fn default_login_status(config: &Config) -> (bool, String) {
+    let (logged_in, openai) = openai_login_status(config).await;
+    let mut messages = vec![openai];
+    // Mention connected Claude providers without changing the exit status, which keeps
+    // describing the OpenAI login for scripts.
+    let (anthropic_ok, anthropic) = crate::claude_login::anthropic_status(config);
+    if anthropic_ok {
+        messages.push(anthropic);
+    }
+    if config
+        .codex_home
+        .join(codex_core::provider_models::CLAUDE_CODE_CONNECTED_MARKER)
+        .exists()
+    {
+        let (_, claude_code) = crate::claude_login::claude_code_status(config).await;
+        messages.push(claude_code);
+    }
+    let (claude_oauth_ok, claude_oauth) = crate::claude_oauth_login::status(config);
+    if claude_oauth_ok {
+        messages.push(claude_oauth);
+    }
+    (logged_in, messages.join("\n"))
+}
+
+/// Describes the ChatGPT/OpenAI login; `true` when logged in.
+async fn openai_login_status(config: &Config) -> (bool, String) {
+    if is_workload_identity_selected() {
+        return match AuthManager::shared_from_config(
+            config, /*enable_codex_api_key_env*/ false,
+        )
+        .await
+        {
+            Ok(_) => (true, "Logged in using workload identity".to_string()),
+            Err(err) => (false, format!("Error checking login status: {err}")),
+        };
     }
 
     let auth_config = config.auth_config();
@@ -467,52 +563,74 @@ pub async fn run_login_status(cli_config_overrides: CliConfigOverrides) -> ! {
     {
         Ok(Some(auth)) => match auth.auth_mode() {
             AuthMode::ApiKey => match auth.get_token() {
-                Ok(api_key) => {
-                    eprintln!("Logged in using an API key - {}", safe_format_key(&api_key));
-                    std::process::exit(0);
-                }
-                Err(e) => {
-                    eprintln!("Unexpected error retrieving API key: {e}");
-                    std::process::exit(1);
-                }
+                Ok(api_key) => (
+                    true,
+                    format!("Logged in using an API key - {}", safe_format_key(&api_key)),
+                ),
+                Err(e) => (false, format!("Unexpected error retrieving API key: {e}")),
             },
             AuthMode::Chatgpt | AuthMode::ChatgptAuthTokens => {
-                eprintln!("Logged in using ChatGPT");
-                std::process::exit(0);
+                (true, "Logged in using ChatGPT".to_string())
             }
             AuthMode::Headers => {
                 unreachable!("header auth cannot be loaded from auth storage")
             }
-            AuthMode::AgentIdentity => {
-                eprintln!("Logged in using access token");
-                std::process::exit(0);
-            }
+            AuthMode::AgentIdentity => (true, "Logged in using access token".to_string()),
             AuthMode::PersonalAccessToken => {
-                eprintln!("Logged in using personal access token");
-                std::process::exit(0);
+                (true, "Logged in using personal access token".to_string())
             }
-            AuthMode::BedrockApiKey => {
-                eprintln!("Logged in using Amazon Bedrock API key");
-                std::process::exit(0);
-            }
-            AuthMode::BedrockAccessKeys => {
-                eprintln!("Logged in using Amazon Bedrock AWS access keys");
-                std::process::exit(0);
-            }
+            AuthMode::BedrockApiKey => (true, "Logged in using Amazon Bedrock API key".to_string()),
+            AuthMode::BedrockAccessKeys => (
+                true,
+                "Logged in using Amazon Bedrock AWS access keys".to_string(),
+            ),
         },
-        Ok(None) => {
-            eprintln!("Not logged in");
-            std::process::exit(1);
-        }
-        Err(err) => {
-            eprintln!("Error checking login status: {err}");
-            std::process::exit(1);
-        }
+        Ok(None) => (false, "Not logged in".to_string()),
+        Err(err) => (false, format!("Error checking login status: {err}")),
     }
 }
 
-pub async fn run_logout(cli_config_overrides: CliConfigOverrides) -> ! {
+pub async fn run_logout(
+    cli_config_overrides: CliConfigOverrides,
+    provider: Option<LoginProvider>,
+) -> ! {
     let config = load_config_or_exit(cli_config_overrides).await;
+    match provider {
+        Some(LoginProvider::Anthropic) => {
+            exit_with(crate::claude_login::logout_anthropic(&config));
+        }
+        Some(LoginProvider::ClaudeCode) => {
+            exit_with(crate::claude_login::logout_claude_code(&config));
+        }
+        Some(LoginProvider::ClaudeOauth) => {
+            exit_with(crate::claude_oauth_login::logout(&config));
+        }
+        Some(LoginProvider::All) => {
+            // Attempt every provider even after a failure so one broken store never leaves the
+            // others signed in; exit non-zero if any of them failed.
+            let mut failed = false;
+            let mut report = |result: Result<String, String>| {
+                failed |= result.is_err();
+                let (Ok(message) | Err(message)) = result;
+                eprintln!("{message}");
+            };
+            report(crate::claude_login::logout_anthropic(&config));
+            report(crate::claude_login::logout_claude_code(&config));
+            report(crate::claude_oauth_login::logout(&config));
+            report(
+                logout_openai(&config)
+                    .await
+                    .map(|message| format!("OpenAI: {message}"))
+                    .map_err(|message| format!("OpenAI: {message}")),
+            );
+            std::process::exit(if failed { 1 } else { 0 });
+        }
+        Some(LoginProvider::Openai) | None => exit_with(logout_openai(&config).await),
+    }
+}
+
+/// Signs out of ChatGPT/OpenAI and clears managed Amazon Bedrock configuration.
+async fn logout_openai(config: &Config) -> Result<String, String> {
     let auth_route_config = config.auth_route_config();
 
     // Cleanup is independent of the current feature gate. Retain the grant lock
@@ -546,46 +664,51 @@ pub async fn run_logout(cli_config_overrides: CliConfigOverrides) -> ! {
         eprintln!("Warning: failed to remove enterprise authorization; continuing account logout");
     }
 
-    let logged_out = match logout_with_revoke(
+    let logged_out = logout_with_revoke(
         &config.codex_home,
         config.cli_auth_credentials_store_mode,
         config.auth_keyring_backend_kind(),
         &auth_route_config,
     )
     .await
-    {
-        Ok(logged_out) => logged_out,
-        Err(err) => {
-            eprintln!("Error logging out: {err}");
-            std::process::exit(1);
-        }
-    };
+    .map_err(|err| format!("Error logging out: {err}"))?;
     drop(enterprise_guard);
 
     let cleared_bedrock_config =
-        if let Some(paths) = ConfigEditsBuilder::bedrock_provider_config_paths_to_clear(&config) {
+        if let Some(paths) = ConfigEditsBuilder::bedrock_provider_config_paths_to_clear(config) {
             let edits = paths
                 .into_iter()
                 .map(|segments| ConfigEdit::ClearPath { segments });
-            if let Err(err) = ConfigEditsBuilder::for_config(&config)
+            ConfigEditsBuilder::for_config(config)
                 .with_edits(edits)
                 .apply()
                 .await
-            {
-                eprintln!("Error clearing Amazon Bedrock configuration after logout: {err}");
-                std::process::exit(1);
-            }
+                .map_err(|err| {
+                    format!("Error clearing Amazon Bedrock configuration after logout: {err}")
+                })?;
             true
         } else {
             false
         };
 
-    if logged_out || cleared_bedrock_config {
-        eprintln!("Successfully logged out");
+    Ok(if logged_out || cleared_bedrock_config {
+        "Successfully logged out".to_string()
     } else {
-        eprintln!("Not logged in");
+        "Not logged in".to_string()
+    })
+}
+
+fn exit_with(result: Result<String, String>) -> ! {
+    match result {
+        Ok(message) => {
+            eprintln!("{message}");
+            std::process::exit(0);
+        }
+        Err(message) => {
+            eprintln!("{message}");
+            std::process::exit(1);
+        }
     }
-    std::process::exit(0);
 }
 
 async fn load_config_or_exit(cli_config_overrides: CliConfigOverrides) -> Config {

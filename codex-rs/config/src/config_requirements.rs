@@ -1043,6 +1043,10 @@ pub struct ConfigRequirementsToml {
     /// Exact provider selection, overriding local and session configuration.
     pub model_provider: Option<String>,
     /// Complete provider definitions; each entry replaces the configured provider.
+    #[serde(
+        default,
+        deserialize_with = "crate::config_toml::deserialize_optional_model_providers"
+    )]
     pub model_providers: Option<HashMap<String, ModelProviderInfo>>,
     pub check_for_update_on_startup: Option<bool>,
     pub allow_login_shell: Option<bool>,

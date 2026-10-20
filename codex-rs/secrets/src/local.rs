@@ -1,6 +1,10 @@
 use std::collections::BTreeMap;
 use std::fs;
 use std::io::Write;
+#[cfg(unix)]
+use std::os::unix::fs::DirBuilderExt;
+#[cfg(unix)]
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -42,6 +46,8 @@ const LOCAL_SECRETS_FILENAME: &str = "local.age";
 const CODEX_AUTH_SECRETS_FILENAME: &str = "codex_auth.age";
 const MCP_OAUTH_SECRETS_FILENAME: &str = "mcp_oauth.age";
 const GATEWAY_OAUTH_SECRETS_FILENAME: &str = "gateway_oauth.age";
+const ANTHROPIC_AUTH_SECRETS_FILENAME: &str = "anthropic_auth.age";
+const CLAUDE_OAUTH_SECRETS_FILENAME: &str = "claude_oauth.age";
 static MCP_OAUTH_CACHE: Mutex<Option<CachedSecrets>> = Mutex::new(None);
 
 /// Selects the local encrypted file used by a `LocalSecretsBackend`.
@@ -56,6 +62,10 @@ pub enum LocalSecretsNamespace {
     McpOAuth,
     /// Gateway OAuth credentials, isolated from primary auth in file and encryption key.
     GatewayOAuth,
+    /// Anthropic API credentials, isolated from primary auth in file and encryption key.
+    AnthropicAuth,
+    /// Experimental Claude subscription OAuth credentials and their independent encryption key.
+    ClaudeOAuth,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -172,6 +182,8 @@ impl LocalSecretsBackend {
             LocalSecretsNamespace::CodexAuth => CODEX_AUTH_SECRETS_FILENAME,
             LocalSecretsNamespace::McpOAuth => MCP_OAUTH_SECRETS_FILENAME,
             LocalSecretsNamespace::GatewayOAuth => GATEWAY_OAUTH_SECRETS_FILENAME,
+            LocalSecretsNamespace::AnthropicAuth => ANTHROPIC_AUTH_SECRETS_FILENAME,
+            LocalSecretsNamespace::ClaudeOAuth => CLAUDE_OAUTH_SECRETS_FILENAME,
         };
         self.secrets_dir().join(filename)
     }
@@ -182,7 +194,10 @@ impl LocalSecretsBackend {
         match self.namespace {
             LocalSecretsNamespace::McpOAuth => Some(&MCP_OAUTH_CACHE),
             LocalSecretsNamespace::GatewayOAuth => Some(&self.gateway_cache),
-            LocalSecretsNamespace::ManagedSecrets | LocalSecretsNamespace::CodexAuth => None,
+            LocalSecretsNamespace::ManagedSecrets
+            | LocalSecretsNamespace::CodexAuth
+            | LocalSecretsNamespace::AnthropicAuth
+            | LocalSecretsNamespace::ClaudeOAuth => None,
         }
     }
 
@@ -239,7 +254,12 @@ impl LocalSecretsBackend {
 
     fn save_file(&self, file: &SecretsFile) -> Result<()> {
         let dir = self.secrets_dir();
-        fs::create_dir_all(&dir)
+        let mut directory = fs::DirBuilder::new();
+        directory.recursive(true);
+        #[cfg(unix)]
+        directory.mode(0o700);
+        directory
+            .create(&dir)
             .with_context(|| format!("failed to create secrets dir {}", dir.display()))?;
 
         let passphrase = self.load_or_create_passphrase()?;
@@ -321,16 +341,16 @@ fn write_file_atomically(path: &Path, contents: &[u8]) -> Result<()> {
     ));
 
     {
-        let mut tmp_file = fs::OpenOptions::new()
-            .create_new(true)
-            .write(true)
-            .open(&tmp_path)
-            .with_context(|| {
-                format!(
-                    "failed to create temp secrets file at {}",
-                    tmp_path.display()
-                )
-            })?;
+        let mut options = fs::OpenOptions::new();
+        options.create_new(true).write(true);
+        #[cfg(unix)]
+        options.mode(0o600);
+        let mut tmp_file = options.open(&tmp_path).with_context(|| {
+            format!(
+                "failed to create temp secrets file at {}",
+                tmp_path.display()
+            )
+        })?;
         tmp_file.write_all(contents).with_context(|| {
             format!(
                 "failed to write temp secrets file at {}",
@@ -548,12 +568,24 @@ mod tests {
             keyring.clone(),
             LocalSecretsNamespace::GatewayOAuth,
         );
+        let anthropic_backend = LocalSecretsBackend::new_with_namespace(
+            codex_home.path().to_path_buf(),
+            keyring.clone(),
+            LocalSecretsNamespace::AnthropicAuth,
+        );
+        let claude_oauth_backend = LocalSecretsBackend::new_with_namespace(
+            codex_home.path().to_path_buf(),
+            keyring.clone(),
+            LocalSecretsNamespace::ClaudeOAuth,
+        );
         let scope = SecretScope::Global;
         let name = SecretName::new("TEST_SECRET")?;
 
         codex_auth_backend.set(&scope, &name, "codex-auth-value")?;
         mcp_backend.set(&scope, &name, "mcp-value")?;
         gateway_backend.set(&scope, &name, "gateway-value")?;
+        anthropic_backend.set(&scope, &name, "anthropic-value")?;
+        claude_oauth_backend.set(&scope, &name, "claude-oauth-value")?;
 
         assert_eq!(
             codex_auth_backend.get(&scope, &name)?,
@@ -591,7 +623,23 @@ mod tests {
                 .join("secrets/gateway_oauth.age")
                 .is_file()
         );
-        // Primary-auth key removal must not make the independent gateway file unreadable.
+        assert!(
+            codex_home
+                .path()
+                .join("secrets/anthropic_auth.age")
+                .is_file()
+        );
+        assert_eq!(
+            anthropic_backend.get(&scope, &name)?,
+            Some("anthropic-value".to_string())
+        );
+        assert!(codex_home.path().join("secrets/claude_oauth.age").is_file());
+        assert_eq!(
+            claude_oauth_backend.get(&scope, &name)?,
+            Some("claude-oauth-value".to_string())
+        );
+        // Primary-auth key removal must not make the independent gateway or Anthropic files
+        // unreadable.
         keyring
             .delete(
                 keyring_service(),
@@ -601,6 +649,61 @@ mod tests {
         assert_eq!(
             gateway_backend.get(&scope, &name)?,
             Some("gateway-value".to_string())
+        );
+        assert_eq!(
+            anthropic_backend.get(&scope, &name)?,
+            Some("anthropic-value".to_string())
+        );
+        assert_eq!(
+            claude_oauth_backend.get(&scope, &name)?,
+            Some("claude-oauth-value".to_string())
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn anthropic_namespace_changes_do_not_touch_primary_auth() -> Result<()> {
+        let codex_home = tempfile::tempdir().expect("tempdir");
+        let keyring = Arc::new(MockKeyringStore::default());
+        let codex_auth_backend = LocalSecretsBackend::new_with_namespace(
+            codex_home.path().to_path_buf(),
+            keyring.clone(),
+            LocalSecretsNamespace::CodexAuth,
+        );
+        let anthropic_backend = LocalSecretsBackend::new_with_namespace(
+            codex_home.path().to_path_buf(),
+            keyring.clone(),
+            LocalSecretsNamespace::AnthropicAuth,
+        );
+        let scope = SecretScope::Global;
+        let name = SecretName::new("TEST_SECRET")?;
+        let codex_auth_account =
+            compute_keyring_account(codex_home.path(), LocalSecretsNamespace::CodexAuth);
+        let anthropic_account =
+            compute_keyring_account(codex_home.path(), LocalSecretsNamespace::AnthropicAuth);
+
+        codex_auth_backend.set(&scope, &name, "codex-auth-value")?;
+        let codex_auth_ciphertext = fs::read(codex_auth_backend.secrets_path())?;
+        let codex_auth_passphrase = keyring.saved_value(&codex_auth_account);
+
+        anthropic_backend.set(&scope, &name, "anthropic-value")?;
+        anthropic_backend.set(&scope, &name, "rotated-anthropic-value")?;
+        assert!(anthropic_backend.delete(&scope, &name)?);
+        keyring
+            .delete(keyring_service(), &anthropic_account)
+            .expect("remove Anthropic secrets key");
+
+        assert_eq!(
+            (
+                fs::read(codex_auth_backend.secrets_path())?,
+                keyring.saved_value(&codex_auth_account),
+                codex_auth_backend.get(&scope, &name)?,
+            ),
+            (
+                codex_auth_ciphertext,
+                codex_auth_passphrase,
+                Some("codex-auth-value".to_string()),
+            )
         );
         Ok(())
     }

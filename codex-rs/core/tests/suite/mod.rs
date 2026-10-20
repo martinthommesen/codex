@@ -45,6 +45,7 @@ mod agent_control;
 mod agent_execution;
 mod agent_websocket;
 mod agents_md;
+mod anthropic_provider;
 mod app_tool_exposure;
 mod apply_patch_cli;
 mod apply_patch_serialization;
@@ -61,6 +62,7 @@ mod bedrock_multi_agent;
 #[path = "bedrock_service_tier_tests.rs"]
 mod bedrock_service_tier;
 mod catalog_permission_messages;
+mod claude_code_provider;
 mod cli_stream;
 mod client;
 mod client_websockets;

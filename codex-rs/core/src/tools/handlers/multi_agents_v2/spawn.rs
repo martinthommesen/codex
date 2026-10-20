@@ -1,4 +1,5 @@
 use super::*;
+use crate::agent::child_config::requested_spawn_provider;
 use crate::agent::role::DEFAULT_ROLE_NAME;
 use crate::agent::types::SpawnAgentForkMode;
 use crate::codex_thread::ThreadConfigSnapshot;
@@ -51,7 +52,7 @@ impl ToolExecutor<ToolInvocation> for Handler {
             let turn_id = invocation.step_context.turn.sub_id.clone();
             let call_id = invocation.call_id.clone();
             let started_at_ms = now_unix_timestamp_ms();
-            let result = handle_spawn_agent(invocation).await;
+            let result = handle_spawn_agent(invocation, self.options.plaintext_messages).await;
             let completed_at_ms = now_unix_timestamp_ms();
             let (status, receiver_thread_ids, agents_states) = match &result {
                 Ok((_, thread_id, agent_status, _)) => (
@@ -93,6 +94,7 @@ impl ToolExecutor<ToolInvocation> for Handler {
 
 async fn handle_spawn_agent(
     invocation: ToolInvocation,
+    plaintext_messages: bool,
 ) -> Result<
     (
         SpawnAgentResult,
@@ -115,6 +117,9 @@ async fn handle_spawn_agent(
     let args: SpawnAgentArgs = parse_arguments(&arguments)?;
     let fork_mode = args.fork_mode()?;
     let message = message_content(args.message)?;
+    // An encrypted task for a child on another provider is answered by `thread_spawn::spawn` with a
+    // request to resend it in plaintext, once every other check has passed.
+    let model_provider = requested_spawn_provider(args.model_provider.as_deref());
     let role_name = args
         .agent_type
         .as_deref()
@@ -127,9 +132,14 @@ async fn handle_spawn_agent(
         &call_id,
         ThreadSpawnRequest {
             task_name: args.task_name,
-            message: agent_message_from_tool(message, &source),
+            message: if plaintext_messages {
+                AgentMessage::Plaintext(message)
+            } else {
+                agent_message_from_tool(message, &source)
+            },
             fork_mode: fork_mode.clone(),
             agent_type: args.agent_type.clone(),
+            model_provider: model_provider.map(str::to_owned),
             model: args.model,
             reasoning_effort: args.reasoning_effort,
         },
@@ -204,6 +214,7 @@ struct SpawnAgentArgs {
     message: String,
     task_name: String,
     agent_type: Option<String>,
+    model_provider: Option<String>,
     model: Option<String>,
     reasoning_effort: Option<ReasoningEffort>,
     fork_turns: Option<String>,

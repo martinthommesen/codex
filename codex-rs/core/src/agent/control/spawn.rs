@@ -4,6 +4,7 @@ use super::spawn_telemetry::SpawnMeasurements;
 use super::spawn_telemetry::record_spawn_success;
 use super::*;
 use crate::agent::child_config::build_agent_resume_config;
+use crate::agent::child_config::switch_agent_provider;
 use crate::agent::role::apply_role_to_config;
 use crate::agent::types::AgentMetadata;
 use crate::agent::types::LiveAgent;
@@ -25,6 +26,7 @@ use crate::context::MultiAgentRoleInstructions;
 use crate::context::MultiAgentUsageHint;
 use crate::context::world_state::IncrementalToolsHint;
 use crate::context::world_state::PersistentModeState;
+use crate::provider_models::check_required_model_provider;
 use crate::session::multi_agents::resolve_usage_hints;
 use crate::tasks::InterruptedTurnHistoryMarker;
 use crate::thread_manager::ForkSnapshot;
@@ -34,6 +36,7 @@ use codex_context_fragments::set_annotated_content;
 use codex_context_fragments::to_annotated_content;
 use codex_features::Feature;
 use codex_history::ResponseItemEnvelope;
+use codex_model_provider_info::WireApi;
 use codex_prompts::ResolvedModelMessages;
 use codex_protocol::error::AgentErrorContext;
 use codex_protocol::intersect_effective_permission_profiles;
@@ -250,6 +253,13 @@ impl LocalAgentControl {
             if registry.agent_metadata_for_thread(thread_id).is_some() {
                 continue;
             }
+            // A tree with agents on different providers stays on plaintext collaboration messages.
+            if let Ok(stored_thread) = &stored_thread
+                && !stored_thread.model_provider.is_empty()
+                && stored_thread.model_provider != config.model_provider_id
+            {
+                self.runtime.mark_plaintext_collaboration_messages();
+            }
             let restore_result = stored_thread.and_then(|stored_thread| {
                 let stored_agent_path = stored_thread
                     .agent_path
@@ -423,6 +433,12 @@ impl LocalAgentControl {
             None
         };
         config.model_reasoning_effort = stored_reasoning_effort;
+        mark_mixed_provider_resume(&mut config, &stored_model_provider);
+        // Switch before the role applies, so that what the role sets survives the switch, as on
+        // spawn.
+        if config.model_provider_id != stored_model_provider {
+            resume_on_stored_provider(&mut config, &stored_model_provider)?;
+        }
         if let Some(role_name) = session_source.get_agent_role() {
             let runtime_approval_policy = config.permissions.approval_policy.value();
             let runtime_approvals_reviewer = config.approvals_reviewer;
@@ -462,18 +478,6 @@ impl LocalAgentControl {
         config.service_tier = self.root_service_tier();
         if let Some(model) = stored_model {
             config.model = Some(model);
-        }
-        if config.model_provider_id != stored_model_provider {
-            config.model_provider = config
-                .model_providers
-                .get(&stored_model_provider)
-                .cloned()
-                .ok_or_else(|| {
-                    CodexErr::InvalidRequest(format!(
-                        "Model provider `{stored_model_provider}` not found"
-                    ))
-                })?;
-            config.model_provider_id = stored_model_provider;
         }
         let parent_thread_id = owner_thread_id
             .or_else(|| initial_history.get_resumed_parent_thread_id())
@@ -1426,7 +1430,7 @@ impl LocalAgentControl {
 
     async fn resume_single_agent_from_rollout(
         &self,
-        config: Config,
+        mut config: Config,
         thread_id: ThreadId,
         session_source: SessionSource,
     ) -> CodexResult<(ThreadId, MultiAgentVersion)> {
@@ -1438,6 +1442,20 @@ impl LocalAgentControl {
                 include_history: false,
             })
             .await?;
+        if !stored_thread.model_provider.is_empty() {
+            mark_mixed_provider_resume(&mut config, &stored_thread.model_provider);
+        }
+        if !stored_thread.model_provider.is_empty()
+            && stored_thread.model_provider != config.model_provider_id
+        {
+            // A child spawned on another provider resumes there; the parent's model and tuning
+            // belong to the parent's provider.
+            resume_on_stored_provider(&mut config, &stored_thread.model_provider)?;
+            config.model.clone_from(&stored_thread.model);
+            config
+                .model_reasoning_effort
+                .clone_from(&stored_thread.reasoning_effort);
+        }
         let resumed_agent_path = stored_thread
             .agent_path
             .as_deref()
@@ -1537,5 +1555,35 @@ impl LocalAgentControl {
         .await;
 
         Ok((resumed_thread.thread_id, multi_agent_version))
+    }
+}
+
+/// Moves a resuming child back onto the provider it was spawned on.
+fn resume_on_stored_provider(config: &mut Config, stored_model_provider: &str) -> CodexResult<()> {
+    check_required_model_provider(config, stored_model_provider)
+        .map_err(CodexErr::InvalidRequest)?;
+    let provider = config
+        .model_providers
+        .get(stored_model_provider)
+        .cloned()
+        .ok_or_else(|| {
+            CodexErr::InvalidRequest(format!(
+                "Model provider `{stored_model_provider}` not found"
+            ))
+        })?;
+    switch_agent_provider(config, stored_model_provider, provider);
+    Ok(())
+}
+
+/// A resumed agent keeps collaboration messages in plaintext when `config` (its parent's, or the
+/// sender's for a reload by message) runs Claude or another provider than the agent. The tool plan
+/// also forces plaintext whenever a Claude provider is connected.
+fn mark_mixed_provider_resume(config: &mut Config, stored_model_provider: &str) {
+    let parent_runs_claude = matches!(
+        config.model_provider.wire_api,
+        WireApi::AnthropicMessages | WireApi::ClaudeCode | WireApi::ClaudeOAuth
+    );
+    if parent_runs_claude || config.model_provider_id != stored_model_provider {
+        config.plaintext_collaboration_messages = true;
     }
 }

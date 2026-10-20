@@ -78,6 +78,48 @@ async fn memories_startup_creates_memory_root() -> anyhow::Result<()> {
 }
 
 #[tokio::test]
+async fn memories_startup_skips_claude_code_sessions() -> anyhow::Result<()> {
+    assert_memories_startup_skipped(ModelProviderInfo::create_claude_code_provider()).await
+}
+
+#[tokio::test]
+async fn memories_startup_skips_claude_oauth_sessions() -> anyhow::Result<()> {
+    assert_memories_startup_skipped(ModelProviderInfo::create_claude_oauth_provider()).await
+}
+
+async fn assert_memories_startup_skipped(provider: ModelProviderInfo) -> anyhow::Result<()> {
+    let server = start_mock_server().await;
+    let home = Arc::new(TempDir::new()?);
+    let memory_root = home.path().join("memories");
+    let test = build_test_codex(&server, home).await?;
+    let config_snapshot = test.codex.config_snapshot().await;
+    let mut config = test.config.clone();
+    config
+        .features
+        .enable(Feature::MemoryTool)
+        .expect("test config should allow feature update");
+    config.model_provider = provider;
+    let parent_permission_profile = config.permissions.effective_permission_profile();
+
+    start_memories_startup_task(
+        Arc::clone(&test.thread_manager),
+        test.thread_manager.auth_manager(),
+        test.session_configured.thread_id,
+        Arc::clone(&test.codex),
+        Arc::new(config),
+        parent_permission_profile,
+        &config_snapshot.session_source,
+    );
+    // Without the skip, the pipeline creates the memory root right away
+    // (memories_startup_creates_memory_root).
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    assert!(!memory_root.exists());
+    shutdown_test_codex(&test).await?;
+    Ok(())
+}
+
+#[tokio::test]
 async fn dual_write_prepares_both_roots_without_importing_old_notes() -> anyhow::Result<()> {
     let server = start_mock_server().await;
     let home = Arc::new(TempDir::new()?);

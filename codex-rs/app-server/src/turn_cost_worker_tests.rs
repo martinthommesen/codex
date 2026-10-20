@@ -60,6 +60,30 @@ async fn worker_starts_with_otlp_metrics_exporter_without_log_exporter() {
 }
 
 #[tokio::test]
+async fn worker_does_not_start_for_claude_providers() {
+    let codex_home = TempDir::new().expect("temporary Codex home");
+    let mut config = ConfigBuilder::default()
+        .codex_home(codex_home.path().to_path_buf())
+        .build()
+        .await
+        .expect("test config");
+    config.otel.metrics_exporter = OtelExporterKind::OtlpGrpc {
+        endpoint: "http://127.0.0.1:4317".to_string(),
+        headers: HashMap::new(),
+        tls: None,
+    };
+    for model_provider in [
+        ModelProviderInfo::create_anthropic_provider(),
+        ModelProviderInfo::create_claude_code_provider(),
+        ModelProviderInfo::create_claude_oauth_provider(),
+    ] {
+        config.model_provider = model_provider;
+        let auth_manager = AuthManager::from_auth_for_testing(CodexAuth::from_api_key("sk-test"));
+        assert!(TurnCostWorker::spawn(Arc::new(config.clone()), auth_manager).is_none());
+    }
+}
+
+#[tokio::test]
 async fn handle_observes_only_matching_model_provider() {
     let codex_home = TempDir::new().expect("temporary Codex home");
     let mut config = ConfigBuilder::default()

@@ -97,3 +97,17 @@ fn required_provider_definitions_are_validated_without_local_defaults() -> anyho
     }
     Ok(())
 }
+
+#[test]
+fn claude_oauth_required_retry_override_projects_without_a_local_provider_name()
+-> anyhow::Result<()> {
+    let requirements: ConfigRequirementsToml = toml::from_str(
+        "model_provider = 'claude-oauth'\n[model_providers.claude-oauth]\nrequest_max_retries = 2",
+    )?;
+    let projected = super::to_config(&requirements)?;
+    assert_eq!(
+        projected["model_providers"]["claude-oauth"]["request_max_retries"].as_integer(),
+        Some(2),
+    );
+    Ok(())
+}

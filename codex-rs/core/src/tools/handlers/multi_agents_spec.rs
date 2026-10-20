@@ -1,5 +1,6 @@
 use crate::agent::child_config::MAX_SPAWN_AGENT_MODEL_OVERRIDES;
 use crate::agent::child_config::model_supports_multi_agent_backend;
+use crate::provider_models::SpawnProviderOption;
 use codex_protocol::openai_models::ModelPreset;
 use codex_protocol::protocol::MultiAgentVersion;
 use codex_tools::JsonSchema;
@@ -33,6 +34,10 @@ pub struct SpawnAgentToolOptions {
     pub multi_agent_version: MultiAgentVersion,
     pub model_catalog_in_context: bool,
     pub usage_hint_text: Option<String>,
+    /// Providers the new agent may use; more than one entry exposes `model_provider`.
+    pub(crate) providers: Vec<SpawnProviderOption>,
+    /// Send collaboration messages as plaintext so agents on other providers can read them.
+    pub plaintext_messages: bool,
 }
 
 impl Default for SpawnAgentToolOptions {
@@ -46,7 +51,65 @@ impl Default for SpawnAgentToolOptions {
             multi_agent_version: MultiAgentVersion::Disabled,
             model_catalog_in_context: false,
             usage_hint_text: None,
+            providers: Vec::new(),
+            plaintext_messages: false,
         }
+    }
+}
+
+/// Describes the `model_provider` spawn argument, or returns `None` when only the current
+/// provider is available (keeping the schema unchanged for single-provider setups).
+fn spawn_agent_provider_property(providers: &[SpawnProviderOption]) -> Option<JsonSchema> {
+    if providers.len() < 2 {
+        return None;
+    }
+    let current = providers
+        .iter()
+        .find(|provider| provider.is_current)
+        .map(|provider| provider.id.as_str())
+        .unwrap_or("current");
+    let listing = providers
+        .iter()
+        .map(|provider| {
+            let marker = if provider.is_current {
+                " (current)"
+            } else {
+                ""
+            };
+            let models = if provider.models.is_empty() {
+                String::new()
+            } else {
+                format!(
+                    "; models: {}",
+                    provider
+                        .models
+                        .iter()
+                        .map(|model| format!("`{model}`"))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )
+            };
+            format!(
+                "- `{}`{marker}: {}{models}",
+                provider.id, provider.description
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    Some(JsonSchema::string(Some(format!(
+        "Model provider for the new agent. Omit to use your own provider (`{current}`). When set, \
+`model` must be a model of that provider; if `model` is omitted, the provider's default model \
+is used. Only set this when the user asks for a specific provider or model family.\n\
+Available providers:\n{listing}"
+    ))))
+}
+
+fn message_schema(description: &str, plaintext: bool) -> JsonSchema {
+    let schema = JsonSchema::string(Some(description.to_string()));
+    if plaintext {
+        schema
+    } else {
+        schema.with_encrypted()
     }
 }
 
@@ -80,6 +143,9 @@ pub fn create_spawn_agent_tool_v1(options: SpawnAgentToolOptions) -> ToolSpec {
     let mut properties = spawn_agent_common_properties_v1(&options.agent_type_description);
     if !options.expose_agent_type {
         properties.remove("agent_type");
+    }
+    if let Some(provider) = spawn_agent_provider_property(&options.providers) {
+        properties.insert("model_provider".to_string(), provider);
     }
     if options.hide_agent_type_model_reasoning {
         hide_spawn_agent_metadata_options(&mut properties);
@@ -122,13 +188,20 @@ pub fn create_spawn_agent_tool_v2(
         (options.expose_spawn_agent_model_overrides && !options.hide_agent_type_model_reasoning)
             .then_some(SPAWN_AGENT_INHERITED_MODEL_GUIDANCE)
     };
-    let mut properties = spawn_agent_common_properties_v2(&options.agent_type_description);
+    let mut properties = spawn_agent_common_properties_v2(
+        &options.agent_type_description,
+        options.plaintext_messages,
+    );
     if !options.expose_agent_type {
         properties.remove("agent_type");
+    }
+    if let Some(provider) = spawn_agent_provider_property(&options.providers) {
+        properties.insert("model_provider".to_string(), provider);
     }
     if !options.expose_spawn_agent_model_overrides {
         properties.remove("model");
         properties.remove("reasoning_effort");
+        properties.remove("model_provider");
     }
     properties.insert(
         "task_name".to_string(),
@@ -201,7 +274,7 @@ pub fn create_send_input_tool_v1() -> ToolSpec {
     })
 }
 
-pub fn create_send_message_tool() -> ToolSpec {
+pub fn create_send_message_tool(plaintext_messages: bool) -> ToolSpec {
     let properties = BTreeMap::from([
         (
             "target".to_string(),
@@ -211,10 +284,10 @@ pub fn create_send_message_tool() -> ToolSpec {
         ),
         (
             "message".to_string(),
-            JsonSchema::string(Some(
-                "Message text to queue on the target agent.".to_string(),
-            ))
-            .with_encrypted(),
+            message_schema(
+                "Message text to queue on the target agent.",
+                plaintext_messages,
+            ),
         ),
     ]);
 
@@ -233,7 +306,7 @@ pub fn create_send_message_tool() -> ToolSpec {
     })
 }
 
-pub fn create_followup_task_tool() -> ToolSpec {
+pub fn create_followup_task_tool(plaintext_messages: bool) -> ToolSpec {
     let properties = BTreeMap::from([
         (
             "target".to_string(),
@@ -244,10 +317,10 @@ pub fn create_followup_task_tool() -> ToolSpec {
         ),
         (
             "message".to_string(),
-            JsonSchema::string(Some(
-                "Message text to send to the target agent.".to_string(),
-            ))
-            .with_encrypted(),
+            message_schema(
+                "Message text to send to the target agent.",
+                plaintext_messages,
+            ),
         ),
     ]);
 
@@ -646,14 +719,17 @@ fn spawn_agent_common_properties_v1(agent_type_description: &str) -> BTreeMap<St
     ])
 }
 
-fn spawn_agent_common_properties_v2(agent_type_description: &str) -> BTreeMap<String, JsonSchema> {
+fn spawn_agent_common_properties_v2(
+    agent_type_description: &str,
+    plaintext_messages: bool,
+) -> BTreeMap<String, JsonSchema> {
     BTreeMap::from([
         (
             "message".to_string(),
-            JsonSchema::string(Some(
-                "Initial plain-text task for the new agent.".to_string(),
-            ))
-            .with_encrypted(),
+            message_schema(
+                "Initial plain-text task for the new agent.",
+                plaintext_messages,
+            ),
         ),
         (
             "agent_type".to_string(),
@@ -687,6 +763,7 @@ fn hide_spawn_agent_metadata_options(properties: &mut BTreeMap<String, JsonSchem
     properties.remove("agent_type");
     properties.remove("model");
     properties.remove("reasoning_effort");
+    properties.remove("model_provider");
 }
 
 fn spawn_agent_tool_description(

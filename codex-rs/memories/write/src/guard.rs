@@ -13,6 +13,11 @@ pub(crate) async fn rate_limits_ok(auth_manager: &AuthManager, config: &Config) 
 }
 
 async fn rate_limits_check(auth_manager: &AuthManager, config: &Config) -> Option<bool> {
+    // ChatGPT quota says nothing about Anthropic usage, and Claude jobs must not load ChatGPT
+    // credentials or contact the ChatGPT backend.
+    if config.model_provider.wire_api.is_claude() {
+        return None;
+    }
     let auth = auth_manager.auth().await?;
     if !auth.uses_codex_backend() {
         return None;
