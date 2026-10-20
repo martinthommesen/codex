@@ -4,6 +4,7 @@
 use super::config_persistence::overridden_write_message;
 use super::*;
 use crate::experimental_features::FeatureWriteResult;
+use crate::settings_panel::SettingsSwitch;
 use tokio::sync::oneshot;
 
 impl App {
@@ -14,14 +15,21 @@ impl App {
         feature: Feature,
     ) {
         let label = match feature {
-            Feature::Collab => "Subagents",
-            Feature::MemoryTool => "Memories",
+            Feature::Collab => SettingsSwitch::Subagents.label(),
+            Feature::MemoryTool => SettingsSwitch::Memories.label(),
             _ => return,
         };
         let mut edits = vec![crate::config_update::build_feature_enabled_edit(
             feature.key(),
             /*enabled*/ true,
         )];
+        if feature == Feature::Collab {
+            // `/settings` also writes `agents.enabled = false` when it turns subagents off.
+            edits.push(crate::config_update::replace_config_value(
+                "agents.enabled",
+                serde_json::json!(true),
+            ));
+        }
         if feature == Feature::MemoryTool {
             // Older app servers still use the legacy key for this feature.
             edits.push(crate::config_update::build_feature_enabled_edit(

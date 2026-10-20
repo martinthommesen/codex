@@ -7,6 +7,9 @@ use codex_protocol::protocol::SKILLS_INSTRUCTIONS_CLOSE_TAG;
 use codex_protocol::protocol::SKILLS_INSTRUCTIONS_OPEN_TAG;
 use serde::Serialize;
 use serde_json::json;
+use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::Ordering;
 
 use crate::render::SkillRenderReport;
 use crate::world_state_catalogs::CatalogBudgetAllocation;
@@ -24,6 +27,7 @@ const NO_HOST_SKILLS_BODY: &str =
     "\n## Host skills update\nNo host skills are currently available.\n";
 const HIDDEN_HOST_SKILLS_BODY: &str = "\n## Host skills update\nHost skills are not listed automatically. Explicit skill mentions can still be resolved when available.\n";
 const OMITTED_HOST_SKILLS_BODY: &str = "\n## Host skills update\nHost skills are available but omitted from the model-visible skills list because the skills context budget was exceeded.\n";
+const DISABLED_SKILLS_BODY: &str = "\n## Skills update\nSkills are turned off. Ignore previously listed skills and do not open or follow their SKILL.md files.\n";
 
 pub(crate) type CatalogRenderCallback = Box<dyn Fn() + Send + Sync>;
 
@@ -107,11 +111,7 @@ pub(crate) fn executor_skills_world_state_section(
                 ).with_metadata(ContentItemMetadata::skills())),
             )
     })
-    .with_legacy_matcher(|role, text| {
-        role == "developer"
-            && text.trim_start().starts_with(SKILLS_INSTRUCTIONS_OPEN_TAG)
-            && text.trim_end().ends_with(SKILLS_INSTRUCTIONS_CLOSE_TAG)
-    });
+    .with_legacy_matcher(is_skills_fragment);
     // A short availability update is valid only while the actual catalog remains in history.
     match retained_body {
         Some(body) => contribution.with_retained_fragment_matcher(move |role, text| {
@@ -207,6 +207,50 @@ fn skills_world_state_section(
     }
 }
 
+/// Retracts catalogs a resumed or forked thread already showed once skills are turned off.
+/// Fresh threads record the disabled state without a model-visible update.
+pub(crate) fn disabled_skills_world_state_sections() -> Vec<WorldStateSectionContribution> {
+    // One notice covers every catalog, so only the first section that listed skills renders it.
+    let notified = Arc::new(AtomicBool::new(false));
+    [
+        HOST_SKILLS_WORLD_STATE_ID,
+        SKILLS_WORLD_STATE_ID,
+        CLOUD_SKILLS_WORLD_STATE_ID,
+    ]
+    .into_iter()
+    .map(|id| {
+        let notified = Arc::clone(&notified);
+        WorldStateSectionContribution::new(id, move |previous| {
+            let listed_skills = match previous {
+                PreviousWorldStateSection::Absent => false,
+                PreviousWorldStateSection::Unknown => true,
+                PreviousWorldStateSection::Known(previous) => {
+                    previous.get("body").is_some_and(|body| !body.is_null())
+                }
+            };
+            let fragment = (listed_skills && !notified.swap(true, Ordering::Relaxed)).then(|| {
+                RenderedWorldStateFragment::new(
+                    "developer",
+                    (SKILLS_INSTRUCTIONS_OPEN_TAG, SKILLS_INSTRUCTIONS_CLOSE_TAG),
+                    input_text(DISABLED_SKILLS_BODY.to_string()),
+                )
+                .with_metadata(ContentItemMetadata::skills())
+            });
+            (Some(json!({ "disabled": true })), fragment)
+        })
+        // History from before skills had saved state still holds catalogs worth retracting.
+        .with_legacy_matcher(is_skills_fragment)
+    })
+    .collect()
+}
+
+/// A developer message holding a skills catalog or skills update.
+fn is_skills_fragment(role: &str, text: &str) -> bool {
+    role == "developer"
+        && text.trim_start().starts_with(SKILLS_INSTRUCTIONS_OPEN_TAG)
+        && text.trim_end().ends_with(SKILLS_INSTRUCTIONS_CLOSE_TAG)
+}
+
 pub(crate) fn host_skills_world_state_section(
     body: Option<String>,
     include_instructions: bool,
@@ -240,3 +284,7 @@ pub(crate) fn host_skills_world_state_section(
         None => contribution,
     }
 }
+
+#[cfg(test)]
+#[path = "world_state_tests.rs"]
+mod tests;

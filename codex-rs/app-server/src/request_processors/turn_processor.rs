@@ -1601,6 +1601,21 @@ impl TurnRequestProcessor {
                 .await?;
             }
             CoreReviewDelivery::Detached => {
+                // The detached reviewer follows the bundled $review-agent skill.
+                let parent_config = parent_thread.config().await;
+                if !parent_config
+                    .features
+                    .enabled(codex_features::Feature::Skills)
+                {
+                    return Err(invalid_request(
+                        "Detached reviews use the $review-agent skill, but skills are turned off (`features.skills = false`). Use inline delivery, or turn skills back on and start a new session.",
+                    ));
+                }
+                if !parent_config.bundled_skills_enabled() {
+                    return Err(invalid_request(
+                        "Detached reviews use the bundled $review-agent skill, but bundled skills are turned off (`skills.bundled.enabled = false`). Use inline delivery or turn bundled skills back on.",
+                    ));
+                }
                 let review_skill_path = system_cache_root_dir(&self.config.codex_home)
                     .join("review-agent")
                     .join("SKILL.md");

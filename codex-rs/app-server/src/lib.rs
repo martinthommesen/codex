@@ -404,11 +404,15 @@ fn project_config_warning(config: &Config) -> Option<ConfigWarningNotification> 
         return None;
     }
 
-    let mut message = concat!(
-        "Project-local config, hooks, and exec policies are disabled in the following folders ",
-        "until the project is trusted, but skills still load.\n",
-    )
-    .to_string();
+    // Untrusted projects still load repository skills, unless skills are off entirely.
+    let skills_note = if config.features.enabled(Feature::Skills) {
+        ", but skills still load"
+    } else {
+        ""
+    };
+    let mut message = format!(
+        "Project-local config, hooks, and exec policies are disabled in the following folders until the project is trusted{skills_note}.\n"
+    );
     for (index, (folder, reason)) in disabled_folders.iter().enumerate() {
         let display_index = index + 1;
         message.push_str(&format!("    {display_index}. {folder}\n"));

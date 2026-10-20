@@ -198,7 +198,14 @@ impl App {
             _ => return None,
         };
         let content_width = usize::from(width.checked_sub(/*rhs*/ 4)?);
+        let feature_commands =
+            crate::bottom_pane::slash_commands::FeatureCommandFlags::from_features(
+                &self.chat_widget.config_ref().features,
+            );
         let render = |template| {
+            if crate::tooltips::mentions_hidden_command(template, feature_commands) {
+                return None;
+            }
             let text = crate::tooltips::render_tooltip(template, Some(&self.keymap))?;
             let lines = crate::tooltips::render_tooltip_lines(
                 &text,

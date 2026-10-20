@@ -34,6 +34,7 @@ async fn yielded_skill_read_keeps_originating_turn_metadata() -> Result<()> {
             read_barrier: None,
         })),
         |config: &Config| SkillsExtensionConfig {
+            enabled: true,
             include_instructions: config.include_skill_instructions,
             max_context_tokens: config.skill_max_context_tokens,
             bundled_skills_enabled: false,

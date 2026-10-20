@@ -364,6 +364,7 @@ fn catalog_extensions(
     }
     install_with_providers(&mut extensions, providers, |config: &Config| {
         SkillsExtensionConfig {
+            enabled: true,
             include_instructions: config.include_skill_instructions,
             max_context_tokens: config.skill_max_context_tokens,
             bundled_skills_enabled: false,
@@ -586,6 +587,157 @@ async fn rendered_catalogs_for_turns(
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn skills_only_plugins_add_no_plugin_guidance_when_skills_are_off() -> Result<()> {
+    skip_if_no_network!(Ok(()));
+
+    for skills_enabled in [true, false] {
+        let server = responses::start_mock_server().await;
+        let response = mount_sse_once(
+            &server,
+            sse(vec![ev_response_created("resp1"), ev_completed("resp1")]),
+        )
+        .await;
+        let codex_home = Arc::new(TempDir::new()?);
+        let plugin_root = codex_home.path().join("plugins/cache/test/sample/local");
+        std::fs::create_dir_all(plugin_root.join(".codex-plugin"))?;
+        std::fs::write(
+            plugin_root.join(".codex-plugin/plugin.json"),
+            r#"{"name":"sample","description":"inspect sample data"}"#,
+        )?;
+        let plugin_skill_dir = plugin_root.join("skills/sample-search");
+        std::fs::create_dir_all(&plugin_skill_dir)?;
+        std::fs::write(
+            plugin_skill_dir.join("SKILL.md"),
+            "---\ndescription: inspect sample data\n---\n\nUse the plugin skill.\n",
+        )?;
+        std::fs::write(
+            codex_home.path().join("config.toml"),
+            "[features]\nplugins = true\n\n[plugins.\"sample@test\"]\nenabled = true\n",
+        )?;
+
+        let mut extensions = ExtensionRegistryBuilder::<Config>::new();
+        install(&mut extensions, |config: &Config| SkillsExtensionConfig {
+            enabled: config.features.enabled(Feature::Skills),
+            include_instructions: config.include_skill_instructions,
+            max_context_tokens: config.skill_max_context_tokens,
+            bundled_skills_enabled: config.bundled_skills_enabled(),
+            cloud_skill_enabled: config.cloud_skill_enabled,
+            shadow_selection_enabled: config.features.enabled(Feature::SkillSearch),
+        });
+        let test = test_codex()
+            .with_home(Arc::clone(&codex_home))
+            .with_extensions(Arc::new(extensions.build()))
+            .with_auth(CodexAuth::create_dummy_chatgpt_auth_for_testing())
+            .with_config(move |config| {
+                config
+                    .features
+                    .set_enabled(Feature::Skills, skills_enabled)
+                    .expect("test config should allow feature update");
+            })
+            .build_with_auto_env(&server)
+            .await?;
+
+        test.codex
+            .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
+                text: "hello".to_string(),
+                text_elements: Vec::new(),
+            }]))
+            .await?;
+        core_test_support::wait_for_event(&test.codex, |event| {
+            matches!(event, EventMsg::TurnComplete(_))
+        })
+        .await;
+
+        let developer_text = response
+            .single_request()
+            .message_input_texts("developer")
+            .join("\n\n");
+        assert_eq!(
+            developer_text.contains("## Plugins"),
+            skills_enabled,
+            "skills_enabled={skills_enabled}: {developer_text}"
+        );
+    }
+    Ok(())
+}
+
+/// A hosted plugin with no connectors, so skills would be its only capability.
+struct SkillsOnlyHostedPlugin;
+
+impl codex_extension_api::McpServerContributor<Config> for SkillsOnlyHostedPlugin {
+    fn id(&self) -> &'static str {
+        "skills_only_hosted_plugin"
+    }
+
+    fn contribute<'a>(
+        &'a self,
+        _context: codex_extension_api::McpServerContributionContext<'a, Config>,
+    ) -> ExtensionFuture<'a, Vec<codex_extension_api::McpServerContribution>> {
+        Box::pin(async {
+            vec![
+                codex_extension_api::McpServerContribution::HostedPluginConnectors {
+                    plugin_id: "hosted@test".to_string(),
+                    plugin_display_name: "Hosted".to_string(),
+                    connector_ids: Vec::new(),
+                },
+            ]
+        })
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn selected_skills_only_plugins_add_no_plugin_guidance_when_skills_are_off() -> Result<()> {
+    skip_if_no_network!(Ok(()));
+
+    for skills_enabled in [true, false] {
+        let server = responses::start_mock_server().await;
+        let response = mount_sse_once(
+            &server,
+            sse(vec![ev_response_created("resp1"), ev_completed("resp1")]),
+        )
+        .await;
+        let mut extensions = ExtensionRegistryBuilder::<Config>::new();
+        extensions.mcp_server_contributor(Arc::new(SkillsOnlyHostedPlugin));
+        let test = test_codex()
+            .with_extensions(Arc::new(extensions.build()))
+            .with_config(move |config| {
+                for (feature, enabled) in
+                    [(Feature::Plugins, true), (Feature::Skills, skills_enabled)]
+                {
+                    config
+                        .features
+                        .set_enabled(feature, enabled)
+                        .expect("test config should allow feature update");
+                }
+            })
+            .build_with_auto_env(&server)
+            .await?;
+
+        test.codex
+            .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
+                text: "hello".to_string(),
+                text_elements: Vec::new(),
+            }]))
+            .await?;
+        core_test_support::wait_for_event(&test.codex, |event| {
+            matches!(event, EventMsg::TurnComplete(_))
+        })
+        .await;
+
+        let developer_text = response
+            .single_request()
+            .message_input_texts("developer")
+            .join("\n\n");
+        assert_eq!(
+            developer_text.contains("## Plugins"),
+            skills_enabled,
+            "skills_enabled={skills_enabled}: {developer_text}"
+        );
+    }
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn capability_sections_render_in_order_with_host_repo_and_plugin_skills() -> Result<()> {
     skip_if_wine_exec!(
         Ok(()),
@@ -641,6 +793,7 @@ async fn capability_sections_render_in_order_with_host_repo_and_plugin_skills() 
 
     let mut extensions = ExtensionRegistryBuilder::<Config>::new();
     install(&mut extensions, |config: &Config| SkillsExtensionConfig {
+        enabled: true,
         include_instructions: config.include_skill_instructions,
         max_context_tokens: config.skill_max_context_tokens,
         bundled_skills_enabled: config.bundled_skills_enabled(),
@@ -1050,6 +1203,7 @@ async fn opted_in_executor_provider_skips_host_discovery_but_injects_discovered_
             ),
         )),
         |config: &Config| SkillsExtensionConfig {
+            enabled: true,
             include_instructions: config.include_skill_instructions,
             max_context_tokens: config.skill_max_context_tokens,
             bundled_skills_enabled: false,
@@ -1279,6 +1433,7 @@ async fn executor_only_provider_preserves_structured_repo_skill_without_discover
             ),
         )),
         |config: &Config| SkillsExtensionConfig {
+            enabled: true,
             include_instructions: config.include_skill_instructions,
             max_context_tokens: config.skill_max_context_tokens,
             bundled_skills_enabled: false,
@@ -1428,6 +1583,7 @@ async fn executor_skill_tool_reads_references_under_current_permissions(
             ),
         )),
         |config: &Config| SkillsExtensionConfig {
+            enabled: true,
             include_instructions: config.include_skill_instructions,
             max_context_tokens: config.skill_max_context_tokens,
             bundled_skills_enabled: false,
@@ -1868,6 +2024,7 @@ async fn explicit_executor_skill_prompt_rejects_oversized_resource() -> Result<(
                 ),
             )),
         |config: &Config| SkillsExtensionConfig {
+            enabled: true,
             include_instructions: config.include_skill_instructions,
             max_context_tokens: config.skill_max_context_tokens,
             bundled_skills_enabled: false,
@@ -2098,6 +2255,7 @@ async fn production_turn_aliases_catalogs_with_separate_cloud_budget() -> Result
             }))
             .with_host_provider(Arc::new(HostSkillProvider::new())),
         |config: &Config| SkillsExtensionConfig {
+            enabled: true,
             include_instructions: config.include_skill_instructions,
             max_context_tokens: config.skill_max_context_tokens,
             bundled_skills_enabled: false,
@@ -2236,6 +2394,7 @@ async fn assert_catalog_model_switch(max_context_tokens: Option<usize>) -> Resul
         &mut extensions,
         SkillProviders::new().with_host_provider(provider.clone()),
         |config: &Config| SkillsExtensionConfig {
+            enabled: true,
             include_instructions: config.include_skill_instructions,
             max_context_tokens: config.skill_max_context_tokens,
             bundled_skills_enabled: false,
@@ -2674,6 +2833,7 @@ async fn production_turn_uses_provider_host_catalog_and_core_snapshot_injection(
             main_prompt_contents: Some(provider_contents.to_string()),
         })),
         |config: &Config| SkillsExtensionConfig {
+            enabled: true,
             include_instructions: config.include_skill_instructions,
             max_context_tokens: config.skill_max_context_tokens,
             bundled_skills_enabled: false,
@@ -2794,6 +2954,7 @@ async fn production_turn_suppresses_only_the_superseded_host_skill_prompt() -> R
             }),
         )),
         |config: &Config| SkillsExtensionConfig {
+            enabled: true,
             include_instructions: config.include_skill_instructions,
             max_context_tokens: config.skill_max_context_tokens,
             bundled_skills_enabled: false,
@@ -3047,6 +3208,7 @@ async fn production_turn_keeps_rebalanced_catalogs_stable_after_compaction_and_r
                 catalog: executor_catalog(&EXECUTOR_CATALOG),
             })),
         |config: &Config| SkillsExtensionConfig {
+            enabled: true,
             include_instructions: config.include_skill_instructions,
             max_context_tokens: config.skill_max_context_tokens,
             bundled_skills_enabled: false,
@@ -3557,6 +3719,7 @@ async fn production_turn_fairly_shortens_extension_catalog_descriptions() -> Res
             }),
         )),
         |config: &Config| SkillsExtensionConfig {
+            enabled: true,
             include_instructions: config.include_skill_instructions,
             max_context_tokens: config.skill_max_context_tokens,
             bundled_skills_enabled: false,

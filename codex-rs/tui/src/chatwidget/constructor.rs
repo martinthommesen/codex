@@ -317,6 +317,7 @@ impl ChatWidget {
         widget.sync_worktrees_enabled();
         widget.sync_plugins_command_enabled();
         widget.sync_goal_command_enabled();
+        widget.sync_feature_commands();
         widget
             .bottom_pane
             .set_voice_command_enabled(/*enabled*/ false);

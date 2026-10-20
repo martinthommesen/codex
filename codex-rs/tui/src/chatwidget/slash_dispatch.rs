@@ -16,6 +16,7 @@ use crate::bottom_pane::slash_commands::SlashCommandItem;
 use crate::bottom_pane::slash_commands::find_slash_command;
 use crate::goal_display::GOAL_USAGE;
 use crate::goal_files::GoalDraft;
+use crate::settings_panel::SettingsSwitch;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum SlashCommandDispatchSource {
@@ -326,6 +327,18 @@ impl ChatWidget {
                     .send(AppEvent::OpenDesktopThread { thread_id });
             }
             SlashCommand::Init => {
+                if !self.config.features.enabled(Feature::AgentsMd) {
+                    let hint = self.turn_back_on_hint(
+                        SettingsSwitch::AgentsMd,
+                        "Turn AGENTS.md back on in /settings.",
+                    );
+                    self.add_info_message(
+                        "AGENTS.md is turned off, so new sessions would not load the file /init creates."
+                            .to_string(),
+                        Some(hint),
+                    );
+                    return;
+                }
                 const INIT_PROMPT: &str = include_str!("../../assets/prompt_for_init_command.md");
                 self.submit_user_message(INIT_PROMPT.to_string().into());
             }
@@ -385,7 +398,8 @@ impl ChatWidget {
                 self.apply_plan_slash_command();
             }
             SlashCommand::Goal => {
-                if !self.config.features.enabled(Feature::Goals) {
+                if !self.goal_controls_available() {
+                    self.report_goals_off();
                     return;
                 }
                 if let Some(thread_id) = self.thread_id {
@@ -483,6 +497,9 @@ impl ChatWidget {
             SlashCommand::Experimental => {
                 self.open_experimental_popup();
             }
+            SlashCommand::Settings => {
+                self.app_event_tx.send(AppEvent::OpenSettingsPanel);
+            }
             SlashCommand::AutoReview => {
                 self.open_auto_review_denials_popup();
             }
@@ -536,6 +553,14 @@ impl ChatWidget {
                 self.insert_str("@");
             }
             SlashCommand::Skills => {
+                if !self.config.features.enabled(Feature::Skills) {
+                    let hint = self.turn_back_on_hint(
+                        SettingsSwitch::Skills,
+                        "Turn them back on in /settings.",
+                    );
+                    self.add_info_message("Skills are turned off.".to_string(), Some(hint));
+                    return;
+                }
                 self.open_skills_menu();
             }
             SlashCommand::Import => {
@@ -543,6 +568,14 @@ impl ChatWidget {
                     .send(AppEvent::OpenExternalAgentConfigMigration);
             }
             SlashCommand::Hooks => {
+                if !self.config.features.enabled(Feature::CodexHooks) {
+                    let hint = self.turn_back_on_hint(
+                        SettingsSwitch::Hooks,
+                        "Turn them back on in /settings.",
+                    );
+                    self.add_info_message("Hooks are turned off.".to_string(), Some(hint));
+                    return;
+                }
                 self.add_hooks_output();
             }
             SlashCommand::Daemon => self.app_event_tx.send(AppEvent::OpenDaemonMenu),
@@ -995,7 +1028,8 @@ impl ChatWidget {
                 }
             }
             SlashCommand::Goal if !trimmed.is_empty() => {
-                if !self.config.features.enabled(Feature::Goals) {
+                if !self.goal_controls_available() {
+                    self.report_goals_off();
                     if source == SlashCommandDispatchSource::Live {
                         self.clear_live_goal_submission();
                     }
@@ -1044,6 +1078,14 @@ impl ChatWidget {
                         }
                     }
                     self.append_message_history_entry(format!("/goal {trimmed}"));
+                    if source == SlashCommandDispatchSource::Live {
+                        self.clear_live_goal_submission();
+                    }
+                    return;
+                }
+                // An existing goal stays controllable, but new goals follow the saved setting.
+                if !self.config.features.enabled(Feature::Goals) {
+                    self.report_goals_off();
                     if source == SlashCommandDispatchSource::Live {
                         self.clear_live_goal_submission();
                     }
@@ -1238,6 +1280,10 @@ impl ChatWidget {
             rest_offset + leading_trimmed,
             &text_elements,
         );
+        // A refused new goal only prints why, so later queued input can go out.
+        let refused_new_goal = cmd == SlashCommand::Goal
+            && !self.config.features.enabled(Feature::Goals)
+            && !is_goal_control_args(trimmed_rest);
         self.dispatch_prepared_command_with_args(
             cmd,
             PreparedSlashCommandArgs {
@@ -1250,6 +1296,9 @@ impl ChatWidget {
                 source: SlashCommandDispatchSource::Queued,
             },
         );
+        if refused_new_goal {
+            return QueueDrain::Continue;
+        }
         self.queued_command_drain_result(cmd)
     }
 
@@ -1272,13 +1321,14 @@ impl ChatWidget {
             connectors_enabled: self.connectors_enabled(),
             plugins_command_enabled: self.config.features.enabled(Feature::Plugins),
             token_activity_command_enabled: self.has_codex_backend_auth,
-            goal_command_enabled: self.config.features.enabled(Feature::Goals),
+            goal_command_enabled: self.goal_controls_available(),
             service_tier_commands_enabled: !self.current_model_service_tier_commands().is_empty(),
             daybreak_command_description: self.daybreak_command_description(),
             voice_command_enabled: self.realtime_conversation_available_for_thread,
             worktrees_enabled: self.local_worktree_operations,
             allow_elevate_sandbox,
             side_conversation_active: self.active_side_conversation,
+            feature_commands: self.feature_command_flags(),
         }
     }
 
@@ -1288,6 +1338,11 @@ impl ChatWidget {
         }
         self.add_error_message(USAGE_CHATGPT_LOGIN_REQUIRED.to_string());
         false
+    }
+
+    fn report_goals_off(&mut self) {
+        let hint = self.turn_back_on_hint(SettingsSwitch::Goals, "Turn them back on in /settings.");
+        self.add_info_message("Goals are turned off.".to_string(), Some(hint));
     }
 
     fn queued_command_drain_result(&self, cmd: SlashCommand) -> QueueDrain {
@@ -1330,6 +1385,11 @@ impl ChatWidget {
                     QueueDrain::Continue
                 }
             }
+            // A command whose feature is off only prints why, so later queued input can go out.
+            SlashCommand::Init if !self.feature_command_flags().init => QueueDrain::Continue,
+            SlashCommand::Skills if !self.feature_command_flags().skills => QueueDrain::Continue,
+            SlashCommand::Hooks if !self.feature_command_flags().hooks => QueueDrain::Continue,
+            SlashCommand::Goal if !self.goal_controls_available() => QueueDrain::Continue,
             SlashCommand::Feedback
             | SlashCommand::Warnings
             | SlashCommand::Export
@@ -1354,6 +1414,7 @@ impl ChatWidget {
             | SlashCommand::Permissions
             | SlashCommand::ElevateSandbox
             | SlashCommand::Experimental
+            | SlashCommand::Settings
             | SlashCommand::AutoReview
             | SlashCommand::Memories
             | SlashCommand::Quit
@@ -1421,4 +1482,12 @@ impl ChatWidget {
         self.bottom_pane.drain_pending_submission_state();
         false
     }
+}
+
+/// `/goal` arguments that act on the current goal instead of starting a new one.
+fn is_goal_control_args(args: &str) -> bool {
+    matches!(
+        args.to_ascii_lowercase().as_str(),
+        "clear" | "edit" | "pause" | "resume"
+    )
 }

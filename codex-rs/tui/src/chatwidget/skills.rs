@@ -17,6 +17,7 @@ use codex_app_server_protocol::SkillMetadata;
 use codex_app_server_protocol::SkillsListEntry;
 use codex_app_server_protocol::SkillsListResponse;
 use codex_connectors::AppInfo;
+use codex_features::Feature;
 use codex_protocol::parse_command::ParsedCommand;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use codex_utils_path_uri::LegacyAppPathString;
@@ -137,7 +138,12 @@ impl ChatWidget {
     }
 
     pub(crate) fn set_skills_from_response(&mut self, response: &SkillsListResponse) {
-        let skills = skills_for_cwd(&self.config.cwd, &response.data);
+        // skills/list follows the saved config, which can differ from what this session started with.
+        let skills = if self.config.features.enabled(Feature::Skills) {
+            skills_for_cwd(&self.config.cwd, &response.data)
+        } else {
+            Vec::new()
+        };
         self.skills_all = skills;
         self.set_skills(Some(enabled_skills_for_mentions(&self.skills_all)));
     }

@@ -22,6 +22,7 @@ pub enum SlashCommand {
     #[strum(serialize = "setup-default-sandbox")]
     ElevateSandbox,
     Experimental,
+    Settings,
     #[strum(to_string = "approve")]
     AutoReview,
     Memories,
@@ -151,6 +152,9 @@ impl SlashCommand {
             SlashCommand::Vim => "toggle Vim mode for the composer",
             SlashCommand::ElevateSandbox => "set up elevated agent sandbox",
             SlashCommand::Experimental => "toggle experimental features",
+            SlashCommand::Settings => {
+                "turn whole features like plugins, skills, and hooks on or off"
+            }
             SlashCommand::AutoReview => "approve one retry of a recent auto-review denial",
             SlashCommand::Memories => "configure memory use and generation",
             SlashCommand::Mcp => "list MCP tools; use /mcp verbose or /mcp login <name>",
@@ -261,6 +265,7 @@ impl SlashCommand {
             | SlashCommand::Vim
             | SlashCommand::ElevateSandbox
             | SlashCommand::Experimental
+            | SlashCommand::Settings
             | SlashCommand::Memories
             | SlashCommand::Import
             | SlashCommand::Review
@@ -365,6 +370,17 @@ mod tests {
         assert!(SlashCommand::Raw.available_in_side_conversation());
         assert!(SlashCommand::Raw.supports_inline_args());
         assert!(SlashCommand::App.available_during_task());
+    }
+
+    #[test]
+    fn settings_command_opens_from_idle_composer_only() {
+        assert_eq!(SlashCommand::Settings.command(), "settings");
+        assert_eq!(
+            SlashCommand::from_str("settings"),
+            Ok(SlashCommand::Settings)
+        );
+        assert!(!SlashCommand::Settings.available_during_task());
+        assert!(!SlashCommand::Settings.supports_inline_args());
     }
 
     #[test]

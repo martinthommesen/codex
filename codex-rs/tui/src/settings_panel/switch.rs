@@ -1,0 +1,448 @@
+//! Whole-feature switch definitions, requirements, and config edits for `/settings`.
+
+use crate::config_update::clear_config_value;
+use crate::config_update::replace_config_value;
+use crate::legacy_core::config::Config;
+use crate::legacy_core::config::ManagedFeatures;
+use codex_app_server_protocol::ConfigEdit;
+use codex_features::Feature;
+use codex_features::legacy_keys_for_feature;
+use codex_protocol::config_types::WebSearchMode;
+
+/// A feature that `/settings` can turn completely on or off.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SettingsSwitch {
+    PluginsAndApps,
+    Skills,
+    Hooks,
+    AgentsMd,
+    Memories,
+    Subagents,
+    WebSearch,
+    ImageGeneration,
+    Goals,
+}
+
+impl SettingsSwitch {
+    pub(crate) const ALL: [Self; 9] = [
+        Self::PluginsAndApps,
+        Self::Skills,
+        Self::Hooks,
+        Self::AgentsMd,
+        Self::Memories,
+        Self::Subagents,
+        Self::WebSearch,
+        Self::ImageGeneration,
+        Self::Goals,
+    ];
+
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::PluginsAndApps => "Plugins & apps",
+            Self::Skills => "Skills",
+            Self::Hooks => "Hooks",
+            Self::AgentsMd => "AGENTS.md",
+            Self::Memories => "Memories",
+            Self::Subagents => "Subagents",
+            Self::WebSearch => "Web search",
+            Self::ImageGeneration => "Image generation",
+            Self::Goals => "Goals",
+        }
+    }
+
+    pub(super) fn description(self) -> &'static str {
+        match self {
+            Self::PluginsAndApps => {
+                "Load plugins and connect apps, including their tools, skills, hooks, and mentions"
+            }
+            Self::Skills => {
+                "Discover skills and offer them through the catalog, $ mentions, and /skills"
+            }
+            Self::Hooks => "Run lifecycle hooks from hooks.json, config.toml, and plugins",
+            Self::AgentsMd => {
+                "Load instructions from ~/.codex/AGENTS.md and project AGENTS.md files"
+            }
+            Self::Memories => "Remember useful context and reuse it in later sessions",
+            Self::Subagents => "Let Codex spawn and coordinate subagents",
+            Self::WebSearch => "Let Codex search the web",
+            Self::ImageGeneration => "Let Codex generate images",
+            Self::Goals => "Keep working toward a goal set with /goal across turns",
+        }
+    }
+
+    pub(super) fn keywords(self) -> &'static str {
+        match self {
+            Self::PluginsAndApps => "extensions connectors marketplace mcp $app",
+            Self::Skills => "skill.md catalog $skill",
+            Self::Hooks => "lifecycle hooks.json automation",
+            Self::AgentsMd => "instructions project docs context init",
+            Self::Memories => "memory remember",
+            Self::Subagents => "agents multi-agent spawn delegate",
+            Self::WebSearch => "internet browse search",
+            Self::ImageGeneration => "images imagegen pictures",
+            Self::Goals => "goal continuation long-running",
+        }
+    }
+
+    pub(super) fn section(self) -> SettingsSection {
+        match self {
+            Self::PluginsAndApps | Self::Skills | Self::Hooks => SettingsSection::Extensions,
+            Self::AgentsMd | Self::Memories => SettingsSection::Context,
+            Self::Subagents | Self::WebSearch | Self::ImageGeneration | Self::Goals => {
+                SettingsSection::Tools
+            }
+        }
+    }
+
+    /// Feature flags this switch writes.
+    pub(crate) fn features(self) -> &'static [Feature] {
+        match self {
+            Self::PluginsAndApps => &[Feature::Plugins, Feature::Apps],
+            Self::Skills => &[Feature::Skills],
+            Self::Hooks => &[Feature::CodexHooks],
+            Self::AgentsMd => &[Feature::AgentsMd],
+            Self::Memories => &[Feature::MemoryTool],
+            Self::Subagents => &[Feature::Collab],
+            Self::WebSearch => &[],
+            Self::ImageGeneration => &[Feature::ImageGeneration],
+            Self::Goals => &[Feature::Goals],
+        }
+    }
+
+    /// Effective state of every key this switch writes.
+    pub(crate) fn state(self, config: &Config) -> SwitchState {
+        match self {
+            Self::Subagents => subagents_state(config),
+            Self::WebSearch => {
+                SwitchState::from_values(
+                    [config.web_search_mode.value() != WebSearchMode::Disabled],
+                )
+            }
+            Self::PluginsAndApps
+            | Self::Skills
+            | Self::Hooks
+            | Self::AgentsMd
+            | Self::Memories
+            | Self::ImageGeneration
+            | Self::Goals => SwitchState::from_values(
+                self.features()
+                    .iter()
+                    .map(|feature| config.features.enabled(*feature)),
+            ),
+        }
+    }
+
+    /// Turns the switch on or off in `config`. Keys that requirements pin to the other value keep
+    /// it, as long as another key still changes; otherwise the switch is rejected as managed.
+    pub(crate) fn apply(self, config: &mut Config, enabled: bool) -> Result<(), String> {
+        let before = self.state(config);
+        let mut changed = false;
+        let mut pinned = None;
+        for feature in self.features() {
+            if config.features.enabled(*feature) == enabled {
+                continue;
+            }
+            match set_feature(&mut config.features, *feature, enabled) {
+                Ok(()) => changed = true,
+                Err(err) => pinned = pinned.or(Some(err)),
+            }
+        }
+        match self {
+            Self::Subagents => {
+                config.agents_enabled = enabled;
+                if !enabled
+                    && let Err(err) =
+                        set_feature(&mut config.features, Feature::MultiAgentV2, enabled)
+                {
+                    pinned = pinned.or(Some(err));
+                }
+                // Subagents follow the combined keys, so a pin only matters if it decides them.
+                let after = self.state(config);
+                let reached = if enabled {
+                    after != SwitchState::Off
+                } else {
+                    after == SwitchState::Off
+                };
+                if !reached || after == before {
+                    return Err(pinned.unwrap_or_else(|| {
+                        "requirements decide whether subagents are available".to_string()
+                    }));
+                }
+                return Ok(());
+            }
+            Self::WebSearch => {
+                let mode = if enabled {
+                    enabled_web_search_mode(config)
+                        .ok_or_else(|| "requirements only allow disabled web search".to_string())?
+                } else {
+                    WebSearchMode::Disabled
+                };
+                config
+                    .web_search_mode
+                    .set(mode)
+                    .map_err(|err| err.to_string())?;
+            }
+            Self::PluginsAndApps
+            | Self::Skills
+            | Self::Hooks
+            | Self::AgentsMd
+            | Self::Memories
+            | Self::ImageGeneration
+            | Self::Goals => {}
+        }
+        if let Some(err) = pinned
+            && !changed
+        {
+            return Err(err);
+        }
+        Ok(())
+    }
+
+    /// Copies only this switch's values, leaving unrelated settings unchanged.
+    pub(crate) fn adopt(self, target: &mut Config, source: &Config) {
+        let adopt_feature = |target: &mut Config, feature: Feature| {
+            if let Err(err) = target
+                .features
+                .set_enabled(feature, source.features.enabled(feature))
+            {
+                tracing::warn!(error = %err, feature = feature.key(), "failed to adopt feature state");
+            }
+        };
+        for feature in self.features() {
+            adopt_feature(target, *feature);
+        }
+        match self {
+            Self::Subagents => {
+                target.agents_enabled = source.agents_enabled;
+                adopt_feature(target, Feature::MultiAgentV2);
+            }
+            Self::WebSearch => {
+                if let Err(err) = target.web_search_mode.set(source.web_search_mode.value()) {
+                    tracing::warn!(error = %err, "failed to adopt web search mode");
+                }
+            }
+            Self::PluginsAndApps
+            | Self::Skills
+            | Self::Hooks
+            | Self::AgentsMd
+            | Self::Memories
+            | Self::ImageGeneration
+            | Self::Goals => {}
+        }
+    }
+
+    /// Explicit values for every key, so runtime enablement and legacy aliases cannot win. Keys
+    /// that requirements pin to the other value are left alone.
+    pub(crate) fn edits(self, enabled: bool, config: &Config) -> Vec<ConfigEdit> {
+        let mut edits = Vec::new();
+        for feature in self.features() {
+            if set_feature(&mut config.features.clone(), *feature, enabled).is_err() {
+                continue;
+            }
+            edits.push(feature_edit(*feature, enabled));
+            edits.extend(
+                legacy_keys_for_feature(*feature)
+                    .map(|legacy_key| clear_config_value(format!("features.{legacy_key}"))),
+            );
+        }
+        match self {
+            Self::Subagents => {
+                edits.push(replace_config_value(
+                    "agents.enabled",
+                    serde_json::json!(enabled),
+                ));
+                // A stale user value would return once an overriding layer goes away.
+                if !enabled {
+                    edits.push(feature_edit(Feature::MultiAgentV2, /*enabled*/ false));
+                }
+            }
+            Self::WebSearch => {
+                // An explicit mode keeps a lower layer from leaving search disabled.
+                let mode = if enabled {
+                    enabled_web_search_mode(config).unwrap_or_default()
+                } else {
+                    WebSearchMode::Disabled
+                };
+                edits.push(replace_config_value("web_search", serde_json::json!(mode)));
+            }
+            Self::PluginsAndApps
+            | Self::Skills
+            | Self::Hooks
+            | Self::AgentsMd
+            | Self::Memories
+            | Self::ImageGeneration
+            | Self::Goals => {}
+        }
+        edits
+    }
+}
+
+/// Mirrors core: `features.multi_agent_v2` turns subagents on and `agents.enabled = false` turns
+/// them off. Otherwise the model's catalog version decides, and `features.multi_agent` only
+/// applies to models without one, so that case is partial.
+fn subagents_state(config: &Config) -> SwitchState {
+    if config.features.enabled(Feature::MultiAgentV2) {
+        SwitchState::On
+    } else if !config.agents_enabled {
+        SwitchState::Off
+    } else if config.features.enabled(Feature::Collab) {
+        SwitchState::On
+    } else {
+        SwitchState::Partial
+    }
+}
+
+fn feature_edit(feature: Feature, enabled: bool) -> ConfigEdit {
+    replace_config_value(
+        format!("features.{}", feature.key()),
+        serde_json::json!(enabled),
+    )
+}
+
+fn set_feature(
+    features: &mut ManagedFeatures,
+    feature: Feature,
+    enabled: bool,
+) -> Result<(), String> {
+    features
+        .set_enabled(feature, enabled)
+        .map_err(|err| err.to_string())?;
+    // Requirements restore pinned features silently, so compare the effective value.
+    if features.enabled(feature) != enabled {
+        return Err(format!(
+            "`features.{}` is pinned by requirements",
+            feature.key()
+        ));
+    }
+    Ok(())
+}
+
+/// The mode turning web search on writes: the mode the user's own config file sets, then the
+/// default, then another mode, whichever requirements allow first.
+pub(crate) fn enabled_web_search_mode(config: &Config) -> Option<WebSearchMode> {
+    // Another layer may have disabled search, so keep the user's own choice instead of resetting it.
+    // A selected profile layers over the main config.toml.
+    let user_mode = config
+        .config_layer_stack
+        .effective_user_config()
+        .and_then(|user_config| user_config.get("web_search").cloned())
+        .and_then(|mode| mode.try_into::<WebSearchMode>().ok())
+        .filter(|mode| *mode != WebSearchMode::Disabled);
+    user_mode
+        .into_iter()
+        .chain(ENABLED_WEB_SEARCH_MODES)
+        .find(|mode| config.web_search_mode.can_set(mode).is_ok())
+}
+
+pub(crate) const ENABLED_WEB_SEARCH_MODES: [WebSearchMode; 3] = [
+    WebSearchMode::Cached,
+    WebSearchMode::Indexed,
+    WebSearchMode::Live,
+];
+
+/// Combined state of the keys behind one switch.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SwitchState {
+    On,
+    Off,
+    /// Some keys are on and others off, for example plugins on with apps off.
+    Partial,
+}
+
+impl SwitchState {
+    fn from_values(values: impl IntoIterator<Item = bool>) -> Self {
+        let mut values = values.into_iter();
+        let first = values.next().unwrap_or(true);
+        if values.any(|enabled| enabled != first) {
+            Self::Partial
+        } else if first {
+            Self::On
+        } else {
+            Self::Off
+        }
+    }
+
+    /// Activating a partially enabled switch turns everything on.
+    pub(super) fn toggled(self) -> bool {
+        self != Self::On
+    }
+}
+
+/// What the panel shows for one switch.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct SwitchStatus {
+    pub(crate) switch: SettingsSwitch,
+    pub(crate) state: SwitchState,
+    /// Value activating the row requests, or `None` when requirements pin every direction.
+    pub(crate) target: Option<bool>,
+    /// Requirements pin at least one key, or block the usual toggle direction.
+    pub(crate) managed: bool,
+}
+
+impl SwitchStatus {
+    pub(super) fn locked(self) -> bool {
+        self.target.is_none()
+    }
+}
+
+pub(crate) fn statuses(config: &Config) -> Vec<SwitchStatus> {
+    SettingsSwitch::ALL
+        .into_iter()
+        .map(|switch| {
+            let state = switch.state(config);
+            let can_apply = |enabled| switch.apply(&mut config.clone(), enabled).is_ok();
+            let preferred = state.toggled();
+            // When a pinned key blocks turning a partial switch on, it can still turn the rest off.
+            let target = if can_apply(preferred) {
+                Some(preferred)
+            } else if state == SwitchState::Partial && can_apply(!preferred) {
+                Some(!preferred)
+            } else {
+                None
+            };
+            let pinned_key = switch.features().iter().any(|feature| {
+                let flipped = !config.features.enabled(*feature);
+                set_feature(&mut config.features.clone(), *feature, flipped).is_err()
+            });
+            SwitchStatus {
+                switch,
+                state,
+                target,
+                managed: pinned_key || target != Some(preferred),
+            }
+        })
+        .collect()
+}
+
+/// Notice shown after a switch saves without being overridden. `state` is the saved result, which
+/// stays partial when requirements pin one of the switch's keys.
+pub(crate) fn saved_notice(switch: SettingsSwitch, enabled: bool, state: SwitchState) -> String {
+    let label = switch.label();
+    let action = if enabled { "on" } else { "off" };
+    if state == SwitchState::Partial {
+        format!(
+            "{label} turned {action} for new sessions where your administrator allows it · use /new to start one"
+        )
+    } else {
+        format!("{label} turned {action} for new sessions · use /new to start one")
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum SettingsSection {
+    Extensions,
+    Context,
+    Tools,
+}
+
+impl SettingsSection {
+    pub(super) const ALL: [Self; 3] = [Self::Extensions, Self::Context, Self::Tools];
+
+    pub(super) fn title(self) -> &'static str {
+        match self {
+            Self::Extensions => "Extensions",
+            Self::Context => "Context",
+            Self::Tools => "Tools",
+        }
+    }
+}

@@ -646,6 +646,14 @@ impl BottomPane {
         self.request_redraw();
     }
 
+    pub(crate) fn set_feature_commands(
+        &mut self,
+        feature_commands: crate::bottom_pane::slash_commands::FeatureCommandFlags,
+    ) {
+        self.composer.set_feature_commands(feature_commands);
+        self.request_redraw();
+    }
+
     pub fn set_goal_command_enabled(&mut self, enabled: bool) {
         self.composer.set_goal_command_enabled(enabled);
         self.request_redraw();

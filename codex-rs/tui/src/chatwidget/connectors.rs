@@ -164,6 +164,15 @@ impl ChatWidget {
     }
 
     pub(crate) fn add_connectors_output(&mut self) {
+        if !self.config.features.enabled(Feature::Apps) {
+            let hint = self.feature_back_on_hint(
+                crate::settings_panel::SettingsSwitch::PluginsAndApps,
+                Feature::Apps,
+                "Turn them back on in /settings.",
+            );
+            self.add_info_message("Apps are turned off.".to_string(), Some(hint));
+            return;
+        }
         if !self.connectors_enabled() {
             self.add_info_message(
                 "Apps are disabled.".to_string(),

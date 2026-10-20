@@ -12,6 +12,7 @@ use codex_extension_api::ExtensionRegistryBuilder;
 use codex_extension_api::SkillInvocationContributor;
 use codex_extension_api::SkillInvocationInput;
 use codex_extension_api::SkillInvocationKind;
+use codex_features::Feature;
 use codex_protocol::config_types::CollaborationMode;
 use codex_protocol::config_types::ModeKind;
 use codex_protocol::config_types::Settings;
@@ -27,6 +28,7 @@ use codex_skills_extension::install;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use codex_utils_path_uri::PathUri;
 use core_test_support::create_directory_symlink;
+use core_test_support::responses::ResponsesRequest;
 use core_test_support::responses::ev_assistant_message;
 use core_test_support::responses::ev_completed;
 use core_test_support::responses::ev_response_created;
@@ -40,8 +42,10 @@ use core_test_support::test_codex::local_requests;
 use core_test_support::test_codex::test_codex;
 use core_test_support::test_codex::turn_permission_fields;
 use pretty_assertions::assert_eq;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::Mutex;
+use tempfile::TempDir;
 use tracing::Level;
 use tracing_subscriber::fmt::format::FmtSpan;
 use tracing_test::internal::MockWriter;
@@ -324,6 +328,7 @@ async fn user_turn_selects_symlinked_skill_by_advertised_discovery_path() -> Res
     let skill_body = "instructions from the canonical linked skill";
     let mut extensions = ExtensionRegistryBuilder::<Config>::new();
     install(&mut extensions, |config: &Config| SkillsExtensionConfig {
+        enabled: true,
         include_instructions: config.include_skill_instructions,
         max_context_tokens: config.skill_max_context_tokens,
         bundled_skills_enabled: false,
@@ -486,6 +491,199 @@ async fn idle_user_turn_includes_skill_instructions_in_the_first_request() -> Re
         }),
         "expected queued skill instructions in the first request, got {user_texts:?}"
     );
+
+    Ok(())
+}
+
+const FLAGGED_REPO_SKILL_DESCRIPTION: &str = "Repository skill gated by the skills feature";
+const FLAGGED_REPO_SKILL_BODY: &str = "Repository skill body gated by the skills feature.";
+const FLAGGED_USER_SKILL_DESCRIPTION: &str = "User skill gated by the skills feature";
+const FLAGGED_USER_SKILL_BODY: &str = "User skill body gated by the skills feature.";
+
+struct SkillsFeatureTurn {
+    request: ResponsesRequest,
+    repo_skill_path: PathBuf,
+    invocations: Vec<(String, SkillInvocationKind)>,
+}
+
+/// Runs one turn that explicitly mentions a repo skill while a user skill is also installed.
+async fn explicit_skill_turn_with_skills_feature(
+    skills_enabled: bool,
+) -> Result<SkillsFeatureTurn> {
+    let server = start_mock_server().await;
+    let codex_home = Arc::new(TempDir::new()?);
+    let user_skill_dir = codex_home.path().join("skills/flagged-user");
+    std::fs::create_dir_all(&user_skill_dir)?;
+    std::fs::write(
+        user_skill_dir.join("SKILL.md"),
+        format!(
+            "---\nname: flagged-user\ndescription: {FLAGGED_USER_SKILL_DESCRIPTION}\n---\n\n{FLAGGED_USER_SKILL_BODY}\n"
+        ),
+    )?;
+    let recorder = Arc::new(SkillInvocationRecorder::default());
+    let mut extensions = ExtensionRegistryBuilder::<Config>::new();
+    extensions.skill_invocation_contributor(recorder.clone());
+    install(&mut extensions, |config: &Config| SkillsExtensionConfig {
+        enabled: config.features.enabled(Feature::Skills),
+        include_instructions: config.include_skill_instructions,
+        max_context_tokens: config.skill_max_context_tokens,
+        bundled_skills_enabled: false,
+        cloud_skill_enabled: false,
+        shadow_selection_enabled: false,
+    });
+    let mut builder = test_codex()
+        .with_home(Arc::clone(&codex_home))
+        .with_extensions(Arc::new(extensions.build()))
+        .with_config(move |config| {
+            config
+                .features
+                .set_enabled(Feature::Skills, skills_enabled)
+                .expect("skills feature should be configurable in tests");
+        })
+        .with_workspace_setup(|cwd, fs| async move {
+            write_repo_skill(
+                cwd,
+                fs,
+                "flagged-repo",
+                FLAGGED_REPO_SKILL_DESCRIPTION,
+                FLAGGED_REPO_SKILL_BODY,
+            )
+            .await
+        });
+    let test = builder.build_with_auto_env(&server).await?;
+    let repo_skill_path = test
+        .config
+        .cwd
+        .join(".agents/skills/flagged-repo/SKILL.md")
+        .canonicalize()
+        .unwrap_or_else(|_| test.config.cwd.join(".agents/skills/flagged-repo/SKILL.md"))
+        .to_path_buf();
+    let mock = mount_sse_once(
+        &server,
+        sse(vec![
+            ev_response_created("flagged-skill-response"),
+            ev_assistant_message("flagged-skill-message", "done"),
+            ev_completed("flagged-skill-response"),
+        ]),
+    )
+    .await;
+
+    test.codex
+        .start_or_steer_turn(TurnInputRequest::user_input(vec![
+            UserInput::Text {
+                text: "please use $flagged-repo".to_string(),
+                text_elements: Vec::new(),
+            },
+            UserInput::Skill {
+                name: "flagged-repo".to_string(),
+                path: repo_skill_path.clone(),
+            },
+        ]))
+        .await?;
+    core_test_support::wait_for_event(test.codex.as_ref(), |event| {
+        matches!(event, EventMsg::TurnComplete(_))
+    })
+    .await;
+
+    let invocations = recorder
+        .0
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone();
+    Ok(SkillsFeatureTurn {
+        request: mock.single_request(),
+        repo_skill_path,
+        invocations,
+    })
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn skills_feature_enabled_exposes_catalog_and_explicit_skill_instructions() -> Result<()> {
+    skip_if_wine_exec!(
+        Ok(()),
+        "skill paths require matching host and executor path conventions"
+    );
+    skip_if_no_network!(Ok(()));
+
+    // Positive control for the disabled case below: the same skills reach the model by default.
+    let turn = explicit_skill_turn_with_skills_feature(/*skills_enabled*/ true).await?;
+
+    let developer_texts = turn.request.message_input_texts("developer");
+    for catalog_entry in [
+        format!("- flagged-repo: {FLAGGED_REPO_SKILL_DESCRIPTION} (file: "),
+        format!("- flagged-user: {FLAGGED_USER_SKILL_DESCRIPTION} (file: "),
+    ] {
+        assert!(
+            developer_texts
+                .iter()
+                .any(|text| text.contains(&catalog_entry)),
+            "expected {catalog_entry:?} in the skill catalog, got {developer_texts:?}"
+        );
+    }
+    let user_texts = turn.request.message_input_texts("user");
+    assert!(
+        user_texts.iter().any(|text| {
+            text.contains("<skill>\n<name>flagged-repo</name>")
+                && text.contains(FLAGGED_REPO_SKILL_BODY)
+        }),
+        "expected explicit skill instructions in user input, got {user_texts:?}"
+    );
+    assert!(
+        turn.request
+            .has_content_kinds(&["skills.selected_skill_instructions"])
+    );
+    assert_eq!(
+        turn.invocations,
+        vec![(
+            turn.repo_skill_path.display().to_string(),
+            SkillInvocationKind::Explicit
+        )],
+    );
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn skills_feature_disabled_omits_catalog_and_explicit_skill_instructions() -> Result<()> {
+    skip_if_wine_exec!(
+        Ok(()),
+        "skill paths require matching host and executor path conventions"
+    );
+    skip_if_no_network!(Ok(()));
+
+    let turn = explicit_skill_turn_with_skills_feature(/*skills_enabled*/ false).await?;
+
+    // The user's own `$flagged-repo` text is the only place the skill may still appear.
+    let developer_texts = turn.request.message_input_texts("developer");
+    assert!(
+        !developer_texts
+            .iter()
+            .any(|text| text.contains("flagged-repo") || text.contains("flagged-user")),
+        "disabled skills must not be listed in the skill catalog, got {developer_texts:?}"
+    );
+    let request_body = turn.request.body_json().to_string();
+    for hidden in [
+        FLAGGED_REPO_SKILL_DESCRIPTION,
+        FLAGGED_REPO_SKILL_BODY,
+        FLAGGED_USER_SKILL_DESCRIPTION,
+        FLAGGED_USER_SKILL_BODY,
+    ] {
+        assert!(
+            !request_body.contains(hidden),
+            "disabled skills must not reach the model, found {hidden:?} in {request_body}"
+        );
+    }
+    let user_texts = turn.request.message_input_texts("user");
+    assert!(
+        !user_texts.iter().any(|text| text.contains("<skill>")),
+        "disabled skills must not inject explicit skill instructions, got {user_texts:?}"
+    );
+    assert!(
+        !turn
+            .request
+            .has_content_kinds(&["skills.selected_skill_instructions"])
+    );
+    assert_eq!(turn.invocations, Vec::new());
 
     Ok(())
 }

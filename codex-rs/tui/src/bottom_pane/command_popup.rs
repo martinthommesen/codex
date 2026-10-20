@@ -11,6 +11,7 @@ use super::selection_popup_common::GenericDisplayRow;
 use super::selection_popup_common::measure_rows_height_with_col_width_mode;
 use super::selection_popup_common::render_rows_with_col_width_mode;
 use super::slash_commands::BuiltinCommandFlags;
+use super::slash_commands::FeatureCommandFlags;
 use super::slash_commands::ServiceTierCommand;
 use super::slash_commands::SlashCommandItem;
 use super::slash_commands::commands_for_input;
@@ -53,6 +54,7 @@ pub(crate) struct CommandPopupFlags {
     pub(crate) worktrees_enabled: bool,
     pub(crate) windows_degraded_sandbox_active: bool,
     pub(crate) side_conversation_active: bool,
+    pub(crate) feature_commands: FeatureCommandFlags,
 }
 
 impl From<CommandPopupFlags> for BuiltinCommandFlags {
@@ -69,6 +71,7 @@ impl From<CommandPopupFlags> for BuiltinCommandFlags {
             worktrees_enabled: value.worktrees_enabled,
             allow_elevate_sandbox: value.windows_degraded_sandbox_active,
             side_conversation_active: value.side_conversation_active,
+            feature_commands: value.feature_commands,
         }
     }
 }
@@ -679,6 +682,7 @@ mod tests {
                 worktrees_enabled: true,
                 windows_degraded_sandbox_active: false,
                 side_conversation_active: false,
+                feature_commands: FeatureCommandFlags::ALL,
             },
             Vec::new(),
         );

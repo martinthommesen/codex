@@ -381,6 +381,7 @@ use self::review::ReviewState;
 mod safety_buffering;
 mod service_tiers;
 mod settings;
+mod settings_panel;
 mod settings_popups;
 mod side;
 use self::safety_buffering::SafetyBufferingState;
@@ -1950,10 +1951,34 @@ impl ChatWidget {
     }
 
     pub(crate) fn sync_plugin_mentions_config(&mut self, config: &Config) {
+        let changed = |before: &Config, feature: Feature| {
+            before.features.enabled(feature) != config.features.enabled(feature)
+        };
+        let skills_changed = changed(&self.config, Feature::Skills);
+        let plugins_changed = changed(&self.config, Feature::Plugins);
+        let apps_changed = changed(&self.config, Feature::Apps);
         self.config.features = config.features.clone();
         self.config.config_layer_stack = config.config_layer_stack.clone();
         self.config.memories = config.memories.clone();
+        // `/settings` in another Codex can change these on disk.
+        self.config.agents_enabled = config.agents_enabled;
+        self.config.web_search_mode = config.web_search_mode.clone();
         self.sync_mentions_v2_enabled();
+        self.sync_feature_commands();
+        self.sync_goal_command_enabled();
+        self.sync_plugins_command_enabled();
+        self.bottom_pane
+            .set_connectors_enabled(self.connectors_enabled());
+        if plugins_changed {
+            self.refresh_plugin_mentions();
+        }
+        if apps_changed {
+            self.refresh_connector_mentions(/*force_refresh*/ false);
+        }
+        // Plugin-provided skills appear or disappear with their plugins.
+        if skills_changed || plugins_changed {
+            self.refresh_skills_for_current_cwd(/*force_reload*/ true);
+        }
     }
 
     pub(crate) fn token_usage(&self) -> TokenUsage {

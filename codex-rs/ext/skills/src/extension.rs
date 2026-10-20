@@ -34,6 +34,7 @@ use codex_extension_api::WorldStateSectionContribution;
 use codex_mcp::McpResourceClient;
 use codex_otel::MetricsClient;
 use codex_protocol::openai_models::ModelInfo;
+use codex_protocol::user_input::UserInput;
 
 use crate::SkillsExtensionConfig;
 use crate::catalog::SkillCatalog;
@@ -78,6 +79,8 @@ use crate::world_state_catalogs::CatalogStatus;
 
 #[path = "cloud_skill.rs"]
 mod cloud_skill;
+
+const SKILLS_OFF_WARNING: &str = "Skills are turned off for this session, so the selected skill was not used. Turn skills on in /settings and start a new session to use them.";
 
 struct SkillsExtension<C> {
     providers: SkillProviders,
@@ -195,7 +198,7 @@ where
                 return Vec::new();
             };
             let config = thread_state.config();
-            if !config.include_instructions {
+            if !config.enabled || !config.include_instructions {
                 return Vec::new();
             }
             let catalog = self
@@ -252,6 +255,13 @@ where
         input: WorldStateContributionInput<'a>,
     ) -> ExtensionFuture<'a, Vec<WorldStateSectionContribution>> {
         Box::pin(async move {
+            if input
+                .thread_store
+                .get::<SkillsThreadState>()
+                .is_some_and(|state| !state.config().enabled)
+            {
+                return crate::world_state::disabled_skills_world_state_sections();
+            }
             let Some(context) =
                 CatalogContext::new(&self.providers, Arc::clone(&self.event_sink), input)
             else {
@@ -372,6 +382,21 @@ where
             };
 
             let config = thread_state.config();
+            if !config.enabled {
+                // A client can still send a selected skill, so say why it is not used.
+                if input
+                    .user_input
+                    .iter()
+                    .any(|item| matches!(item, UserInput::Skill { .. }))
+                {
+                    self.emit_warning(
+                        thread_store.level_id(),
+                        Some(&input.turn_id),
+                        SKILLS_OFF_WARNING.to_string(),
+                    );
+                }
+                return Vec::new();
+            }
             let mcp_resources = session_store
                 .get::<SkillsSessionState>()
                 .and_then(|state| state.mcp_resources.clone());

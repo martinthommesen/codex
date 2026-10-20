@@ -34,6 +34,8 @@ pub(crate) struct TrustDirectoryWidget {
     pub cwd: PathBuf,
     pub trust_target: PathBuf,
     pub show_windows_create_sandbox_hint: bool,
+    /// Untrusted folders still load repository skills unless skills are off entirely.
+    pub skills_enabled: bool,
     pub should_quit: bool,
     pub selection: Option<TrustDirectorySelection>,
     pub highlighted: TrustDirectorySelection,
@@ -62,10 +64,14 @@ impl WidgetRef for &TrustDirectoryWidget {
                 "This existing task may retain settings \
                  and history, including project configuration or hooks loaded while it was trusted. \
                  To use restricted settings, start a new task. The folder's trust setting will not change."
-            } else if self.restricted {
+            } else if self.restricted && self.skills_enabled {
                 "Config, hooks, and exec policies from untrusted folders stay disabled. \
                  Trusted project folders can still contribute settings. Skills still load, \
                  and tools follow your permission settings. Opening will not change saved trust."
+            } else if self.restricted {
+                "Config, hooks, and exec policies from untrusted folders stay disabled. \
+                 Trusted project folders can still contribute settings. Tools follow your \
+                 permission settings. Opening will not change saved trust."
             } else {
                 "Trust this folder? Codex can read, edit, and run files here, subject to \
                  your permission settings. Folder settings can run code automatically, \
@@ -285,6 +291,7 @@ mod tests {
             cwd: PathBuf::from("/workspace/project"),
             trust_target: PathBuf::from("/workspace/project"),
             show_windows_create_sandbox_hint: false,
+            skills_enabled: true,
             should_quit: false,
             selection: None,
             highlighted: TrustDirectorySelection::Trust,
@@ -301,6 +308,7 @@ mod tests {
             cwd: PathBuf::from("."),
             trust_target: PathBuf::from("."),
             show_windows_create_sandbox_hint: false,
+            skills_enabled: true,
             should_quit: false,
             selection: None,
             highlighted: TrustDirectorySelection::Quit,
@@ -417,6 +425,29 @@ mod tests {
             } else {
                 insta::assert_snapshot!(terminal.backend());
             }
+        }
+    }
+
+    #[test]
+    fn restricted_folder_mentions_skills_only_while_they_are_on() {
+        for skills_enabled in [true, false] {
+            let widget = TrustDirectoryWidget {
+                restricted: true,
+                skills_enabled,
+                ..widget(/*error*/ None)
+            };
+            // Wide enough that the sentence does not wrap.
+            let mut terminal =
+                Terminal::new(VT100Backend::new(/*width*/ 200, /*height*/ 18)).expect("terminal");
+            terminal
+                .draw(|f| (&widget).render_ref(f.area(), f.buffer_mut()))
+                .expect("draw");
+            let screen = terminal.backend().to_string();
+            assert_eq!(
+                screen.contains("Skills still load"),
+                skills_enabled,
+                "skills_enabled={skills_enabled}: {screen}"
+            );
         }
     }
 

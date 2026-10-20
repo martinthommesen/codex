@@ -6,6 +6,9 @@
 
 use super::*;
 use codex_config::ConfigLayerSource;
+use codex_features::FeatureConfigSource;
+use codex_features::FeatureOverrides;
+use codex_features::Features;
 
 async fn build_config_on_runtime_worker(
     builder: ConfigBuilder,
@@ -1209,8 +1212,9 @@ impl App {
         effective_config: &ConfigReadResponse,
         feature_updates: &[(Feature, bool)],
     ) {
+        let features = features_from_effective_config(effective_config);
         for (feature, _) in feature_updates {
-            let enabled = feature_enabled_from_effective_config(effective_config, *feature);
+            let enabled = features.enabled(*feature);
             if let Err(err) = self.config.features.set_enabled(*feature, enabled) {
                 tracing::warn!(
                     error = %err,
@@ -1378,19 +1382,21 @@ pub(super) fn overridden_write_message(write_response: &ConfigWriteResponse) -> 
         .unwrap_or("the effective config is overridden by a higher-priority layer")
 }
 
-fn feature_enabled_from_effective_config(
-    effective_config: &ConfigReadResponse,
-    feature: Feature,
-) -> bool {
+pub(super) fn features_from_effective_config(effective_config: &ConfigReadResponse) -> Features {
     let root_features = effective_config
         .config
         .additional
         .get("features")
         .and_then(features_toml_from_json);
-    root_features
-        .as_ref()
-        .and_then(|features| features.entries().get(feature.key()).copied())
-        .unwrap_or_else(|| feature.default_enabled())
+    // Resolve legacy aliases and structured tables the same way config loading does.
+    Features::from_sources(
+        FeatureConfigSource {
+            features: root_features.as_ref(),
+            ..Default::default()
+        },
+        FeatureConfigSource::default(),
+        FeatureOverrides::default(),
+    )
 }
 
 fn approvals_reviewer_from_effective_config(
@@ -1423,7 +1429,19 @@ fn memories_from_effective_config(effective_config: &ConfigReadResponse) -> Opti
 }
 
 fn features_toml_from_json(value: &serde_json::Value) -> Option<FeaturesToml> {
-    serde_json::from_value(value.clone()).ok()
+    if let Ok(features) = serde_json::from_value(value.clone()) {
+        return Some(features);
+    }
+    // Keep every entry that parses on its own, so one malformed entry does not reset the rest.
+    let entries = value
+        .as_object()?
+        .iter()
+        .filter(|(key, entry)| {
+            serde_json::from_value::<FeaturesToml>(serde_json::json!({ *key: *entry })).is_ok()
+        })
+        .map(|(key, entry)| (key.clone(), entry.clone()))
+        .collect::<serde_json::Map<_, _>>();
+    serde_json::from_value(serde_json::Value::Object(entries)).ok()
 }
 
 #[cfg(test)]
@@ -2136,6 +2154,32 @@ theme = "dracula"
         assert_eq!(
             app.chat_widget.local_settings.tui.pet.as_deref(),
             Some(crate::pets::DISABLED_PET_ID)
+        );
+    }
+
+    #[test]
+    fn effective_feature_readback_resolves_legacy_aliases_and_tables() {
+        let response: ConfigReadResponse = serde_json::from_value(serde_json::json!({
+            "config": {
+                "features": {
+                    "apps": true,
+                    "code_mode": "not a feature value",
+                    "connectors": false,
+                    "multi_agent_v2": { "enabled": true },
+                },
+            },
+            "origins": {},
+        }))
+        .expect("valid config read response");
+
+        // `connectors` is the legacy alias for apps and sorts after it, so it wins on load. The
+        // malformed `code_mode` entry is skipped without hiding the others.
+        let features = features_from_effective_config(&response);
+        assert!(!features.enabled(Feature::Apps));
+        assert!(features.enabled(Feature::MultiAgentV2));
+        assert_eq!(
+            features.enabled(Feature::Plugins),
+            Feature::Plugins.default_enabled()
         );
     }
 }

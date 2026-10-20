@@ -73,6 +73,7 @@ async fn required_environment_skill_gates_inference(availability: Availability) 
         &mut extensions,
         SkillProviders::new().with_executor_provider(Arc::new(CatalogSkillProvider { catalog })),
         |_: &Config| SkillsExtensionConfig {
+            enabled: true,
             include_instructions: false,
             max_context_tokens: None,
             bundled_skills_enabled: false,

@@ -1856,6 +1856,100 @@ async fn fresh_thread_composes_global_before_project_and_reports_sources() -> Re
     Ok(())
 }
 
+#[test_case::test_case(true; "enabled composes global thread and project")]
+#[test_case::test_case(false; "disabled keeps only thread instructions")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn agents_md_feature_gates_global_and_project_files_but_keeps_thread_instructions(
+    enabled: bool,
+) -> Result<()> {
+    // Set up one global file, one project file, and host-supplied thread instructions.
+    let server = start_mock_server().await;
+    let response_mock = mount_sse_once(
+        &server,
+        sse(vec![
+            ev_response_created("agents-md-feature-response"),
+            ev_completed("agents-md-feature-response"),
+        ]),
+    )
+    .await;
+    let home = Arc::new(TempDir::new()?);
+    let global_source =
+        write_global_file(home.as_ref(), GLOBAL_AGENTS_FILENAME, GLOBAL_INSTRUCTIONS)?;
+    let global_provider = Arc::new(RecordingUserInstructionsProvider::new(Arc::new(
+        CodexHomeUserInstructionsProvider::new(AbsolutePathBuf::try_from(
+            home.path().to_path_buf(),
+        )?),
+    )));
+    let mut builder = test_codex()
+        .with_home(Arc::clone(&home))
+        .with_user_instructions_provider(global_provider.clone())
+        .with_config(move |config| {
+            config
+                .features
+                .set_enabled(Feature::AgentsMd, enabled)
+                .expect("test config should allow toggling AGENTS.md");
+        })
+        .with_workspace_setup(|cwd, fs| async move {
+            let project_agents_uri = executor_path_uri(cwd.join(GLOBAL_AGENTS_FILENAME))?;
+            fs.write_file(
+                &project_agents_uri,
+                PROJECT_INSTRUCTIONS.as_bytes().to_vec(),
+                Default::default(),
+                /*sandbox*/ None,
+            )
+            .await?;
+            Ok(())
+        });
+    let test = builder.build_with_auto_env(&server).await?;
+    let thread_provider = Arc::new(RecordingThreadInstructionsProvider::with_text(
+        TASK_USER_INSTRUCTIONS,
+    ));
+    let thread = test
+        .thread_manager
+        .start_thread(StartThreadOptions {
+            environments: Some(vec![test.executor_environment().request()]),
+            thread_instructions_provider: Some(thread_provider.clone()),
+            ..StartThreadOptions::new(test.config.clone())
+        })
+        .await?
+        .thread;
+
+    submit_thread_turn(&thread, "inspect feature-gated AGENTS.md instructions").await?;
+
+    // Disabling AGENTS.md drops both files without consulting the global provider, while the
+    // host-supplied thread instructions still reach the model.
+    let request = response_mock.single_request();
+    let (expected_fragment, expected_sources) = if enabled {
+        (
+            expected_instruction_fragment(
+                &test.executor_environment().selection().cwd,
+                &format!(
+                    "{GLOBAL_INSTRUCTIONS}\n\n{TASK_USER_INSTRUCTIONS}\n\n{PROJECT_SEPARATOR}\n\n{PROJECT_INSTRUCTIONS}"
+                ),
+            ),
+            vec![
+                PathUri::from_abs_path(&global_source),
+                test.workspace_path_uri(GLOBAL_AGENTS_FILENAME)?,
+            ],
+        )
+    } else {
+        (
+            expected_provider_only_instruction_fragment(TASK_USER_INSTRUCTIONS),
+            Vec::new(),
+        )
+    };
+    assert_single_instruction_fragment(&request, &expected_fragment);
+    assert_eq!(
+        [GLOBAL_INSTRUCTIONS, PROJECT_INSTRUCTIONS].map(|text| request.body_contains_text(text)),
+        [enabled, enabled],
+    );
+    assert_eq!(thread.instruction_sources().await, expected_sources);
+    assert_eq!(global_provider.load_count() > 0, enabled);
+    assert!(thread_provider.load_count() > 0);
+
+    Ok(())
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn multi_environment_project_instructions_share_one_byte_budget() -> Result<()> {
     skip_if_no_network!(Ok(()));

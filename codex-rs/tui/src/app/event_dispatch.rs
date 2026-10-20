@@ -2813,6 +2813,13 @@ impl App {
             AppEvent::UpdateFeatureFlags { updates } => {
                 self.update_feature_flags(app_server, updates).await;
             }
+            AppEvent::OpenSettingsPanel => {
+                self.chat_widget
+                    .open_settings_panel(crate::settings_panel::statuses(&self.config));
+            }
+            AppEvent::SaveSettingsSwitch { switch, enabled } => {
+                self.save_settings_switch(app_server, switch, enabled).await;
+            }
             AppEvent::UpdateMemorySettings {
                 use_memories,
                 generate_memories,

@@ -744,6 +744,9 @@
             "agent_message_board": {
               "type": "boolean"
             },
+            "agents_md": {
+              "type": "boolean"
+            },
             "analytics_plan_history": {
               "type": "boolean"
             },
@@ -1196,6 +1199,9 @@
               "type": "boolean"
             },
             "skill_search": {
+              "type": "boolean"
+            },
+            "skills": {
               "type": "boolean"
             },
             "skip_host_skill_discovery": {
@@ -7160,6 +7166,9 @@
         "agent_message_board": {
           "type": "boolean"
         },
+        "agents_md": {
+          "type": "boolean"
+        },
         "analytics_plan_history": {
           "type": "boolean"
         },
@@ -7612,6 +7621,9 @@
           "type": "boolean"
         },
         "skill_search": {
+          "type": "boolean"
+        },
+        "skills": {
           "type": "boolean"
         },
         "skip_host_skill_discovery": {

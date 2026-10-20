@@ -86,11 +86,15 @@ pub(super) fn project_config_warning(config: &Config) -> Option<String> {
         return None;
     }
 
-    let mut message = concat!(
-        "Project-local config, hooks, and exec policies are disabled in the following folders ",
-        "until the project is trusted, but skills still load.\n",
-    )
-    .to_string();
+    // Untrusted projects still load repository skills, unless skills are off entirely.
+    let skills_note = if config.features.enabled(codex_features::Feature::Skills) {
+        ", but skills still load"
+    } else {
+        ""
+    };
+    let mut message = format!(
+        "Project-local config, hooks, and exec policies are disabled in the following folders until the project is trusted{skills_note}.\n"
+    );
     for (index, (folder, reason)) in disabled_folders.iter().enumerate() {
         let display_index = index + 1;
         message.push_str(&format!("    {display_index}. {folder}\n"));
@@ -449,6 +453,41 @@ mod tests {
                 vec![base_cwd.join("rel").into_path_buf()]
             )
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn project_config_warning_mentions_skills_only_while_they_are_on() -> Result<()> {
+        let codex_home = tempdir()?;
+        let mut config = Config::load_default_with_cli_overrides_for_codex_home(
+            codex_home.path().to_path_buf(),
+            Vec::new(),
+        )
+        .await?;
+        config.config_layer_stack = codex_config::ConfigLayerStack::new(
+            vec![codex_config::ConfigLayerEntry::new_disabled(
+                ConfigLayerSource::Project {
+                    dot_codex_folder: codex_home.path().join("project/.codex").abs(),
+                },
+                toml::Value::Table(toml::Table::new()),
+                "project is untrusted",
+            )],
+            codex_config::ConfigRequirements::default(),
+            codex_config::ConfigRequirementsToml::default(),
+        )?;
+
+        for skills_enabled in [true, false] {
+            config
+                .features
+                .set_enabled(codex_features::Feature::Skills, skills_enabled)?;
+            let warning =
+                project_config_warning(&config).expect("an untrusted project layer is listed");
+            assert_eq!(
+                warning.contains("skills still load"),
+                skills_enabled,
+                "{warning}"
+            );
+        }
         Ok(())
     }
 

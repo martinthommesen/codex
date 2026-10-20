@@ -66,6 +66,9 @@ pub(crate) fn skill_tools(
     let Some(thread_state) = thread_store.get::<SkillsThreadState>() else {
         return Vec::new();
     };
+    if !thread_state.config().enabled {
+        return Vec::new();
+    }
     let cloud_available = providers.has_cloud_provider() && thread_state.cloud_skill_enabled();
     if !cloud_available && executor_query.is_none() {
         return Vec::new();

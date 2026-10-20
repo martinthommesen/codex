@@ -1,3 +1,4 @@
+use crate::bottom_pane::slash_commands::FeatureCommandFlags;
 use crate::keymap::RuntimeKeymap;
 use crate::keymap::keymap_action_id;
 use crate::terminal_hyperlinks::HyperlinkLine;
@@ -46,9 +47,13 @@ lazy_static! {
 }
 
 /// Pick a random tooltip to show to the user when starting Codex.
-pub(crate) fn get_tooltip(plan: Option<PlanType>, keymap: &TuiKeymap) -> Option<String> {
+pub(crate) fn get_tooltip(
+    plan: Option<PlanType>,
+    keymap: &TuiKeymap,
+    feature_commands: FeatureCommandFlags,
+) -> Option<String> {
     let mut rng = rand::rng();
-    preferred_tooltip(&mut rng, plan).or_else(|| pick_tooltip(&mut rng, keymap))
+    preferred_tooltip(&mut rng, plan).or_else(|| pick_tooltip(&mut rng, keymap, feature_commands))
 }
 
 /// Apply the shared announcement and promotion policy before falling back to local tips.
@@ -109,11 +114,24 @@ fn app_tooltip() -> Option<&'static str> {
     }
 }
 
-fn pick_tooltip<R: Rng + ?Sized>(rng: &mut R, keymap: &TuiKeymap) -> Option<String> {
+fn pick_tooltip<R: Rng + ?Sized>(
+    rng: &mut R,
+    keymap: &TuiKeymap,
+    feature_commands: FeatureCommandFlags,
+) -> Option<String> {
     // Resolve current settings for each new tip; never replace an invalid or unbound keymap
     // with defaults, or cache shortcut text across /keymap edits.
     let keymap = RuntimeKeymap::from_config(keymap).ok();
-    resolved_tooltips(keymap.as_ref()).choose(rng)
+    resolved_tooltips(keymap.as_ref())
+        .filter(|tip| !mentions_hidden_command(tip, feature_commands))
+        .choose(rng)
+}
+
+/// Tips name commands as `**/name**`; skip ones whose feature is turned off.
+pub(crate) fn mentions_hidden_command(tip: &str, feature_commands: FeatureCommandFlags) -> bool {
+    feature_commands
+        .hidden_commands()
+        .any(|cmd| tip.contains(&format!("**/{}**", cmd.command())))
 }
 
 /// Render shared tip styling and links, retaining visible URLs when the terminal needs them.
@@ -375,20 +393,58 @@ mod tests {
     use rand::rngs::StdRng;
 
     #[test]
+    fn tips_for_commands_whose_feature_is_off_are_skipped() {
+        let all_off = FeatureCommandFlags {
+            skills: false,
+            hooks: false,
+            init: false,
+            plugins: false,
+            apps: false,
+        };
+        let tips = resolved_tooltips(/*keymap*/ None).collect::<Vec<_>>();
+        for command in ["/skills", "/hooks", "/init"] {
+            let marker = format!("**{command}**");
+            assert!(
+                tips.iter().any(|tip| tip.contains(&marker)),
+                "expected a tip for {command}"
+            );
+            assert!(
+                tips.iter()
+                    .filter(|tip| tip.contains(&marker))
+                    .all(|tip| mentions_hidden_command(tip, all_off)),
+                "tips for {command} should be hidden"
+            );
+        }
+        assert!(
+            tips.iter()
+                .all(|tip| !mentions_hidden_command(tip, FeatureCommandFlags::ALL))
+        );
+        for seed in 0..500 {
+            let mut rng = StdRng::seed_from_u64(seed);
+            let tip =
+                pick_tooltip(&mut rng, &TuiKeymap::default(), all_off).expect("other tips remain");
+            assert!(!mentions_hidden_command(&tip, all_off), "picked {tip:?}");
+        }
+    }
+
+    #[test]
     fn random_tooltip_returns_some_tip_when_available() {
         let mut rng = StdRng::seed_from_u64(42);
-        assert!(pick_tooltip(&mut rng, &TuiKeymap::default()).is_some());
+        assert!(pick_tooltip(&mut rng, &TuiKeymap::default(), FeatureCommandFlags::ALL).is_some());
     }
 
     #[test]
     fn random_tooltip_is_reproducible_with_seed() {
         let expected = {
             let mut rng = StdRng::seed_from_u64(7);
-            pick_tooltip(&mut rng, &TuiKeymap::default())
+            pick_tooltip(&mut rng, &TuiKeymap::default(), FeatureCommandFlags::ALL)
         };
 
         let mut rng = StdRng::seed_from_u64(7);
-        assert_eq!(expected, pick_tooltip(&mut rng, &TuiKeymap::default()));
+        assert_eq!(
+            expected,
+            pick_tooltip(&mut rng, &TuiKeymap::default(), FeatureCommandFlags::ALL)
+        );
     }
 
     #[test]

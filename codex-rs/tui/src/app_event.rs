@@ -1477,6 +1477,15 @@ pub(crate) enum AppEvent {
     /// Save an enable prompt on the app server without changing the current thread.
     EnableFeatureForNewThreads(Feature),
 
+    /// Open `/settings` with the saved values that new sessions will use.
+    OpenSettingsPanel,
+
+    /// Persist a `/settings` kill switch on the app server for new sessions.
+    SaveSettingsSwitch {
+        switch: crate::settings_panel::SettingsSwitch,
+        enabled: bool,
+    },
+
     /// Update memory settings and persist them to config.toml.
     UpdateMemorySettings {
         use_memories: bool,

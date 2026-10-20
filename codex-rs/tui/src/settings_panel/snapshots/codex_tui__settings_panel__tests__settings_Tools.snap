@@ -1,0 +1,16 @@
+---
+source: tui/src/settings_panel/settings_panel_tests.rs
+expression: "render(&panel, 130)"
+---
+
+  Settings
+  Turn whole features off · changes apply to new sessions
+
+   Extensions   Context   Tools
+
+› Subagents         [x] On                 Let Codex spawn and coordinate subagents
+  Web search        [x] On · managed       Managed by your administrator
+  Image generation  [x] On                 Let Codex generate images
+  Goals             [x] On                 Keep working toward a goal set with /goal across turns
+
+  left/right group · / search · enter toggle · esc clear search/close

@@ -92,6 +92,10 @@ impl SkillsWatcher {
         thread_manager: &ThreadManager,
         environments: &[TurnEnvironmentSelection],
     ) -> WatchRegistration {
+        // Resolving roots would also install system skills, which stay untouched while skills are off.
+        if !config.features.enabled(codex_features::Feature::Skills) {
+            return WatchRegistration::default();
+        }
         let Some(environment_selection) = environments.first() else {
             return WatchRegistration::default();
         };

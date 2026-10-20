@@ -458,6 +458,35 @@ fn canonical_image_generation_toggle_wins_over_extension_alias() {
 }
 
 #[test]
+fn legacy_keys_for_feature_lists_aliases() {
+    assert_eq!(
+        crate::legacy_keys_for_feature(Feature::Apps).collect::<Vec<_>>(),
+        vec!["connectors"]
+    );
+    assert_eq!(
+        crate::legacy_keys_for_feature(Feature::Skills).count(),
+        0,
+        "skills has no legacy alias"
+    );
+}
+
+#[test]
+fn skills_and_agents_md_are_default_on_kill_switches() {
+    let mut features = Features::with_defaults();
+    assert!(features.enabled(Feature::Skills));
+    assert!(features.enabled(Feature::AgentsMd));
+    assert_eq!(feature_for_key("skills"), Some(Feature::Skills));
+    assert_eq!(feature_for_key("agents_md"), Some(Feature::AgentsMd));
+
+    features.apply_map(&BTreeMap::from([
+        ("skills".to_string(), false),
+        ("agents_md".to_string(), false),
+    ]));
+    assert!(!features.enabled(Feature::Skills));
+    assert!(!features.enabled(Feature::AgentsMd));
+}
+
+#[test]
 fn use_legacy_landlock_config_records_deprecation_notice() {
     let mut entries = BTreeMap::new();
     entries.insert("use_legacy_landlock".to_string(), true);

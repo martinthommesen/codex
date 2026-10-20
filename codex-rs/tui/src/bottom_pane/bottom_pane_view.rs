@@ -39,6 +39,15 @@ pub(crate) trait BottomPaneView: Renderable {
         false
     }
 
+    /// Refresh an open `/settings` panel after a switch save completes.
+    /// Returns whether this view is a settings panel.
+    fn update_settings_panel(
+        &mut self,
+        _update: &crate::settings_panel::SettingsPanelUpdate,
+    ) -> bool {
+        false
+    }
+
     /// Acknowledge that a queued configuration editor has opened.
     fn config_editor_opened(&mut self) {}
 

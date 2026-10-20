@@ -42,6 +42,7 @@ pub use feature_configs::TokenBudgetConfigToml;
 pub use feature_configs::ToolRegistryConfigToml;
 use legacy::LegacyFeatureToggles;
 pub use legacy::legacy_feature_keys;
+pub use legacy::legacy_keys_for_feature;
 
 /// High-level lifecycle stage for a feature.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -112,6 +113,8 @@ pub enum Feature {
     SleepTool,
     /// Enable Claude-style lifecycle hooks loaded from hooks.json files.
     CodexHooks,
+    /// Load global and project AGENTS.md instructions into model context.
+    AgentsMd,
     /// Store CLI auth in the encrypted local secrets backend when keyring storage is selected.
     SecretAuthStorage,
 
@@ -361,6 +364,8 @@ pub enum Feature {
     SkillMcpDependencyInstall,
     /// Run cheap skill-search methods in shadow mode and emit experiment metrics.
     SkillSearch,
+    /// Discover, expose, and inject skills. Disabling it turns off every skill source.
+    Skills,
     /// Removed compatibility flag for deleted skill env var dependency prompting.
     SkillEnvVarDependencyPrompt,
     /// Enable the unified mention popup used by default in the TUI.
@@ -1371,6 +1376,12 @@ pub const FEATURES: &[FeatureSpec] = &[
         default_enabled: true,
     },
     FeatureSpec {
+        id: Feature::AgentsMd,
+        key: "agents_md",
+        stage: Stage::Stable,
+        default_enabled: true,
+    },
+    FeatureSpec {
         id: Feature::RequestPermissionsTool,
         key: "request_permissions_tool",
         stage: Stage::UnderDevelopment,
@@ -1821,6 +1832,12 @@ pub const FEATURES: &[FeatureSpec] = &[
     FeatureSpec {
         id: Feature::SkillSearch,
         key: "skill_search",
+        stage: Stage::Stable,
+        default_enabled: true,
+    },
+    FeatureSpec {
+        id: Feature::Skills,
+        key: "skills",
         stage: Stage::Stable,
         default_enabled: true,
     },

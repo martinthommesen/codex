@@ -1,0 +1,16 @@
+---
+source: tui/src/settings_panel/settings_panel_tests.rs
+expression: "render(&panel, 130)"
+---
+
+  Settings
+  Skills turned off for new sessions · use /new to start one
+
+   Extensions   Context   Tools
+
+  Plugins & apps    [-] Partial            Load plugins and connect apps, including their tools, skills, hooks, and mentions
+› Skills            [ ] Off                Discover skills and offer them through the catalog, $ mentions, and /skills
+  Hooks             [ ] Off                Run lifecycle hooks from hooks.json, config.toml, and plugins
+
+
+  left/right group · / search · enter toggle · esc clear search/close

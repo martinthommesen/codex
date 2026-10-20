@@ -463,3 +463,117 @@ async fn unsupported_legacy_permissions_are_shown_without_exiting() -> Result<()
     app_server.shutdown().await?;
     Ok(())
 }
+
+#[tokio::test]
+async fn queued_input_runs_after_the_server_refuses_a_queued_goal() -> Result<()> {
+    for goal_command in ["/goal ship it", "/goal pause", "/goal clear", "/goal"] {
+        let (mut app, mut events, mut op_rx) = make_test_app_with_channels().await;
+        // The TUI shows goals, but the server's config keeps them off for its threads.
+        let server_home = tempfile::tempdir()?;
+        std::fs::write(
+            server_home.path().join("config.toml"),
+            "[features]\ngoals = false\n",
+        )?;
+        let server_config = ConfigBuilder::default()
+            .codex_home(server_home.path().into())
+            .build()
+            .await?;
+        let mut tui = crate::tui::test_support::make_test_tui()?;
+        let mut app_server = crate::start_embedded_app_server_for_picker(&server_config).await?;
+        let started = app_server.start_thread(&app.config).await?;
+        let thread_id = started.session.thread_id;
+        // Input queued before the session is ready waits the same way it does behind a running
+        // turn.
+        for (text, action) in [
+            (
+                goal_command,
+                crate::bottom_pane::QueuedInputAction::ParseSlash,
+            ),
+            (
+                "also run the tests",
+                crate::bottom_pane::QueuedInputAction::Plain,
+            ),
+        ] {
+            assert!(app.chat_widget.queue_user_message_with_options(
+                UserMessage::from(text),
+                action,
+                Vec::new()
+            ));
+        }
+        app.enqueue_primary_thread_session(started.session, started.turns)
+            .await?;
+        while op_rx.try_recv().is_ok() {}
+
+        while let Ok(event) = events.try_recv() {
+            app.handle_event(&mut tui, &mut app_server, event).await?;
+        }
+
+        let Op::UserTurn { items, .. } = next_user_turn_op(&mut op_rx) else {
+            unreachable!("next_user_turn_op only returns user turns");
+        };
+        assert_eq!(
+            items,
+            vec![UserInput::Text {
+                text: "also run the tests".to_string(),
+                text_elements: Vec::new(),
+            }],
+            "{goal_command}"
+        );
+        assert!(app_server.thread_goal_get(thread_id).await.is_err());
+
+        app_server.shutdown().await?;
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn queued_input_runs_after_a_queued_goal_summary() -> Result<()> {
+    let (mut app, mut events, mut op_rx) = make_test_app_with_channels().await;
+    let mut tui = crate::tui::test_support::make_test_tui()?;
+    let mut app_server = crate::start_embedded_app_server_for_picker(&app.config).await?;
+    let started = app_server.start_thread(&app.config).await?;
+    let thread_id = started.session.thread_id;
+    app_server
+        .thread_goal_set(
+            thread_id,
+            Some("Ship the release".to_string()),
+            Some(ThreadGoalStatus::Paused),
+            /*token_budget*/ None,
+        )
+        .await?;
+    // A bare /goal prints the summary, which is not a popup, so later input still runs.
+    for (text, action) in [
+        ("/goal", crate::bottom_pane::QueuedInputAction::ParseSlash),
+        (
+            "also run the tests",
+            crate::bottom_pane::QueuedInputAction::Plain,
+        ),
+    ] {
+        assert!(app.chat_widget.queue_user_message_with_options(
+            UserMessage::from(text),
+            action,
+            Vec::new()
+        ));
+    }
+    app.enqueue_primary_thread_session(started.session, started.turns)
+        .await?;
+    while op_rx.try_recv().is_ok() {}
+
+    while let Ok(event) = events.try_recv() {
+        app.handle_event(&mut tui, &mut app_server, event).await?;
+    }
+
+    let Op::UserTurn { items, .. } = next_user_turn_op(&mut op_rx) else {
+        unreachable!("next_user_turn_op only returns user turns");
+    };
+    assert_eq!(
+        items,
+        vec![UserInput::Text {
+            text: "also run the tests".to_string(),
+            text_elements: Vec::new(),
+        }]
+    );
+
+    app_server.shutdown().await?;
+    Ok(())
+}

@@ -1,10 +1,12 @@
 //! Session headers, onboarding guidance, and transcript cards.
 
 use super::*;
+use crate::bottom_pane::slash_commands::FeatureCommandFlags;
 use crate::line_truncation::line_width;
 use crate::line_truncation::truncate_line_with_ellipsis_if_overflow;
 use crate::style::accent_color;
 use crate::width::display_width;
+use codex_features::Feature;
 
 /// Render `lines` inside a border whose inner width is at least `inner_width`.
 ///
@@ -215,16 +217,21 @@ pub(crate) fn new_session_info(
 
     if is_first_event {
         // Help lines below the header (new copy and list)
-        let help_lines: Vec<Line<'static>> = vec![
+        let mut help_lines: Vec<Line<'static>> = vec![
             "  To get started, describe a task or try one of these commands:"
                 .dim()
                 .into(),
             Line::from(""),
-            Line::from(vec![
+        ];
+        // `/init` writes an AGENTS.md file, so skip it while `/settings` keeps those unloaded.
+        if config.features.enabled(Feature::AgentsMd) {
+            help_lines.push(Line::from(vec![
                 "  ".into(),
                 "/init".into(),
                 " - create an AGENTS.md file with instructions for Codex".dim(),
-            ]),
+            ]));
+        }
+        help_lines.extend([
             Line::from(vec![
                 "  ".into(),
                 "/status".into(),
@@ -245,13 +252,19 @@ pub(crate) fn new_session_info(
                 "/review".into(),
                 " - review any changes and find issues".dim(),
             ]),
-        ];
+        ]);
 
         parts.push(Box::new(PlainHistoryCell { lines: help_lines }));
     } else {
         if local_settings.tui.show_tooltips
             && let Some(tooltips) = tooltip_override
-                .or_else(|| tooltips::get_tooltip(auth_plan, &local_settings.tui.keymap))
+                .or_else(|| {
+                    tooltips::get_tooltip(
+                        auth_plan,
+                        &local_settings.tui.keymap,
+                        FeatureCommandFlags::from_features(&config.features),
+                    )
+                })
                 .map(|tip| TooltipHistoryCell::new(tip, &config.cwd))
         {
             parts.push(Box::new(tooltips));

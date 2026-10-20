@@ -77,6 +77,7 @@ impl ChatWidget {
             .is_some_and(|active_thread_id| active_thread_id.to_string() == thread_id)
         {
             self.current_goal_status = None;
+            self.sync_goal_command_enabled();
             self.update_collaboration_mode_indicator();
         }
     }

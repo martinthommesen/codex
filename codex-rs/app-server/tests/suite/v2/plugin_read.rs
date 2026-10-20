@@ -1025,6 +1025,62 @@ async fn plugin_skill_read_reads_remote_skill_contents_when_remote_plugin_enable
 }
 
 #[tokio::test]
+async fn plugin_skill_read_is_rejected_when_skills_are_off() -> Result<()> {
+    let codex_home = TempDir::new()?;
+    let server = MockServer::start().await;
+    write_remote_plugin_catalog_config(
+        codex_home.path(),
+        &format!("{}/backend-api/", server.uri()),
+    )?;
+    let config_path = codex_home.path().join("config.toml");
+    std::fs::write(
+        &config_path,
+        format!("{}skills = false\n", std::fs::read_to_string(&config_path)?),
+    )?;
+    write_chatgpt_auth(
+        codex_home.path(),
+        ChatGptAuthFixture::new("chatgpt-token")
+            .account_id("account-123")
+            .chatgpt_user_id("user-123")
+            .chatgpt_account_id("account-123"),
+        AuthCredentialsStoreMode::File,
+    )?;
+
+    let mut mcp = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .without_auto_env()
+        .build_initialized_with_timeout(DEFAULT_TIMEOUT)
+        .await?;
+    let request_id = mcp
+        .send_plugin_skill_read_request(PluginSkillReadParams {
+            remote_marketplace_name: "openai-curated-remote".to_string(),
+            remote_plugin_id: "plugins~Plugin_00000000000000000000000000000000".to_string(),
+            skill_name: "plan-work".to_string(),
+        })
+        .await?;
+    let err: JSONRPCError = timeout(
+        DEFAULT_TIMEOUT,
+        mcp.read_stream_until_error_message(RequestId::Integer(request_id)),
+    )
+    .await??;
+
+    assert!(
+        err.error.message.contains("skills are turned off"),
+        "unexpected error: {}",
+        err.error.message
+    );
+    // The skill contents are never fetched.
+    assert!(
+        server
+            .received_requests()
+            .await
+            .unwrap_or_default()
+            .is_empty()
+    );
+    Ok(())
+}
+
+#[tokio::test]
 async fn plugin_read_maps_missing_remote_plugin_to_invalid_request() -> Result<()> {
     let codex_home = TempDir::new()?;
     let server = MockServer::start().await;

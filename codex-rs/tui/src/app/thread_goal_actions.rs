@@ -36,6 +36,7 @@ impl App {
             Err(err) => {
                 self.chat_widget
                     .add_error_message(thread_goal_error_message("read", &err));
+                self.chat_widget.maybe_send_next_queued_input();
                 return;
             }
         };
@@ -45,10 +46,12 @@ impl App {
                 GOAL_USAGE.to_string(),
                 Some("No goal is currently set.".to_string()),
             );
+            self.chat_widget.maybe_send_next_queued_input();
             return;
         };
 
         self.chat_widget.show_goal_summary(goal);
+        self.chat_widget.maybe_send_next_queued_input();
     }
 
     pub(super) async fn maybe_prompt_resume_paused_goal_after_resume(
@@ -105,6 +108,7 @@ impl App {
             Err(err) => {
                 self.chat_widget
                     .add_error_message(thread_goal_error_message("read", &err));
+                self.chat_widget.maybe_send_next_queued_input();
                 return;
             }
         };
@@ -155,6 +159,8 @@ impl App {
                 Err(err) => {
                     self.chat_widget
                         .add_error_message(thread_goal_error_message("read", &err));
+                    // A refused goal must not hold back input queued after it.
+                    self.chat_widget.maybe_send_next_queued_input();
                     return;
                 }
             }
@@ -173,6 +179,7 @@ impl App {
             Err(err) => {
                 if self.current_displayed_thread_id() == Some(thread_id) {
                     self.chat_widget.add_error_message(err.to_string());
+                    self.chat_widget.maybe_send_next_queued_input();
                 }
                 return;
             }
@@ -189,6 +196,7 @@ impl App {
                 }
                 self.chat_widget
                     .add_error_message(thread_goal_error_message("replace", &err));
+                self.chat_widget.maybe_send_next_queued_input();
                 return;
             }
         }
@@ -226,6 +234,7 @@ impl App {
                 let action = if replacing_goal { "replace" } else { "set" };
                 self.chat_widget
                     .add_error_message(thread_goal_error_message(action, &err));
+                self.chat_widget.maybe_send_next_queued_input();
             }
         }
     }
@@ -257,6 +266,7 @@ impl App {
                 .chat_widget
                 .add_error_message(thread_goal_error_message("update", &err)),
         }
+        self.chat_widget.maybe_send_next_queued_input();
     }
 
     pub(super) async fn clear_thread_goal(
@@ -285,6 +295,7 @@ impl App {
                 .chat_widget
                 .add_error_message(thread_goal_error_message("clear", &err)),
         }
+        self.chat_widget.maybe_send_next_queued_input();
     }
 
     pub(super) fn show_replace_thread_goal_confirmation(
@@ -335,6 +346,7 @@ impl App {
             GOAL_USAGE.to_string(),
             Some("Create a goal before editing it.".to_string()),
         );
+        self.chat_widget.maybe_send_next_queued_input();
     }
 }
 
@@ -352,9 +364,21 @@ async fn cleanup_materialized_goal_files(
 fn thread_goal_error_message(action: &str, err: &color_eyre::Report) -> String {
     if is_ephemeral_thread_goal_error(err) {
         EPHEMERAL_THREAD_GOAL_ERROR_MESSAGE.to_string()
+    } else if is_goals_off_for_thread_error(err) {
+        GOALS_OFF_FOR_THREAD_ERROR_MESSAGE.to_string()
     } else {
         format!("Failed to {action} thread goal: {err}")
     }
+}
+
+/// Each thread keeps the Goals setting it started with, so turning Goals on in `/settings` only
+/// reaches new sessions. The server or project config can also have goals off, so `/new` is only
+/// suggested for the `/settings` case.
+const GOALS_OFF_FOR_THREAD_ERROR_MESSAGE: &str = "Goals are off for this session. If you turned Goals on in /settings after it started, use /new to start a session with goals.";
+
+fn is_goals_off_for_thread_error(err: &color_eyre::Report) -> bool {
+    err.chain()
+        .any(|cause| cause.to_string().contains("goals feature is disabled"))
 }
 
 fn is_ephemeral_thread_goal_error(err: &color_eyre::Report) -> bool {
@@ -420,6 +444,17 @@ mod tests {
         .expect("insert history lines");
 
         insta::assert_snapshot!(terminal.backend());
+    }
+
+    #[test]
+    fn thread_goal_error_message_explains_goals_off_for_the_session() {
+        let err = color_eyre::eyre::eyre!("thread/goal/get failed: goals feature is disabled")
+            .wrap_err("thread/goal/get failed in TUI");
+
+        assert_eq!(
+            thread_goal_error_message("read", &err),
+            GOALS_OFF_FOR_THREAD_ERROR_MESSAGE
+        );
     }
 
     #[test]

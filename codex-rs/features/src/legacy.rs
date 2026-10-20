@@ -55,6 +55,14 @@ pub fn legacy_feature_keys() -> impl Iterator<Item = &'static str> {
     ALIASES.iter().map(|alias| alias.legacy_key)
 }
 
+/// Returns the legacy aliases that still configure `feature`.
+pub fn legacy_keys_for_feature(feature: Feature) -> impl Iterator<Item = &'static str> {
+    ALIASES
+        .iter()
+        .filter(move |alias| alias.feature == feature)
+        .map(|alias| alias.legacy_key)
+}
+
 pub(crate) fn feature_for_key(key: &str) -> Option<Feature> {
     ALIASES
         .iter()

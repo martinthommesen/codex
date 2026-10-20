@@ -3014,6 +3014,166 @@ async fn slash_memories_opens_memory_menu() {
 }
 
 #[tokio::test]
+async fn slash_settings_asks_the_app_for_saved_values() {
+    let (mut chat, mut rx, mut op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+
+    chat.dispatch_command(SlashCommand::Settings);
+
+    assert_matches!(rx.try_recv(), Ok(AppEvent::OpenSettingsPanel));
+    assert!(op_rx.try_recv().is_err(), "expected no core op to be sent");
+    chat.open_settings_panel(crate::settings_panel::statuses(chat.config_ref()));
+    let popup = render_bottom_popup(&chat, /*width*/ 120);
+    assert!(popup.contains("Plugins & apps"), "got {popup:?}");
+    assert!(popup.contains("[x] On"), "got {popup:?}");
+}
+
+#[tokio::test]
+async fn saved_skills_switch_hides_command_and_refreshes_skill_list() {
+    let (mut chat, _rx, mut op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+    let mut saved = chat.config_ref().clone();
+    crate::settings_panel::SettingsSwitch::Skills
+        .apply(&mut saved, /*enabled*/ false)
+        .expect("skills is not pinned");
+    chat.bottom_pane
+        .set_composer_text("/sk".to_string(), Vec::new(), Vec::new());
+    assert!(render_bottom_popup(&chat, /*width*/ 80).contains("/skills"));
+
+    chat.apply_settings_switch(crate::settings_panel::SettingsSwitch::Skills, &saved);
+
+    assert!(!chat.config_ref().features.enabled(Feature::Skills));
+    chat.bottom_pane
+        .set_composer_text("/sk".to_string(), Vec::new(), Vec::new());
+    let popup = render_bottom_popup(&chat, /*width*/ 80);
+    assert!(!popup.contains("/skills"), "got {popup:?}");
+    let expected_cwd = chat.config_ref().cwd.to_path_buf();
+    assert_matches!(
+        op_rx.try_recv(),
+        Ok(Op::ListSkills { cwds, force_reload: true }) if cwds == vec![expected_cwd]
+    );
+    assert!(
+        op_rx.try_recv().is_err(),
+        "expected a single skills refresh"
+    );
+}
+
+#[tokio::test]
+async fn session_with_skills_off_hides_skills_command_and_listed_skills() {
+    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+    let cwd = chat.config_ref().cwd.to_path_buf();
+    let response: codex_app_server_protocol::SkillsListResponse =
+        serde_json::from_value(serde_json::json!({
+            "data": [{
+                "cwd": cwd,
+                "skills": [{
+                    "name": "demo",
+                    "description": "Demo skill",
+                    "path": cwd.join("demo/SKILL.md"),
+                    "scope": "user",
+                    "enabled": true,
+                    "pluginId": null,
+                }],
+                "errors": [],
+            }],
+        }))
+        .expect("valid skills list response");
+    chat.set_skills_from_response(&response);
+    assert_eq!(chat.skills_all.len(), 1);
+
+    chat.set_feature_enabled(Feature::Skills, /*enabled*/ false);
+    chat.bottom_pane
+        .set_composer_text("/sk".to_string(), Vec::new(), Vec::new());
+    let popup = render_bottom_popup(&chat, /*width*/ 80);
+    assert!(!popup.contains("/skills"), "got {popup:?}");
+    // skills/list follows the saved config, so a session with skills off ignores what it lists.
+    chat.set_skills_from_response(&response);
+    assert!(chat.skills_all.is_empty());
+}
+
+#[tokio::test]
+async fn queued_disabled_feature_commands_keep_draining_the_queue() {
+    let (mut chat, mut rx, mut op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+    chat.thread_id = Some(ThreadId::new());
+    for feature in [Feature::AgentsMd, Feature::Skills, Feature::CodexHooks] {
+        chat.set_feature_enabled(feature, /*enabled*/ false);
+    }
+    for command in ["/init", "/skills", "/hooks"] {
+        let drain = chat.submit_queued_slash_prompt(UserMessage::from(command).into());
+        assert_matches!(
+            drain,
+            QueueDrain::Continue,
+            "{command} should not stop the queue"
+        );
+    }
+    drain_insert_history(&mut rx);
+
+    handle_turn_started(&mut chat, "turn-1");
+    queue_composer_text_with_tab(&mut chat, "/init");
+    queue_composer_text_with_tab(&mut chat, "add tests after init");
+    complete_turn_with_message(&mut chat, "turn-1", Some("done"));
+
+    assert!(
+        drain_insert_history(&mut rx)
+            .iter()
+            .any(|lines| lines_to_single_string(lines).contains("AGENTS.md is turned off"))
+    );
+    match next_submit_op(&mut op_rx) {
+        Op::UserTurn { items, .. } => assert_eq!(
+            items,
+            vec![UserInput::Text {
+                text: "add tests after init".to_string(),
+                text_elements: Vec::new(),
+            }]
+        ),
+        other => panic!("expected the message queued after /init, got {other:?}"),
+    }
+    assert!(chat.input_queue.queued_user_messages.is_empty());
+}
+
+#[tokio::test]
+async fn commands_for_disabled_features_point_to_settings() {
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+
+    for (feature, command, expected) in [
+        (
+            Feature::Skills,
+            SlashCommand::Skills,
+            "Skills are turned off.",
+        ),
+        (
+            Feature::CodexHooks,
+            SlashCommand::Hooks,
+            "Hooks are turned off.",
+        ),
+        (
+            Feature::AgentsMd,
+            SlashCommand::Init,
+            "AGENTS.md is turned off",
+        ),
+        (
+            Feature::Plugins,
+            SlashCommand::Plugins,
+            "Plugins are turned off.",
+        ),
+        (Feature::Apps, SlashCommand::Apps, "Apps are turned off."),
+    ] {
+        chat.set_feature_enabled(feature, /*enabled*/ false);
+        chat.dispatch_command(command);
+
+        let rendered = drain_insert_history(&mut rx)
+            .iter()
+            .map(|cell| lines_to_single_string(cell))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(rendered.contains(expected), "got {rendered:?}");
+        assert!(rendered.contains("/settings"), "got {rendered:?}");
+    }
+    assert!(
+        chat.bottom_pane.no_modal_or_popup_active(),
+        "disabled commands should not open their menus"
+    );
+}
+
+#[tokio::test]
 async fn slash_resume_opens_picker_while_mcp_startup_is_running() {
     let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
     chat.bottom_pane.set_task_running(/*running*/ true);
@@ -3878,4 +4038,83 @@ async fn owned_copy_guard_defers_queued_input_until_released() {
         chat.maybe_send_next_queued_input();
         assert!(chat.input_queue.queued_user_messages.is_empty());
     }
+}
+
+#[tokio::test]
+async fn config_reloaded_from_disk_updates_settings_gated_state() {
+    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+    set_chatgpt_auth(&mut chat);
+    let mut reloaded = chat.config.clone();
+    // Another Codex turned these off in /settings.
+    for feature in [Feature::Plugins, Feature::Apps, Feature::Skills] {
+        reloaded
+            .features
+            .set_enabled(feature, /*enabled*/ false)
+            .expect("not pinned");
+    }
+    reloaded.agents_enabled = false;
+    reloaded
+        .web_search_mode
+        .set(codex_protocol::config_types::WebSearchMode::Disabled)
+        .expect("disabled is allowed");
+
+    chat.sync_plugin_mentions_config(&reloaded);
+
+    let flags = chat.builtin_command_flags();
+    assert_eq!(
+        (
+            flags.plugins_command_enabled,
+            flags.feature_commands.plugins,
+            flags.feature_commands.apps,
+            flags.feature_commands.skills,
+            chat.config.agents_enabled,
+            chat.config.web_search_mode.value(),
+        ),
+        (
+            false,
+            false,
+            false,
+            false,
+            false,
+            codex_protocol::config_types::WebSearchMode::Disabled
+        )
+    );
+}
+
+#[tokio::test]
+async fn apps_command_is_explained_only_where_turning_apps_on_helps() {
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+    chat.set_feature_enabled(Feature::Apps, /*enabled*/ false);
+    // Without a ChatGPT account /apps stays unavailable, so it is not explained as turned off.
+    assert!(chat.feature_command_flags().apps);
+    set_chatgpt_auth(&mut chat);
+    assert!(!chat.feature_command_flags().apps);
+
+    // With apps pinned off, turning the switch back on would only bring back plugins.
+    let mut warnings = Vec::new();
+    chat.config.features =
+        crate::legacy_core::config::ManagedFeatures::from_configured_with_warnings(
+            chat.config.features.get().clone(),
+            Some(codex_config::Sourced {
+                value: codex_config::FeatureRequirementsToml {
+                    entries: [("apps".to_string(), false)].into_iter().collect(),
+                },
+                source: codex_config::RequirementSource::Unknown,
+            }),
+            &mut warnings,
+        )
+        .expect("pins are valid");
+    chat.set_feature_enabled(Feature::Plugins, /*enabled*/ false);
+    drain_insert_history(&mut rx);
+    chat.dispatch_command(SlashCommand::Apps);
+
+    let rendered = drain_insert_history(&mut rx)
+        .iter()
+        .map(|cell| lines_to_single_string(cell))
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        rendered.contains("Plugins & apps is managed by your administrator."),
+        "got {rendered:?}"
+    );
 }
